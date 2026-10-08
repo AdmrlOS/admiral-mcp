@@ -314,3 +314,20 @@ def test_get_device_system_services_offline_is_an_error_not_a_crash(monkeypatch)
     out = json.loads(server.get_device_system_services("dotmatrixboi"))
 
     assert "error" in out
+
+
+def test_get_device_system_services_unavailable_is_not_flagged(monkeypatch):
+    data = dict(SYSTEM_SERVICES, services=[
+        {"name": "wpa_supplicant", "health": "unavailable", "normallyUp": True, "reason": "no Wi-Fi hardware"},
+        {"name": "bluetoothd", "health": "unavailable", "normallyUp": False},
+    ])
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        return httpx.Response(200, json={"code": 200, "msg": "ok", "data": data})
+
+    client = AdmiralClient(settings=_settings(), transport=httpx.MockTransport(handler))
+    monkeypatch.setattr(server, "get_client", lambda: client)
+    _patch_resolution(monkeypatch)
+
+    out = json.loads(server.get_device_system_services("dotmatrixboi"))
+    assert out["needs_attention"] == []

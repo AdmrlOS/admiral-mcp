@@ -824,6 +824,28 @@ class AdmiralClient:
     def reboot_device(self, device_id: str, *, org_id: str | None = None) -> Any:
         return self.post(f"devices/{device_id}/reboot", org_id=org_id, json={})
 
+    # Memory tests (online modes only; a test boot is operator-only and is not exposed here).
+    def start_memory_test(self, device_id: str, body: dict[str, Any], *, org_id: str | None = None) -> Any:
+        return self.post(f"devices/{device_id}/memory-test", org_id=org_id, json=body, timeout=45.0)
+
+    def cancel_memory_test(self, device_id: str, *, run_id: str | None = None, org_id: str | None = None) -> Any:
+        return self.post(
+            f"devices/{device_id}/memory-test/cancel",
+            org_id=org_id,
+            json={"runId": run_id} if run_id else {},
+            timeout=45.0,
+        )
+
+    def get_memory_test(self, device_id: str, *, org_id: str | None = None) -> Any:
+        return self.get(f"devices/{device_id}/memory-test", org_id=org_id, timeout=35.0)
+
+    def list_memory_test_results(self, device_id: str, *, limit: int | None = None, org_id: str | None = None) -> Any:
+        return self.get(
+            f"devices/{device_id}/memory-test/results",
+            org_id=org_id,
+            params={"limit": limit} if limit is not None else None,
+        )
+
     # Edge-executed workload lifecycle actions. The backend forwards `action`
     # verbatim (SendDeviceWorkloadCommandHandler) and admrl-init's handleCommand
     # switch matches uppercase, so canonicalise on the way out. Swagger's enum

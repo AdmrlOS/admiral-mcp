@@ -220,6 +220,8 @@ def test_known_mutations_are_not_read_only():
     by = {t.name: t.annotations for t in _all_tools()}
     for name in (
         "reboot_device",
+        "start_memory_test",
+        "cancel_memory_test",
         "change_workload_status",
         "patch_device_document",
         "create_rollout",
@@ -293,7 +295,7 @@ def test_session_list_tools_server_info_and_call_tool():
     assert info["name"] == "admrl" and info["runtime"]["protocol"] == "session"
     assert "Personal API Token" not in info["instructions"]
     assert {"name", "description", "inputSchema", "annotations"} <= set(tools[0])
-    assert len(tools) == 41 - len(browser.EXCLUDED_TOOLS)
+    assert len(tools) == 45 - len(browser.EXCLUDED_TOOLS)
     assert result["isError"] is False and result["content"][0]["type"] == "text"
     assert "shop-01" in result["content"][0]["text"]
     tokens = [r.headers["authorization"] for r in seen]
@@ -322,7 +324,7 @@ def test_direct_fallback_when_session_cannot_start(monkeypatch):
 
     info, tools, ok, err = asyncio.run(go())
     assert info["runtime"]["protocol"] == "direct"
-    assert len(tools) == 41 - len(browser.EXCLUDED_TOOLS)
+    assert len(tools) == 45 - len(browser.EXCLUDED_TOOLS)
     assert ok["isError"] is False and "shop-01" in ok["content"][0]["text"]
     assert err["isError"] is True
     assert seen[0].headers["authorization"] == "Bearer t"

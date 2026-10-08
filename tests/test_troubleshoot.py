@@ -550,3 +550,36 @@ def test_new_tools_work_sequentially_without_threads(monkeypatch):
     assert "workload" in run(server.explain_workload_failure, "kiosk-7")
     install(monkeypatch, fleet_api())
     assert run(server.fleet_health_report, None)["diagnosed"] == 7
+
+
+# ------------------------------------------------------------ usb / services ---
+
+_BENIGN_USB = [
+    "[USB] USB policy applied",
+    "[USB] Stored USB policy enforced",
+    "[USB] USB policy pull failed",
+    "USB policy: failed to protect sysfs path",
+    "[USB] Rejecting USB policy",
+    "[USB] Policy enforcement incomplete",
+]
+
+
+@pytest.mark.parametrize("suffix", ["", " mode=off allow_rules=0"])
+@pytest.mark.parametrize("line", _BENIGN_USB)
+def test_usb_policy_info_lines_are_not_usb_denied(line, suffix):
+    out = ts._logs({"logs": {"logs": [{"level": "info", "source": "admiral-init", "message": line + suffix}]}})
+    assert "usb_denied" not in [f["code"] for f in out]
+
+
+def test_usb_blocked_interface_is_usb_denied():
+    msg = "[USB] Blocked interface interface=1-1:1.0 class=mass-storage"
+    out = ts._logs({"logs": {"logs": [{"level": "warn", "source": "admiral-init", "message": msg}]}})
+    assert "usb_denied" in [f["code"] for f in out]
+
+
+def test_unavailable_service_health_is_not_flagged():
+    ev = {"services": {"services": [
+        {"name": "wpa_supplicant", "health": "unavailable", "normallyUp": True, "reason": "no Wi-Fi hardware"},
+        {"name": "bluetoothd", "health": "unavailable", "normallyUp": False},
+    ]}}
+    assert ts._services(ev) == []

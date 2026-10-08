@@ -25,6 +25,7 @@ from mcp.types import ToolAnnotations
 from .client import AdmiralAPIError, AdmiralClient, log_page_cursor, parse_rfc3339
 from .config import ConfigError, require_settings
 from . import docs
+from . import memtest
 from . import troubleshoot as ts
 from .extensions import load_env_extensions
 from .distill import distill_events, distill_logs, health_from_stats
@@ -55,6 +56,9 @@ How to answer naturally:
   workload, storage, time, connectivity, desired-vs-observed drift -> ranked findings with concrete steps and a docs
   link). Narrower: check_device_connectivity (DNS/TCP/NTP/NATS/clock/link), explain_workload_failure (crash loops,
   exit codes, pull/signature/USB denials, OOM), fleet_health_report (problems grouped across a fleet). All read-only.
+- Memory tests: start_memory_test (mode live keeps the workload running; full_online stops it and needs
+  confirm=true after the user agrees), cancel_memory_test, get_memory_test, list_memory_test_results.
+  A test boot is not available here: the user starts it from the dashboard or the device console.
 - Destructive actions (reboot, document patches, local-override adopt/discard, rollouts and rollout control)
   require an explicit user request. Confirm the exact device first.
 
@@ -336,7 +340,7 @@ def get_device_specs(device: str, organization_id: str | None = None) -> str:
     description=(
         "What the device's init system (s6) is running and whether each service is stable or crashing. "
         "Each service has state (up/down), health (stable, starting, unstable, flapping = crash loop, "
-        "restarting, stopped, unsupervised), pid, uptime, recent crash counts, and its last exits "
+        "restarting, stopped, unsupervised, unavailable = hardware not present on this board, not a fault), pid, uptime, recent crash counts, and its last exits "
         "(exit code or signal) with a plain-English reason. Use this to see what is going wrong on a "
         "device (a crash-looping dhcpcd, workload or wpa_supplicant). Live query: the device must be online; "
         "offline devices return a 504 error. Not the same as network services (listening ports)."
@@ -1153,6 +1157,164 @@ def probe_device(
 
 
 # ---------------------------------------------------------------------------
+# Memory tests (online modes only)
+# ---------------------------------------------------------------------------
+
+
+def _memtest_error(exc: Exception) -> str:
+    if isinstance(exc, AdmiralAPIError):
+        return _dumps(memtest.describe_error(exc))
+    return _err(exc)
+
+
+@mcp.tool(
+    description=(
+        "Start a RAM test on a device. mode='live': the workload keeps running and a bounded slice of free "
+        "memory is tested (quick=true is a shorter, lighter preset). mode='full_online': the workload is STOPPED "
+        "for the whole test so nearly all free memory is tested; because that interrupts the workload you must "
+        "pass confirm=true after the user agreed. passes sets the number of passes (live default 1, full online "
+        "default 2). A test boot (reboot into a dedicated test) is not available here: the user starts that "
+        "from the dashboard or the device console. The device must be online. One test per device at a time; "
+        "starts are rate-limited to one per 5 seconds. Returns the run id: follow progress with get_memory_test, "
+        "stop it with cancel_memory_test. Only on an explicit user request."
+    ),
+    annotations=ToolAnnotations(destructiveHint=True, idempotentHint=False, readOnlyHint=False),
+)
+def start_memory_test(
+    device: str,
+    mode: str = "live",
+    quick: bool | None = None,
+    passes: int | None = None,
+    confirm: bool = False,
+    organization_id: str | None = None,
+) -> str:
+    try:
+        norm = (mode or "").strip().lower().replace("-", "_").replace(" ", "_")
+        if norm in ("offline", "test_boot", "testboot", "boot"):
+            return _dumps({"error": memtest.OFFLINE_MESSAGE, "code": "operator_required"})
+        if norm not in memtest.MODES:
+            return _dumps({"error": f"Unknown mode {mode!r}. Use 'live' or 'full_online'."})
+        if norm == "full_online" and confirm is not True:
+            return _dumps(
+                {
+                    "error": "confirmation_required",
+                    "message": (
+                        "mode 'full_online' stops the device's workload for the duration of the test (typically tens of "
+                        "minutes or more). Ask the user to confirm, then call again with confirm=true. "
+                        "mode 'live' leaves the workload running."
+                    ),
+                }
+            )
+        if passes is not None and not 1 <= int(passes) <= 20:
+            return _dumps({"error": "passes must be between 1 and 20."})
+        found = _resolve_device(device, organization_id)
+        if not found.get("match"):
+            return _dumps(found)
+        body = memtest.start_body(norm, quick, passes)
+        result = get_client().start_memory_test(found["match"]["id"], body, org_id=found["organization_id"])
+        result = result if isinstance(result, dict) else {}
+        out: dict[str, Any] = {
+            "device": found["match"],
+            "started": True,
+            "mode": norm,
+            "run_id": result.get("runId"),
+            "status": memtest.summarise_status(result.get("status")),
+            "next": "Follow progress with get_memory_test; stop it with cancel_memory_test.",
+        }
+        if norm == "full_online":
+            out["note"] = "The workload is stopped while the test runs and restarts when it ends."
+        return _dumps(out)
+    except Exception as exc:
+        return _memtest_error(exc)
+
+
+@mcp.tool(
+    description=(
+        "Cancel the memory test running on a device. If a full online test had stopped the workload, the device "
+        "restarts it. Optional run_id (from start_memory_test) guards against cancelling a different run. "
+        "Answers with a clear message when no test is running."
+    ),
+    annotations=ToolAnnotations(destructiveHint=True, idempotentHint=True, readOnlyHint=False),
+)
+def cancel_memory_test(device: str, run_id: str | None = None, organization_id: str | None = None) -> str:
+    try:
+        found = _resolve_device(device, organization_id)
+        if not found.get("match"):
+            return _dumps(found)
+        result = get_client().cancel_memory_test(
+            found["match"]["id"], run_id=run_id, org_id=found["organization_id"]
+        )
+        return _dumps({"device": found["match"], "cancelled": True, "result": result})
+    except Exception as exc:
+        return _memtest_error(exc)
+
+
+@mcp.tool(
+    description=(
+        "Memory test status and memory health for a device: the current or last run (phase, pass, coverage %, "
+        "errors, temperature, ETA), the verdict, retired pages, memory fault, hardware error counters and what the "
+        "device can do (live / full online / test boot). needs_attention lists a memory fault (replace the "
+        "board/RAM) and an interrupted last test. Online devices answer live; offline devices return the last "
+        "stored report (source='stored')."
+    ),
+    annotations=_READ_ONLY,
+)
+def get_memory_test(device: str, organization_id: str | None = None) -> str:
+    try:
+        found = _resolve_device(device, organization_id)
+        if not found.get("match"):
+            return _dumps(found)
+        data = get_client().get_memory_test(found["match"]["id"], org_id=found["organization_id"])
+        data = data if isinstance(data, dict) else {}
+        history = data.get("history") or []
+        supported = bool(data.get("supported"))
+        out: dict[str, Any] = {
+            "device": found["match"],
+            "source": data.get("source"),
+            "supported": supported,
+            "needs_attention": memtest.attention(supported, data.get("status"), data.get("health"), history),
+            "status": memtest.summarise_status(data.get("status")),
+            "health": memtest.summarise_health(data.get("health"), history),
+            "health_reported_at": data.get("healthReportedAt"),
+            "history": [memtest.summarise_result(r) for r in history[:5] if isinstance(r, dict)],
+        }
+        if not supported:
+            out["note"] = "This device does not report memory tests (older firmware or unsupported board)."
+        return _dumps(out)
+    except Exception as exc:
+        return _memtest_error(exc)
+
+
+@mcp.tool(
+    description=(
+        "Stored memory test results for a device, newest first (limit 1-100, default 10): outcome, verdict, "
+        "coverage, error count, retired pages and a few sample errors per run. Works for offline devices."
+    ),
+    annotations=_READ_ONLY,
+)
+def list_memory_test_results(device: str, limit: int = 10, organization_id: str | None = None) -> str:
+    try:
+        if not 1 <= int(limit) <= 100:
+            return _dumps({"error": "limit must be between 1 and 100."})
+        found = _resolve_device(device, organization_id)
+        if not found.get("match"):
+            return _dumps(found)
+        data = get_client().list_memory_test_results(
+            found["match"]["id"], limit=int(limit), org_id=found["organization_id"]
+        )
+        results = [r for r in ((data or {}).get("results") or []) if isinstance(r, dict)]
+        return _dumps(
+            {
+                "device": found["match"],
+                "count": len(results),
+                "results": [memtest.summarise_result(r) for r in results],
+            }
+        )
+    except Exception as exc:
+        return _memtest_error(exc)
+
+
+# ---------------------------------------------------------------------------
 # Convergence-driven rollouts (ADDENDUM-A §A3)
 # ---------------------------------------------------------------------------
 
@@ -1530,7 +1692,7 @@ def troubleshoot_device(
             client,
             org_id,
             match,
-            include={"diagnose", "state", "workload", "events", "logs", "document", "live", "probe", "services", "stats"},
+            include={"diagnose", "state", "workload", "events", "logs", "document", "live", "probe", "services", "stats", "memtest"},
             lookback_hours=lookback_hours,
             run_probe_flag=run_probe,
             pmap=_parallel_map,
