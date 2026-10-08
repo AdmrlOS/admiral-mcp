@@ -308,6 +308,34 @@ KB: dict[str, dict[str, Any]] = {
         support=True,
         support_note="Repeated read-only remounts mean failing media or filesystem damage.",
     ),
+    "memory_fault": dict(
+        area="hardware",
+        cause="A memory test or the kernel found faulty RAM (too many bad pages, or a data/address line fault).",
+        steps=[
+            "Replace the board/RAM. Retired pages keep the device usable in the meantime, but memory errors can corrupt data.",
+            "get_memory_test shows the verdict, retired pages and the last results.",
+        ],
+        docs="device memory test",
+        support=True,
+        support_note="A memory fault means failing hardware; arrange a replacement.",
+    ),
+    "memory_test_interrupted": dict(
+        area="hardware",
+        cause="The last memory test did not finish: the device reset or crashed while it was running.",
+        steps=[
+            "Run it again with start_memory_test (mode live, or full_online with the user's go-ahead) and check get_memory_test.",
+            "If the device resets again during a test, suspect failing RAM or power.",
+        ],
+        docs="device memory test",
+        support=False,
+    ),
+    "memory_test_running": dict(
+        area="hardware",
+        cause="A memory test is holding the workload stopped. This is planned maintenance, not a failure.",
+        steps=["It ends by itself; get_memory_test shows progress and cancel_memory_test stops it and restarts the workload."],
+        docs="device memory test",
+        support=False,
+    ),
     "memory_pressure": dict(
         area="resources",
         cause="Memory use is very high; the OOM killer may start killing the workload.",
@@ -389,12 +417,12 @@ KB: dict[str, dict[str, Any]] = {
     ),
 }
 
-_AREA_ORDER = ["connectivity", "workload", "time", "storage", "update", "drift", "boot", "system", "resources", "logs", "events", "probe"]
+_AREA_ORDER = ["connectivity", "workload", "time", "storage", "update", "drift", "boot", "system", "hardware", "resources", "logs", "events", "probe"]
 
 # symptom keyword -> areas that become "relevant to your symptom"
 _SYMPTOM_AREAS = [
     (("offline", "connect", "network", "wifi", "wi-fi", "internet", "dns", "unreachable", "cloud"), {"connectivity", "time"}),
-    (("crash", "restart", "reboot", "loop", "exit", "oom", "memory", "app", "container", "workload", "start"), {"workload", "boot", "resources"}),
+    (("crash", "restart", "reboot", "loop", "exit", "oom", "memory", "app", "container", "workload", "start"), {"workload", "boot", "resources", "hardware"}),
     (("screen", "black", "display", "blank", "video", "hdmi"), {"workload", "system"}),
     (("disk", "storage", "full", "space", "read-only", "readonly"), {"storage"}),
     (("update", "upgrade", "stuck", "version", "rollout", "deploy", "config", "pull", "download", "image"), {"update", "drift", "workload"}),
@@ -716,7 +744,11 @@ def gather(
 
         return attempt("document", go)
 
-    phase1 = [n for n in ("detail", "diagnose", "state", "workload", "events", "logs", "document") if n in include]
+    def t_memtest() -> Any:
+        # Unsupported firmware answers 422/404: nothing to report, not a failure.
+        return attempt("memtest", lambda: client.get_memory_test(device_id, org_id=org_id), soft_statuses=(404, 422, 503, 504))
+
+    phase1 = [n for n in ("detail", "diagnose", "state", "workload", "events", "logs", "document", "memtest") if n in include]
     runners = {
         "detail": t_detail,
         "diagnose": t_diagnose,
@@ -725,6 +757,7 @@ def gather(
         "events": t_events,
         "logs": t_logs,
         "document": t_document,
+        "memtest": t_memtest,
     }
     run = pmap or (lambda fn, items: [fn(i) for i in items])
     results = run(lambda name: runners[name](), phase1)
@@ -889,7 +922,7 @@ def _workload(ev: dict[str, Any]) -> list[dict[str, Any]]:
         out.append(finding("workload_crashing", "critical", "The workload is crash-looping", evid))
     elif state == "ERROR" or (err and state not in ("RUNNING", "")):
         out.append(finding("workload_error", "critical", "The workload is in an error state", evid))
-    elif state in ("STOPPED", "EXITED"):
+    elif state in ("STOPPED", "EXITED") and not _memtest_hold(st):
         out.append(
             finding(
                 "workload_error",
@@ -955,6 +988,55 @@ def _workload(ev: dict[str, Any]) -> list[dict[str, Any]]:
                     support=False,
                 )
             )
+    return out
+
+
+def _cond_true(state: dict[str, Any] | None, ctype: str) -> dict[str, Any] | None:
+    c = _condition(state, ctype)
+    if c is not None and str(c.get("status")).lower() == "true":
+        return c
+    return None
+
+
+def _memtest_hold(state: dict[str, Any] | None) -> bool:
+    """A memory test is holding the workload (MemoryTest=True): WorkloadReady=False/MaintenanceHold is expected."""
+    return _cond_true(state, "MemoryTest") is not None
+
+
+def _memory(ev: dict[str, Any]) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    st = ev.get("state_doc") or {}
+    mt = ev.get("memtest") if isinstance(ev.get("memtest"), dict) else {}
+    health = mt.get("health") if isinstance(mt.get("health"), dict) else {}
+    fault = _cond_true(st, "MemoryFault")
+    if fault is not None or health.get("fault"):
+        evid = []
+        if fault is not None:
+            evid.append(f"MemoryFault condition: {fault.get('reason') or 'set'}")
+        if health.get("faultReason"):
+            evid.append(f"reason: {health['faultReason']}")
+        if health.get("retiredPages"):
+            evid.append(f"{len(health['retiredPages'])} memory pages retired")
+        out.append(finding("memory_fault", "critical", "Memory fault: replace the board/RAM", evid))
+    last = health.get("lastResult") if isinstance(health.get("lastResult"), dict) else None
+    if last is None:
+        last = next((r for r in (mt.get("history") or []) if isinstance(r, dict)), None)
+    if (isinstance(last, dict) and last.get("outcome") == "interrupted") or isinstance(health.get("interrupted"), dict):
+        intr = (last or {}).get("interrupted") or health.get("interrupted") or {}
+        evid = [f"last test interrupted at phase {intr.get('phase')}" if intr.get("phase") else "last memory test was interrupted"]
+        if intr.get("at"):
+            evid.append(f"{ago(intr['at']) or intr['at']}")
+        out.append(finding("memory_test_interrupted", "warning", "The last memory test was interrupted", evid))
+    held = _cond_true(st, "MemoryTest")
+    if held is not None:
+        out.append(
+            finding(
+                "memory_test_running",
+                "info",
+                "A memory test is holding the workload (maintenance, not a failure)",
+                [f"MemoryTest condition: {held.get('reason') or 'set'}", "WorkloadReady=False with reason MaintenanceHold is expected now"],
+            )
+        )
     return out
 
 
@@ -1087,8 +1169,10 @@ def _services(ev: dict[str, Any]) -> list[dict[str, Any]]:
     return out
 
 
+# usb_denied matches real block/deny events only. Never match "policy" alone: device logs
+# routinely carry "USB policy applied mode=off" and similar informational lines.
 _LOG_PATTERNS: list[tuple[str, str, re.Pattern[str]]] = [
-    ("usb_denied", "warning", re.compile(r"usb.*(denied|blocked|not allowed|rejected|policy)|(denied|blocked|rejected).*usb", re.I)),
+    ("usb_denied", "warning", re.compile(r"\bblocked interface\b|\busb\b.*\b(denied|blocked|not allowed)\b|\b(denied|blocked)\b.*\busb\b", re.I)),
     ("image_signature", "critical", re.compile(r"(signature|cosign|notation).*(fail|invalid|denied|unverified|not verified|mismatch)", re.I)),
     ("image_pull_failed", "critical", re.compile(r"(pull|manifest|registry|layer).*(fail|unauthori[sz]ed|denied|not found|timeout|refused)", re.I)),
     ("tls_error", "warning", re.compile(r"x509|certificate (has expired|is not yet valid|signed by unknown)|tls: (bad|failed)", re.I)),
@@ -1186,6 +1270,7 @@ ANALYSERS: list[Callable[[dict[str, Any]], list[dict[str, Any]]]] = [
     _offline,  # before the backend issues so its richer likely_cause wins the merge
     _from_diagnosis,
     _workload,
+    _memory,
     _storage,
     _time,
     _transport,

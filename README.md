@@ -58,6 +58,10 @@ This server uses the historical query. Live tail cannot be opened with a PAT —
 | `fleet_health_report` | Devices by status and grouped by top problem for a fleet or organisation (bounded) |
 | `search` | Global search |
 | `reboot_device` | Destructive; only on explicit request |
+| `start_memory_test` | RAM test. `mode=live` keeps the workload running (`quick`, `passes` optional); `mode=full_online` stops the workload for the run and needs `confirm=true`. A test boot is not offered here: start it from the dashboard or the device console |
+| `cancel_memory_test` | Stop the running memory test (restarts the workload if it was held) |
+| `get_memory_test` | Status, coverage %, errors, verdict, retired pages, memory fault, capabilities; flags a fault or an interrupted last test |
+| `list_memory_test_results` | Stored results, newest first (`limit` 1-100); works offline |
 
 ## Run locally
 
