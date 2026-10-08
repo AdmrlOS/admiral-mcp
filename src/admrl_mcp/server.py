@@ -25,6 +25,7 @@ from mcp.types import ToolAnnotations
 from .client import AdmiralAPIError, AdmiralClient, log_page_cursor, parse_rfc3339
 from .config import ConfigError, require_settings
 from . import docs
+from . import fleetmetrics
 from . import memtest
 from . import troubleshoot as ts
 from .extensions import load_env_extensions
@@ -56,6 +57,10 @@ How to answer naturally:
   workload, storage, time, connectivity, desired-vs-observed drift -> ranked findings with concrete steps and a docs
   link). Narrower: check_device_connectivity (DNS/TCP/NTP/NATS/clock/link), explain_workload_failure (crash loops,
   exit codes, pull/signature/USB denials, OOM), fleet_health_report (problems grouped across a fleet). All read-only.
+- Fleet / organisation metrics: get_fleet_metrics (avg, max, latest, device count; per_device=true ranks devices; pass
+  device to compare one device with its fleet), get_fleet_health, get_fleet_uptime, get_org_metrics (org-wide, by
+  fleet or device, top N), query_telemetry_metrics (raw PromQL), get_telemetry_scope. A 402 means the organisation
+  lacks the Telemetry add-on (billing gate, not an outage).
 - Memory tests: start_memory_test (mode live keeps the workload running; full_online stops it and needs
   confirm=true after the user agrees), cancel_memory_test, get_memory_test, list_memory_test_results.
   A test boot is not available here: the user starts it from the dashboard or the device console.
@@ -437,6 +442,321 @@ def get_device_metrics(
             end=end,
         )
         return _dumps({"device": match, "query": {"metric": metric, "start": start, "end": end}, "result": payload})
+    except Exception as exc:
+        return _err(exc)
+
+
+def _fleet_target(fleet: str | None, device: str | None, organization_id: str | None) -> tuple[str, dict[str, Any], str | None] | str:
+    """(org_id, {id, name}, device_id) or a JSON string to return as-is (ambiguous/unknown)."""
+    client = get_client()
+    device_id = None
+    if device:
+        found = _resolve_device(device, organization_id)
+        if not found.get("match"):
+            return _dumps(found)
+        match = found["match"]
+        device_id = match["id"]
+        org_id = found["organization_id"]
+        if not fleet:
+            fl = match.get("fleet") or {}
+            if not fl.get("id"):
+                return _dumps({"device": match, "error": "Device has no fleet; pass fleet explicitly"})
+            return org_id, {"id": fl["id"], "name": fl.get("name")}, device_id
+    else:
+        org_id = DeviceResolver(client).resolve_org(organization_id)
+    if not fleet:
+        return _dumps({"error": "fleet (name or id) is required unless device is given"})
+    res = fleetmetrics.resolve_fleet(client, fleet, org_id)
+    if not res.get("match"):
+        return _dumps(res)
+    return org_id, res["match"], device_id
+
+
+@mcp.tool(
+    description=(
+        "Metric statistics for a whole fleet (VictoriaMetrics) in one call: avg, max, latest and device count over "
+        "the window, plus (per_device=true) a ranked per-device table with names. Pass fleet as a name or id. To "
+        "compare one device with its fleet, pass device (name, tag or id; fleet is then optional): the result adds "
+        "that device's avg, rank and difference from the fleet average. metric is cpu, memory, disk (worst "
+        "partition), network_rx or network_tx (bytes/second). lookback_hours defaults to 24. Empty windows return "
+        "a summary saying no data, not an error. A 402 means the organisation lacks the Telemetry add-on."
+    ),
+    annotations=_READ_ONLY,
+)
+def get_fleet_metrics(
+    fleet: str | None = None,
+    metric: str = "cpu",
+    lookback_hours: float = 24,
+    per_device: bool = False,
+    device: str | None = None,
+    limit: int = 25,
+    organization_id: str | None = None,
+) -> str:
+    try:
+        if metric not in fleetmetrics.METRICS:
+            return _dumps({"error": f"Unknown metric {metric!r}", "choices": list(fleetmetrics.METRICS)})
+        target = _fleet_target(fleet, device, organization_id)
+        if isinstance(target, str):
+            return target
+        org_id, fl, device_id = target
+        start, end = _rfc3339_hours_ago(lookback_hours)
+        try:
+            out = fleetmetrics.fleet_metrics(
+                get_client(), fleet=fl, org_id=org_id, metric=metric, start=start, end=end,
+                per_device=per_device, limit=limit, device_id=device_id,
+            )
+        except AdmiralAPIError as exc:
+            gated = fleetmetrics.gate_result(exc, "Fleet metrics")
+            if gated is None:
+                raise
+            return _dumps({**gated, "fleet": fl})
+        return _dumps(out)
+    except Exception as exc:
+        return _err(exc)
+
+
+@mcp.tool(
+    description=(
+        "Fleet health snapshot: total devices, online, offline and the fleet's average CPU, memory and disk. "
+        "Pass fleet as a name or id. For which devices are the problem use fleet_health_report; for trends use "
+        "get_fleet_metrics."
+    ),
+    annotations=_READ_ONLY,
+)
+def get_fleet_health(fleet: str, organization_id: str | None = None) -> str:
+    try:
+        target = _fleet_target(fleet, None, organization_id)
+        if isinstance(target, str):
+            return target
+        org_id, fl, _ = target
+        try:
+            data = get_client().get_fleet_health(fl["id"], org_id=org_id)
+        except AdmiralAPIError as exc:
+            gated = fleetmetrics.gate_result(exc, "Fleet health")
+            if gated is None:
+                raise
+            return _dumps({**gated, "fleet": fl})
+        data = data if isinstance(data, dict) else {}
+        total, online = data.get("total_devices"), data.get("online")
+        offline = data.get("offline")
+        if offline is None and isinstance(total, int) and isinstance(online, int):
+            offline = total - online
+        stats = {k: data.get(k) for k in ("total_devices", "online", "avg_cpu", "avg_memory", "avg_disk")}
+        stats["offline"] = offline
+        return _dumps(
+            {
+                "summary": (
+                    f"Fleet {fl.get('name') or fl['id']}: {online}/{total} online, avg CPU {data.get('avg_cpu')}%, "
+                    f"memory {data.get('avg_memory')}%, disk {data.get('avg_disk')}%."
+                ),
+                "fleet": fl,
+                "health": stats,
+                **(
+                    {
+                        "note": (
+                            "The platform reports 0 devices for this fleet's health snapshot. Cross-check with "
+                            "list_devices(fleet_id=...) or get_fleet_metrics before concluding it is empty."
+                        )
+                    }
+                    if not total
+                    else {}
+                ),
+            }
+        )
+    except Exception as exc:
+        return _err(exc)
+
+
+@mcp.tool(
+    description=(
+        "Fleet uptime: the current uptime percentage (last hour) plus uptime buckets (period_type hourly, daily, "
+        "weekly or monthly; periods_back buckets, default 7 daily). Pass fleet as a name or id. Hours before a "
+        "device's current boot count as downtime."
+    ),
+    annotations=_READ_ONLY,
+)
+def get_fleet_uptime(
+    fleet: str,
+    period_type: str = "daily",
+    periods_back: int = 7,
+    organization_id: str | None = None,
+) -> str:
+    try:
+        if period_type not in ("hourly", "daily", "weekly", "monthly"):
+            return _dumps({"error": f"Unknown period_type {period_type!r}", "choices": ["hourly", "daily", "weekly", "monthly"]})
+        target = _fleet_target(fleet, None, organization_id)
+        if isinstance(target, str):
+            return target
+        org_id, fl, _ = target
+        client = get_client()
+        try:
+            buckets = client.get_fleet_uptime(fl["id"], period_type=period_type, periods_back=periods_back, org_id=org_id)
+            current = client.get_fleet_uptime_percentage(fl["id"], org_id=org_id)
+        except AdmiralAPIError as exc:
+            gated = fleetmetrics.gate_result(exc, "Fleet uptime")
+            if gated is None:
+                raise
+            return _dumps({**gated, "fleet": fl})
+        return _dumps(fleetmetrics.fleet_uptime_view(buckets, current, fl, period_type))
+    except Exception as exc:
+        return _err(exc)
+
+
+@mcp.tool(
+    description=(
+        "Organisation-wide metric question in one call: 'CPU across the org', 'which fleet runs hottest', 'top 10 "
+        "devices by memory'. metric is cpu, memory, disk, network_rx or network_tx (bytes/second); group_by is "
+        "fleet or device; stat (avg or max) is what rows are ranked by; fleet optionally narrows to one fleet "
+        "(name or id). Returns org_stats (avg, max, latest, device count) plus ranked rows with fleet/device names, "
+        "so a device can be compared against its fleet and the org average. Uses the organisation-scoped "
+        "Telemetry query API (Telemetry add-on; a 402 or 403 is reported as unavailable, not an error)."
+    ),
+    annotations=_READ_ONLY,
+)
+def get_org_metrics(
+    metric: str = "cpu",
+    group_by: str = "fleet",
+    stat: str = "avg",
+    fleet: str | None = None,
+    lookback_hours: float = 24,
+    limit: int = 10,
+    ascending: bool = False,
+    organization_id: str | None = None,
+) -> str:
+    try:
+        for value, choices, label in (
+            (metric, tuple(fleetmetrics.METRICS), "metric"),
+            (group_by, fleetmetrics.GROUPS, "group_by"),
+            (stat, fleetmetrics.STATS, "stat"),
+        ):
+            if value not in choices:
+                return _dumps({"error": f"Unknown {label} {value!r}", "choices": list(choices)})
+        if not 0 < lookback_hours <= fleetmetrics.MAX_RANGE_HOURS:
+            return _dumps({"error": f"lookback_hours must be between 0 and {fleetmetrics.MAX_RANGE_HOURS}"})
+        client = get_client()
+        org_id = DeviceResolver(client).resolve_org(organization_id)
+        fl = None
+        if fleet:
+            res = fleetmetrics.resolve_fleet(client, fleet, org_id)
+            if not res.get("match"):
+                return _dumps(res)
+            fl = res["match"]
+        try:
+            out = fleetmetrics.org_metrics(
+                client, org_id=org_id, metric=metric, group_by=group_by, stat=stat,
+                hours=lookback_hours, limit=min(max(limit, 1), 100), fleet=fl,
+                sort="asc" if ascending else "desc",
+            )
+        except AdmiralAPIError as exc:
+            gated = fleetmetrics.gate_result(exc, "Organisation metrics")
+            if gated is None:
+                raise
+            return _dumps(gated)
+        out["organization_id"] = org_id
+        return _dumps(out)
+    except Exception as exc:
+        return _err(exc)
+
+
+@mcp.tool(
+    description=(
+        "Advanced: run a raw PromQL/MetricsQL query through the organisation-scoped Telemetry API (read-only; the "
+        "organisation and your access are enforced server-side). mode=instant evaluates now; mode=range uses "
+        "lookback_hours (max 168) and a step (default auto, at most 500 points). Stored metric names look like "
+        "edge_cpu_usagepercent, edge_memory_usagepercent, edge_disk_usagepercent; series carry device_id and "
+        "fleet_id labels. Output is bounded (25 series, 60 points each). Prefer get_org_metrics / "
+        "get_fleet_metrics for ordinary questions. A 402 means the Telemetry add-on is not enabled."
+    ),
+    annotations=_READ_ONLY,
+)
+def query_telemetry_metrics(
+    query: str,
+    mode: str = "instant",
+    lookback_hours: float = 1,
+    step: str | None = None,
+    fleet: str | None = None,
+    organization_id: str | None = None,
+) -> str:
+    try:
+        if mode not in ("instant", "range"):
+            return _dumps({"error": f"Unknown mode {mode!r}", "choices": ["instant", "range"]})
+        q = (query or "").strip()
+        if not q or len(q) > fleetmetrics.MAX_QUERY_CHARS:
+            return _dumps({"error": f"query must be 1-{fleetmetrics.MAX_QUERY_CHARS} characters"})
+        if not 0 < lookback_hours <= fleetmetrics.MAX_RANGE_HOURS:
+            return _dumps({"error": f"lookback_hours must be between 0 and {fleetmetrics.MAX_RANGE_HOURS}"})
+        client = get_client()
+        org_id = DeviceResolver(client).resolve_org(organization_id)
+        extra = None
+        if fleet:
+            res = fleetmetrics.resolve_fleet(client, fleet, org_id)
+            if not res.get("match"):
+                return _dumps(res)
+            extra = {"scope_fleet_id": res["match"]["id"]}
+        start = end = None
+        if mode == "range":
+            start, end = _rfc3339_hours_ago(lookback_hours)
+            floor = max(15, int(lookback_hours * 3600 / fleetmetrics.MAX_RANGE_POINTS))
+            step = step if step and step.rstrip("smhd").isdigit() and _step_seconds(step) >= floor else f"{floor}s"
+        try:
+            payload = client.telemetry_query(q, org_id=org_id, start=start, end=end, step=step, extra=extra)
+        except AdmiralAPIError as exc:
+            gated = fleetmetrics.gate_result(exc, "Telemetry query")
+            if gated is None:
+                raise
+            return _dumps(gated)
+        out = fleetmetrics.compact_prom(payload, mode)
+        out = {
+            "summary": f"{out['series_total']} series for {mode} query.",
+            "query": {"promql": q, "mode": mode, "start": start, "end": end, "step": step},
+            **out,
+        }
+        return _dumps(out)
+    except Exception as exc:
+        return _err(exc)
+
+
+def _step_seconds(step: str) -> int:
+    return int(step[:-1]) * {"s": 1, "m": 60, "h": 3600, "d": 86400}[step[-1]] if step[-1] in "smhd" else int(step)
+
+
+@mcp.tool(
+    description=(
+        "What telemetry this caller can query in the organisation: org_wide, or the specific fleets/devices "
+        "granted (fleet names resolved). Use it to explain empty org-wide results or a 403. A 402 means the "
+        "Telemetry add-on is not enabled."
+    ),
+    annotations=_READ_ONLY,
+)
+def get_telemetry_scope(organization_id: str | None = None) -> str:
+    try:
+        client = get_client()
+        org_id = DeviceResolver(client).resolve_org(organization_id)
+        try:
+            scope = client.get_telemetry_scope(org_id=org_id)
+        except AdmiralAPIError as exc:
+            gated = fleetmetrics.gate_result(exc, "Telemetry scope")
+            if gated is None:
+                raise
+            return _dumps(gated)
+        scope = scope if isinstance(scope, dict) else {}
+        fleet_ids = scope.get("fleet_ids") or []
+        device_ids = scope.get("device_ids") or []
+        names = fleetmetrics.fleet_names(client, org_id) if fleet_ids else {}
+        org_wide = bool(scope.get("org_wide"))
+        return _dumps(
+            {
+                "summary": (
+                    "Telemetry is org-wide: all fleets and devices in the organisation are queryable."
+                    if org_wide and not fleet_ids and not device_ids
+                    else f"Telemetry is limited to {len(fleet_ids)} fleet(s) and {len(device_ids)} device(s)."
+                ),
+                "organization_id": scope.get("org_id") or org_id,
+                "org_wide": org_wide,
+                "fleets": [{"id": f, "name": names.get(f)} for f in fleet_ids[:50]],
+                "device_ids": device_ids[:50],
+            }
+        )
     except Exception as exc:
         return _err(exc)
 
