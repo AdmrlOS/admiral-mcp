@@ -231,9 +231,10 @@ def test_known_mutations_are_not_read_only():
         "duplicate_fleet",
         "duplicate_configuration",
         "render_device_document",
+        "create_support_ticket",
     ):
         assert by[name].readOnlyHint is False, name
-    for name in ("list_devices", "get_device_logs", "get_device_screenshot", "search"):
+    for name in ("list_devices", "get_device_logs", "get_device_screenshot", "search", "list_support_tickets"):
         assert by[name].readOnlyHint is True, name
 
 
@@ -295,7 +296,7 @@ def test_session_list_tools_server_info_and_call_tool():
     assert info["name"] == "admrl" and info["runtime"]["protocol"] == "session"
     assert "Personal API Token" not in info["instructions"]
     assert {"name", "description", "inputSchema", "annotations"} <= set(tools[0])
-    assert len(tools) == 51 - len(browser.EXCLUDED_TOOLS)
+    assert len(tools) == 53 - len(browser.EXCLUDED_TOOLS)
     assert result["isError"] is False and result["content"][0]["type"] == "text"
     assert "shop-01" in result["content"][0]["text"]
     tokens = [r.headers["authorization"] for r in seen]
@@ -324,7 +325,7 @@ def test_direct_fallback_when_session_cannot_start(monkeypatch):
 
     info, tools, ok, err = asyncio.run(go())
     assert info["runtime"]["protocol"] == "direct"
-    assert len(tools) == 51 - len(browser.EXCLUDED_TOOLS)
+    assert len(tools) == 53 - len(browser.EXCLUDED_TOOLS)
     assert ok["isError"] is False and "shop-01" in ok["content"][0]["text"]
     assert err["isError"] is True
     assert seen[0].headers["authorization"] == "Bearer t"

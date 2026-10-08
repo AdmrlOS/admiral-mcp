@@ -1130,6 +1130,180 @@ def duplicate_configuration(
         return _err(exc)
 
 
+_TICKET_PRIORITY = {"high": 1, "normal": 2, "low": 3}
+_TICKET_TYPES = ("technical", "billing", "implementation")
+
+
+def _ticket_summary(t: dict[str, Any]) -> dict[str, Any]:
+    subject = t.get("subject") if isinstance(t.get("subject"), dict) else None
+    return {
+        "ref": t.get("ref"),
+        "id": t.get("id"),
+        "title": t.get("title"),
+        "status": t.get("status"),
+        "priority": t.get("priority"),
+        "supportType": t.get("supportType"),
+        "subject": ({"type": subject.get("type"), "id": subject.get("id"), "name": subject.get("name")} if subject else None),
+        "createdAt": t.get("createdAt"),
+    }
+
+
+def _resolve_named(client: AdmiralClient, kind: str, ref: str, org_id: str) -> dict[str, Any]:
+    """Resolve a fleet/configuration by UUID (verified by GET) or name. Ambiguity -> candidates."""
+    ref = ref.strip()
+    path = "fleets" if kind == "fleet" else "configurations"
+    if is_uuid(ref):
+        row = client.get(f"{path}/{ref}", org_id=org_id)
+        row = row if isinstance(row, dict) else {}
+        return {"match": {"id": ref, "name": row.get("name")}, "candidates": []}
+    lister = client.list_fleets if kind == "fleet" else client.list_configurations
+    rows = _items(lister(org_id=org_id, search=ref, limit=100))
+    needle = ref.lower()
+    hits = [r for r in rows if str(r.get("name") or "").lower() == needle] or [
+        r for r in rows if needle in str(r.get("name") or "").lower()
+    ]
+    cands = [{"id": r.get("id"), "name": r.get("name")} for r in hits[:10]]
+    if len(hits) == 1:
+        return {"match": cands[0], "candidates": []}
+    return {"match": None, "candidates": cands, "kind": kind, "query": ref}
+
+
+@mcp.tool(
+    description=(
+        "Raise a support ticket with the Admiral support team (visible to staff and to the user on the dashboard "
+        "Help page). Only call when the user asks for a ticket or agrees to one you offered; never on your own "
+        "initiative. Put everything a support engineer needs in description: what is wrong, what the user "
+        "expected, what was already tried, and the findings from other tools (device status, errors, log "
+        "excerpts, versions, timestamps). support_type: 'technical' (default), 'billing' or 'implementation'. "
+        "priority: 'normal' (default), 'high' or 'low'. This tool cannot raise an urgent/Sev 1 ticket: for a "
+        "production outage that must page on-call, tell the user to raise it from the dashboard Help page. "
+        "Optionally tie the ticket to ONE subject: device (name, UUID or tag; resolved like reboot_device, "
+        "ambiguous matches return candidates and nothing is created), fleet (name or UUID) or configuration "
+        "(name or UUID). attach_diagnostics=true (device only) also collects device state, logs and system info "
+        "into a diagnostics bundle for staff; the device must be online, otherwise the ticket is still created "
+        "and diagnostics.status is 'unavailable' with a reason. Returns {summary, ticket, diagnostics, next_step}."
+    ),
+    annotations=ToolAnnotations(destructiveHint=False, idempotentHint=False, readOnlyHint=False),
+)
+def create_support_ticket(
+    title: str,
+    description: str,
+    support_type: str = "technical",
+    priority: str = "normal",
+    device: str | None = None,
+    fleet: str | None = None,
+    configuration: str | None = None,
+    attach_diagnostics: bool = False,
+    organization_id: str | None = None,
+) -> str:
+    try:
+        title = (title or "").strip()
+        description = (description or "").strip()
+        if not title or not description:
+            return _dumps({"error": "title and description are required"})
+        stype = (support_type or "technical").strip().lower()
+        if stype not in _TICKET_TYPES:
+            return _dumps({"error": f"Unsupported support_type {support_type!r}", "choices": list(_TICKET_TYPES)})
+        prio = (priority or "normal").strip().lower()
+        if prio not in _TICKET_PRIORITY:
+            return _dumps(
+                {
+                    "error": f"Unsupported priority {priority!r}",
+                    "choices": list(_TICKET_PRIORITY),
+                    "note": "Urgent/Sev 1 pages on-call and is only available from the dashboard Help page.",
+                }
+            )
+        given = {k: v for k, v in (("device", device), ("fleet", fleet), ("configuration", configuration)) if v and str(v).strip()}
+        if len(given) > 1:
+            return _dumps({"error": "Pass at most one of device, fleet or configuration", "given": sorted(given)})
+        if attach_diagnostics and "device" not in given:
+            return _dumps({"error": "attach_diagnostics requires a device subject"})
+
+        client = get_client()
+        org_id = DeviceResolver(client).resolve_org(organization_id)
+        body: dict[str, Any] = {
+            "title": title,
+            "description": description,
+            "priority": _TICKET_PRIORITY[prio],
+            "supportType": stype.upper(),
+        }
+        subject: dict[str, Any] | None = None
+        if "device" in given:
+            found = _resolve_device(given["device"], org_id)
+            if not found.get("match"):
+                return _dumps({**found, "note": "No ticket created. Pass a device id (UUID) to disambiguate."})
+            subject = {"type": "device", "id": found["match"]["id"], "name": found["match"].get("name")}
+        elif given:
+            kind = "fleet" if "fleet" in given else "configuration"
+            found = _resolve_named(client, kind, given[kind], org_id)
+            if not found.get("match"):
+                return _dumps({**found, "note": f"No ticket created. Pass the {kind} id (UUID) to disambiguate."})
+            subject = {"type": kind, "id": found["match"]["id"], "name": found["match"].get("name")}
+        if subject:
+            body["subject"] = {"type": subject["type"], "id": subject["id"]}
+            if attach_diagnostics:
+                body["attachDiagnostics"] = True
+
+        data = client.post("helpdesk/tickets", org_id=org_id, json=body)
+        ticket = _ticket_summary(data if isinstance(data, dict) else {})
+        if subject and not ticket["subject"]:
+            ticket["subject"] = subject
+        elif ticket["subject"] and not ticket["subject"].get("name"):
+            ticket["subject"]["name"] = subject["name"] if subject else None
+        diag = data.get("diagnostics") if isinstance(data, dict) and isinstance(data.get("diagnostics"), dict) else None
+        label = ticket["ref"] or ticket["id"] or "(no ref)"
+        text = f"Ticket {label} raised ({stype}, {prio})"
+        if subject:
+            text += f" about {subject['type']} {subject.get('name') or subject['id']}"
+        if diag:
+            status = diag.get("status")
+            text += (
+                "; diagnostics bundle requested"
+                if status == "requested"
+                else f"; diagnostics unavailable ({diag.get('reason') or 'no reason given'})"
+            )
+        return _dumps(
+            {
+                "summary": text,
+                "ticket": ticket,
+                "diagnostics": diag,
+                "organization_id": org_id,
+                "next_step": "Follow up on the dashboard Help page; the support team replies there.",
+            }
+        )
+    except Exception as exc:
+        return _err(exc)
+
+
+@mcp.tool(
+    description=(
+        "List the organisation's support tickets (newest first, compact: ref, title, status, priority, type, "
+        "subject, created). Use it to show existing tickets or to check for a duplicate before offering "
+        "create_support_ticket. Pass 'after' (next_cursor from a previous page) to page."
+    ),
+    annotations=_READ_ONLY,
+)
+def list_support_tickets(limit: int = 20, after: str | None = None, organization_id: str | None = None) -> str:
+    try:
+        client = get_client()
+        org_id = DeviceResolver(client).resolve_org(organization_id)
+        n = max(1, min(int(limit), 50))
+        page = client.get("helpdesk/tickets", org_id=org_id, params={"first": n, "after": after})
+        page = page if isinstance(page, dict) else {}
+        rows = [_ticket_summary(t) for t in (page.get("tickets") or []) if isinstance(t, dict)]
+        return _dumps(
+            {
+                "summary": f"{len(rows)} of {page.get('totalCount', len(rows))} tickets",
+                "tickets": rows,
+                "has_next": bool(page.get("hasNext")),
+                "next_cursor": page.get("nextCursor") or None,
+                "organization_id": org_id,
+            }
+        )
+    except Exception as exc:
+        return _err(exc)
+
+
 @mcp.tool(description="Organisation-wide search across devices, fleets, and configurations.", annotations=_READ_ONLY)
 def search(query: str, organization_id: str | None = None, limit: int = 20) -> str:
     try:
