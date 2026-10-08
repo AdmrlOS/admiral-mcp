@@ -1,0 +1,115 @@
+# Admiral MCP server
+
+Talk to an Admiral fleet from Hermes (or any MCP client) using a Personal API Token.
+
+Natural questions this is built for:
+
+- "What's the IP of my printer?"
+- "Which devices are offline?"
+- "Grab logs from the crashing kiosk and tell me why"
+
+It is **not** a 1:1 dump of the swagger file. Tools resolve devices by name, tag, notes, IP, or UUID, then call the real Admiral API.
+
+## Auth
+
+PAT only (for now):
+
+| Header | Env var |
+|---|---|
+| `X-API-Token-ID` | `ADMRL_API_TOKEN_ID` |
+| `X-API-Secret-Key` | `ADMRL_API_SECRET_KEY` |
+| `X-Organization-ID` | `ADMRL_ORG_ID` (optional if the token sees one org) |
+
+Create a token in **app.admrl.co → Settings → API Tokens**. The secret is shown once.
+
+Copy `.env.example` and fill it in, or put the same keys in `~/.hermes/.env` (preferred for Hermes — stdio MCP subprocesses only inherit env you pass explicitly). Empty `${ADMRL_*}` placeholders from Hermes config are ignored so a project `.env` still works.
+
+## Logs
+
+Two Admiral log surfaces exist:
+
+| Surface | Path | Auth | Offline devices |
+|---|---|---|---|
+| Historical query (VictoriaLogs) | `GET /v1/devices/{id}/logs`, `POST /v1/metrics/logs/query` | PAT | Yes |
+| Live websocket tail | `wss://api.admrl.co/v1/ws/devices/{id}/logs/stream` | Firebase/JWT first-message `auth` | No |
+
+This server uses the historical query. Live tail cannot be opened with a PAT — that is how `DeviceLogsTab.svelte` authenticates today.
+
+## Tools
+
+| Tool | Use |
+|---|---|
+| `list_organisations` | Pick an org when `ADMRL_ORG_ID` is unset |
+| `list_fleets` | Fleet list, optional search/tag |
+| `list_devices` | Filter by status / fleet / query |
+| `find_device` | Resolve name, tag (`role=printer`), IP, UUID |
+| `get_device` | Detail + effective tags |
+| `get_device_network` | IPs from list cache, spec, and live status |
+| `get_device_specs` | Hardware / versions |
+| `get_device_workload` | Container state + live config identity |
+| `get_device_stats` | Health gauges |
+| `get_device_screenshot` | Live display capture (metadata + image block) |
+| `get_device_logs` | Historical logs + crash-signature distill |
+| `get_device_events` | Lifecycle events |
+| `diagnose_device` | Offline/error sweep, or one device: stats + events + logs |
+| `troubleshoot_device` | "What is wrong with this device?" in one call: state, diagnosis, probe, logs, events, workload, storage, time, connectivity, drift → ranked findings with steps and docs links |
+| `check_device_connectivity` | Link, DNS, TCP, NTP/clock and NATS/transport checks plus the classic causes |
+| `explain_workload_failure` | Crash loops, exit codes, pull/signature/USB denials, OOM, with scrubbed log excerpts |
+| `fleet_health_report` | Devices by status and grouped by top problem for a fleet or organisation (bounded) |
+| `search` | Global search |
+| `reboot_device` | Destructive; only on explicit request |
+
+## Run locally
+
+```bash
+cd /path/to/admrl-mcp
+uv sync --extra dev
+uv run pytest
+```
+
+Stdio server:
+
+```bash
+export ADMRL_API_TOKEN_ID=...
+export ADMRL_API_SECRET_KEY=...
+export ADMRL_ORG_ID=...   # optional
+uv run admrl-mcp
+```
+
+## Hermes
+
+```bash
+hermes mcp add admrl \
+  --command uv \
+  --args --directory /path/to/admrl-mcp run admrl-mcp \
+  --env ADMRL_API_TOKEN_ID \
+  --env ADMRL_API_SECRET_KEY \
+  --env ADMRL_ORG_ID
+```
+
+Hermes prefixes tools as `mcp_admrl_*`. Restart the desktop app after adding.
+
+## In the browser (Admiral dashboard assistant)
+
+`admrl_mcp.browser` runs the same tools inside Pyodide in a Web Worker, authenticated with the
+dashboard user's session token (`Authorization: Bearer` + `X-Organization-ID`) instead of a PAT.
+HTTP goes through a synchronous-XHR httpx transport; `set_auth()` is called before every tool call.
+Tools that cannot work there (`watch_*` SSE streams) are not offered
+(`browser.EXCLUDED_TOOLS`). The PAT/stdio server is unchanged. The dashboard builds the wheel set
+with `npm run mcp:bundle`; see `admiral-dashboard/src/lib/assistant/runtime/README.md`.
+
+## Extensions
+
+Extra tool packages can be plugged in without changing this package. An extension is an importable
+module with `register(mcp: FastMCP) -> list[str]` that adds tools and returns their names. Every tool it
+adds must set `ToolAnnotations(readOnlyHint=...)` explicitly, or the extension is rejected. Optional module
+attributes: `INSTRUCTIONS` (text appended to the server instructions) and `BROWSER_EXCLUDED_TOOLS`
+(`{tool: reason}`, tools the browser must not offer).
+
+- Python: `admrl_mcp.extensions.register_extension(module_name, mcp) -> list[str]`.
+- stdio: `ADMRL_MCP_EXTENSIONS=mod1,mod2 admrl-mcp`. A module that is not installed is logged to stderr
+  and skipped; the server still starts.
+- Browser (Pyodide): `admrl_mcp.browser.load_extension(module_name) -> str` (synchronous) registers the
+  module on the browser server and returns `{"tools": [...]}`. The open in-memory MCP session sees the
+  new tools on its next `list_tools`; call it before the host freezes its tool list. The module's wheel
+  must already be installed (e.g. `micropip.install(..., deps=False)` from the Pyodide filesystem).
