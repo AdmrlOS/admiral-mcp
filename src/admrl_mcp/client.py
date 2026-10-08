@@ -804,6 +804,98 @@ class AdmiralClient:
     def get_fleet_health(self, fleet_id: str, *, org_id: str | None = None) -> Any:
         return self.get(f"fleets/{fleet_id}/health", org_id=org_id)
 
+    def get_fleet_metrics(
+        self,
+        fleet_id: str,
+        *,
+        metric_name: str,
+        start: str | None = None,
+        end: str | None = None,
+        aggregate: bool = True,
+        org_id: str | None = None,
+    ) -> Any:
+        # start/end RFC3339 (default last 24h). aggregate=false returns one
+        # series per device (label device_id); series null = empty window.
+        return self.get(
+            f"fleets/{fleet_id}/metrics",
+            org_id=org_id,
+            params={
+                "metric_name": metric_name,
+                "start": start,
+                "end": end,
+                "aggregate": "true" if aggregate else "false",
+            },
+        )
+
+    def get_fleet_uptime(
+        self,
+        fleet_id: str,
+        *,
+        period_type: str = "daily",
+        periods_back: int = 7,
+        org_id: str | None = None,
+    ) -> Any:
+        return self.get(
+            f"fleets/{fleet_id}/uptime",
+            org_id=org_id,
+            params={"period_type": period_type, "periods_back": periods_back},
+        )
+
+    def get_fleet_uptime_percentage(
+        self,
+        fleet_id: str,
+        *,
+        start: str | None = None,
+        end: str | None = None,
+        org_id: str | None = None,
+    ) -> Any:
+        # Default window is the last hour.
+        return self.get(
+            f"fleets/{fleet_id}/uptime/percentage",
+            org_id=org_id,
+            params={"start": start, "end": end},
+        )
+
+    def get_timeseries(
+        self,
+        *,
+        fleet_id: str,
+        metric_name: str,
+        start: str | None = None,
+        end: str | None = None,
+        org_id: str | None = None,
+    ) -> Any:
+        return self.get(
+            "metrics/timeseries",
+            org_id=org_id,
+            params={"fleet_id": fleet_id, "metric_name": metric_name, "start": start, "end": end},
+        )
+
+    def get_telemetry_scope(self, *, org_id: str | None = None) -> Any:
+        # What the caller may query: org_wide, or the fleet/device ids granted.
+        return self.get("telemetry/scope", org_id=org_id)
+
+    def telemetry_query(
+        self,
+        query: str,
+        *,
+        org_id: str | None = None,
+        start: str | None = None,
+        end: str | None = None,
+        step: str | None = None,
+        extra: dict[str, Any] | None = None,
+    ) -> Any:
+        # Scoped PromQL proxy (Telemetry add-on; 402 without it). The org and
+        # the caller's grants are enforced server-side; scope_fleet_id /
+        # scope_device_id only narrow. Native Prometheus JSON comes back as-is.
+        # With start+end it is a range query, otherwise an instant query now.
+        params: dict[str, Any] = {"query": query, **(extra or {})}
+        endpoint = "query"
+        if start and end:
+            endpoint = "query_range"
+            params.update({"start": start, "end": end, "step": step})
+        return self.get(f"telemetry/metrics/{endpoint}", org_id=org_id, params=params)
+
     def get_fleet_logs(
         self,
         fleet_id: str,

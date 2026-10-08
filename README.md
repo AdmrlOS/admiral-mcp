@@ -56,6 +56,12 @@ This server uses the historical query. Live tail cannot be opened with a PAT —
 | `check_device_connectivity` | Link, DNS, TCP, NTP/clock and NATS/transport checks plus the classic causes |
 | `explain_workload_failure` | Crash loops, exit codes, pull/signature/USB denials, OOM, with scrubbed log excerpts |
 | `fleet_health_report` | Devices by status and grouped by top problem for a fleet or organisation (bounded) |
+| `get_fleet_metrics` | Fleet CPU/memory/disk/network over a window: avg, max, latest, device count; `per_device=true` ranks devices; `device=` compares one device with its fleet |
+| `get_fleet_health` | Fleet snapshot: devices online/offline and average CPU, memory, disk |
+| `get_fleet_uptime` | Fleet uptime: current percentage plus hourly/daily/weekly/monthly buckets |
+| `get_org_metrics` | Organisation-wide metric by fleet or device (avg/max, top N, optional fleet filter) with names resolved |
+| `query_telemetry_metrics` | Advanced: bounded read-only PromQL (instant or range) through the organisation-scoped Telemetry API |
+| `get_telemetry_scope` | What telemetry the caller can query (org-wide or specific fleets/devices) |
 | `search` | Global search |
 | `reboot_device` | Destructive; only on explicit request |
 | `start_memory_test` | RAM test. `mode=live` keeps the workload running (`quick`, `passes` optional); `mode=full_online` stops the workload for the run and needs `confirm=true`. A test boot is not offered here: start it from the dashboard or the device console |
