@@ -6,7 +6,7 @@ from __future__ import annotations
 
 import json
 import sys
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Callable
 
@@ -462,7 +462,7 @@ def test_scrub_masks_secrets_and_bounds_length():
 def fleet_api(n_online: int = 3, n_offline: int = 4, pages: bool = False) -> FakeAPI:
     api = FakeAPI()
     devices = [{"id": f"on-{i}", "name": f"on-{i}", "status": "online", "isOnline": {"isOnline": True}} for i in range(n_online)]
-    devices += [{"id": f"off-{i}", "name": f"off-{i}", "status": "offline", "isOnline": {"isOnline": False, "lastSeen": "2026-10-07T20:00:00Z"}} for i in range(n_offline)]
+    devices += [{"id": f"off-{i}", "name": f"off-{i}", "status": "offline", "isOnline": {"isOnline": False, "lastSeen": (NOW - timedelta(hours=4)).strftime("%Y-%m-%dT%H:%M:%SZ")}} for i in range(n_offline)]
     api.on("GET", "/fleets", httpx.Response(200, json=envelope([{"id": FLEET, "name": "shops"}])))
     api.on("GET", "/devices", httpx.Response(200, json=envelope(devices, pagination={"page": 1, "limit": 100, "total": len(devices), "totalPages": 1})))
 
@@ -583,3 +583,15 @@ def test_unavailable_service_health_is_not_flagged():
         {"name": "bluetoothd", "health": "unavailable", "normallyUp": False},
     ]}}
     assert ts._services(ev) == []
+
+
+def test_fleet_health_report_buckets_follow_injected_clock(monkeypatch):
+    """Same fixtures, clock moved +30 days: offline devices fall out of '< 24 h'."""
+    api = fleet_api()
+    install(monkeypatch, api)
+    monkeypatch.setattr(ts, "_now", lambda: NOW + timedelta(days=30))
+
+    out = run(server.fleet_health_report, "shops")
+
+    assert "< 24 h" not in out["not_online_by_last_seen"]
+    assert sum(out["not_online_by_last_seen"].values()) == 4

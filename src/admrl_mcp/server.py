@@ -2466,7 +2466,7 @@ def fleet_health_report(
         else:
             truncated = True
         summaries = [summarise_device(r) for r in rows]
-        now = datetime.now(timezone.utc)
+        now = ts._now()
         by_status = Counter(s["status"] for s in summaries)
         buckets: Counter[str] = Counter()
         for s in summaries:
