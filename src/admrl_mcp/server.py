@@ -15,6 +15,7 @@ import base64
 import json
 from collections import Counter
 import sys
+import contextvars
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -81,8 +82,19 @@ mcp = FastMCP(
 _client: AdmiralClient | None = None
 
 
+# Hosted (multi-tenant) mode: ``hosted.py`` sets this True. A request-scoped client (carrying only
+# that caller's token) then replaces the module-level singleton, which is never used.
+_hosted_mode = False
+_request_client: contextvars.ContextVar[Any] = contextvars.ContextVar("admrl_request_client", default=None)
+
+
 def get_client() -> AdmiralClient:
     global _client
+    holder = _request_client.get()
+    if holder is not None:
+        return holder.get()
+    if _hosted_mode:
+        raise ConfigError("No request credentials: hosted mode never falls back to a shared client.")
     if _client is None:
         _client = AdmiralClient(require_settings())
     return _client
@@ -96,8 +108,13 @@ def _parallel_map(fn: Any, items: list[Any], max_workers: int = 8) -> list[Any]:
     """
     if sys.platform == "emscripten" or max_workers <= 1:
         return [fn(item) for item in items]
+    # Worker threads do not inherit contextvars; run each task in a copy of the caller's context so
+    # the request-scoped client (hosted mode) is visible to them.
+    # (A context can only be entered by one thread at a time, so each task gets its own copy,
+    # taken here in the calling thread.)
+    contexts = [contextvars.copy_context() for _ in items]
     with ThreadPoolExecutor(max_workers=max_workers) as pool:
-        return list(pool.map(fn, items))
+        return list(pool.map(lambda pair: pair[0].run(fn, pair[1]), zip(contexts, items)))
 
 
 def _dumps(payload: Any) -> str:

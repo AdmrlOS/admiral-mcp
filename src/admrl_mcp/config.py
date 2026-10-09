@@ -34,6 +34,9 @@ class Settings:
     # current Settings on every request instead of capturing it.
     auth_mode: str = AUTH_PAT
     bearer_token: str = ""
+    # Hosted mode: the grant is bound to one organisation server-side, so a missing
+    # organisation is not an error; no X-Organization-ID is sent and the backend defaults it.
+    org_optional: bool = False
 
     @property
     def configured(self) -> bool:

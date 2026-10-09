@@ -162,6 +162,8 @@ class DeviceResolver:
             return organization_id
         if self.client.settings.org_id:
             return self.client.settings.org_id
+        if self.client.settings.org_optional:
+            return ""  # hosted: the backend uses the grant's organisation when no header is sent
         orgs = self.client.list_organisations()
         if len(orgs) == 1:
             return str(orgs[0].get("id") or orgs[0].get("ID"))

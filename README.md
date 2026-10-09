@@ -86,6 +86,42 @@ export ADMRL_ORG_ID=...   # optional
 uv run admrl-mcp
 ```
 
+## Hosted mode (remote connector, streamable HTTP + OAuth 2.1)
+
+`admrl-mcp-http` serves the same tools (minus the SSE `watch_*` tools) as a stateless streamable-HTTP MCP
+server at `/mcp`, acting as an OAuth 2.1 protected resource. It never holds a PAT or shared credential: every
+request must carry `Authorization: Bearer admrl_mcp_at_...`, and that token is forwarded to the Admiral API
+for that request only (the backend validates it, enforces scope and organisation).
+
+```bash
+ADMRL_API_BASE=https://api.admrl.co/v1 uv run admrl-mcp-http        # listens on :8080
+curl localhost:8080/healthz
+docker build -t admrl-mcp . && docker run --rm --read-only -p 8080:8080 admrl-mcp
+```
+
+Endpoints: `/mcp` (401 + `WWW-Authenticate: Bearer resource_metadata=..., scope="admrl:read"` without a valid-looking
+bearer; a backend 401 during a tool call is returned the same way so the client refreshes), `/healthz`,
+`/.well-known/oauth-protected-resource[/mcp]`, `/.well-known/oauth-authorization-server`.
+
+| Env var | Default | Purpose |
+|---|---|---|
+| `ADMRL_MCP_RESOURCE_URL` | `https://mcp.admrl.co/mcp` | resource identifier; its host is the allowed `Host` |
+| `ADMRL_MCP_ISSUER` | `https://mcp.admrl.co` | OAuth issuer |
+| `ADMRL_MCP_AUTHORIZE_URL` | `https://app.admrl.co/oauth/authorize` | consent UI |
+| `ADMRL_MCP_PUBLIC_API_BASE` | `https://api.admrl.co/v1` | token/registration/revocation endpoint base |
+| `ADMRL_API_BASE` | `https://api.admrl.co/v1` | API the server calls (may be the in-cluster service) |
+| `ADMRL_MCP_ALLOWED_HOSTS` | (none) | extra comma-separated `Host` values (DNS-rebinding allow-list); `host:*` allowed |
+| `ADMRL_MCP_ALLOWED_ORIGINS` | claude.ai, claude.com, chatgpt.com, issuer | extra allowed `Origin`s |
+| `ADMRL_MCP_DNS_REBINDING_PROTECTION` | `true` | set `false` only for local debugging |
+| `ADMRL_MCP_MAX_BODY_BYTES` | `1048576` | request body limit (413 above) |
+| `ADMRL_MCP_MAX_THREADS` | `64` | worker threads for sync tools |
+| `ADMRL_MCP_HOST` / `ADMRL_MCP_PORT` | `0.0.0.0` / `8080` | bind address |
+| `ADMRL_MCP_LOG_LEVEL` | `INFO` | JSON logs on stderr; tokens are never logged |
+
+Organisation: tools take `organization_id` as before; when omitted no `X-Organization-ID` is sent and the
+backend uses the grant's organisation. The image is `ghcr.io/admrlos/admiral-mcp` (built by
+`.github/workflows/image.yaml`: `:main`, `:vX.Y.Z`, `:X.Y`, `:sha-<short>`).
+
 ## Hermes
 
 ```bash
