@@ -58,7 +58,7 @@ def _env(data):
 
 def test_start_live_sends_online_running_and_never_offline(monkeypatch):
     seen = _setup(monkeypatch, {("POST", BASE): httpx.Response(202, json={"success": True, "code": 202, "data": {"deviceId": DEV, "runId": "run-1", "status": STATUS}})})
-    out = json.loads(server.start_memory_test("kiosk", mode="live", quick=True, passes=1))
+    out = json.loads(server.start_memory_test("kiosk", mode="live", quick=True, passes=1, confirm=True))
     body = json.loads(seen[0].content)
     assert body == {"impact": "running", "placement": "online", "quick": True, "passes": 1}
     assert out["started"] and out["run_id"] == "run-1"
@@ -68,9 +68,12 @@ def test_start_live_sends_online_running_and_never_offline(monkeypatch):
 def test_full_online_requires_confirm(monkeypatch):
     seen = _setup(monkeypatch, {("POST", BASE): httpx.Response(202, json={"data": {"runId": "r2", "status": {}}})})
     out = json.loads(server.start_memory_test("kiosk", mode="full_online"))
-    assert out["error"] == "confirmation_required" and seen == []
+    assert out["confirmation_required"] is True and "STOPPED" in out["summary"]
+    assert out["preview"]["workload_stopped"] is True
+    assert out["next"]["arguments"]["confirm"] is True and out["next"]["arguments"]["mode"] == "full_online"
+    assert not [r for r in seen if r.method != "GET"]
     out = json.loads(server.start_memory_test("kiosk", mode="full_online", confirm=True))
-    assert json.loads(seen[0].content) == {"impact": "stopped", "placement": "online"}
+    assert json.loads([r for r in seen if r.method == "POST"][0].content) == {"impact": "stopped", "placement": "online"}
     assert out["started"] and "workload is stopped" in out["note"]
 
 
@@ -101,8 +104,8 @@ def test_no_placement_parameter_exposed():
 
 def test_bad_args_do_not_call_api(monkeypatch):
     seen = _setup(monkeypatch, {})
-    assert "passes" in json.loads(server.start_memory_test("kiosk", passes=99))["error"]
-    assert "Unknown mode" in json.loads(server.start_memory_test("kiosk", mode="weird"))["error"]
+    assert "passes" in json.loads(server.start_memory_test("kiosk", passes=99, confirm=True))["error"]
+    assert "Unknown mode" in json.loads(server.start_memory_test("kiosk", mode="weird", confirm=True))["error"]
     assert "limit" in json.loads(server.list_memory_test_results("kiosk", limit=0))["error"]
     assert seen == []
 
@@ -121,7 +124,7 @@ def test_error_codes_map_to_clear_messages(monkeypatch):
     ]
     for status, body, code, detail in cases:
         _setup(monkeypatch, {("POST", BASE): httpx.Response(status, json=body)})
-        out = json.loads(server.start_memory_test("kiosk", mode="live"))
+        out = json.loads(server.start_memory_test("kiosk", mode="live", confirm=True))
         assert out["code"] == code and out["http_status"] == status
         assert out["error"] and not out["error"].startswith("Admiral API")
         assert out.get("detail") == detail
@@ -131,17 +134,17 @@ def test_error_codes_map_to_clear_messages(monkeypatch):
 
 def test_cancel_not_running_and_plain_403(monkeypatch):
     _setup(monkeypatch, {("POST", BASE + "/cancel"): httpx.Response(409, json={"error": "not_running"})})
-    out = json.loads(server.cancel_memory_test("kiosk"))
+    out = json.loads(server.cancel_memory_test("kiosk", confirm=True))
     assert out["code"] == "not_running" and "nothing to cancel" in out["error"]
     # A 403 for no device access is not operator_required.
     _setup(monkeypatch, {("POST", BASE + "/cancel"): httpx.Response(403, json={"msg": "forbidden"})})
-    out = json.loads(server.cancel_memory_test("kiosk"))
+    out = json.loads(server.cancel_memory_test("kiosk", confirm=True))
     assert "code" not in out and "403" in out["error"]
 
 
 def test_cancel_sends_run_id(monkeypatch):
     seen = _setup(monkeypatch, {("POST", BASE + "/cancel"): _env({})})
-    out = json.loads(server.cancel_memory_test("kiosk", run_id="run-1"))
+    out = json.loads(server.cancel_memory_test("kiosk", run_id="run-1", confirm=True))
     assert json.loads(seen[0].content) == {"runId": "run-1"} and out["cancelled"] is True
 
 

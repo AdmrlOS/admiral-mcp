@@ -29,6 +29,11 @@ TEXT_REWRITES: tuple[tuple[str, str], ...] = (
         "List organisations visible to the signed-in user. Use when the user asks which org to use.",
     ),
     ("PAT cannot open the live websocket tail. ", "The live websocket tail is not available here. "),
+    (
+        "- Local secrets (stdio only): create_registry_credential / update_registry_credential read the secret from a local secret_file\n"
+        "  or a secret_env variable and upload_secret_file reads a local source_path; secrets and contents are never tool arguments.\n",
+        "",
+    ),
 )
 
 

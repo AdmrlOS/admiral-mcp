@@ -74,11 +74,14 @@ CORS_ALLOW_METHODS = "GET, POST, DELETE, OPTIONS"
 # Browser-based MCP clients send an Origin header; the SDK rejects origins not listed here.
 DEFAULT_ALLOWED_ORIGINS = ("https://claude.ai", "https://claude.com", "https://chatgpt.com")
 
-# Tools that cannot work over stateless request/response HTTP: SSE streams (and, were there any,
-# tools that write files on the server host).
+# Tools that cannot work over stateless request/response HTTP: SSE streams, and tools that read
+# secrets or files from the MCP process's own host (create/update_registry_credential, upload_secret_file).
 HOSTED_EXCLUDED_TOOLS: dict[str, str] = {
     "watch_device_state": "SSE stream: not available over stateless HTTP.",
     "watch_rollout": "SSE stream: not available over stateless HTTP.",
+    "create_registry_credential": "Reads the secret from a local file or environment variable of the MCP process; the hosted server has no access to the user's files.",
+    "update_registry_credential": "Reads the secret from a local file or environment variable of the MCP process; the hosted server has no access to the user's files.",
+    "upload_secret_file": "Reads the file from a local path of the MCP process; the hosted server has no access to the user's files.",
 }
 
 _HOSTED_AUTH_PARAGRAPH = (

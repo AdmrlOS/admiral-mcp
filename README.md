@@ -63,8 +63,8 @@ This server uses the historical query. Live tail cannot be opened with a PAT —
 | `query_telemetry_metrics` | Advanced: bounded read-only PromQL (instant or range) through the organisation-scoped Telemetry API |
 | `get_telemetry_scope` | What telemetry the caller can query (org-wide or specific fleets/devices) |
 | `search` | Global search |
-| `reboot_device` | Destructive; only on explicit request |
-| `start_memory_test` | RAM test. `mode=live` keeps the workload running (`quick`, `passes` optional); `mode=full_online` stops the workload for the run and needs `confirm=true`. A test boot is not offered here: start it from the dashboard or the device console |
+| `reboot_device` | Destructive: previews first, reboots only with `confirm=true` |
+| `start_memory_test` | RAM test. `mode=live` keeps the workload running (`quick`, `passes` optional); `mode=full_online` stops the workload for the run. Both modes preview first and start only with `confirm=true`. A test boot is not offered here: start it from the dashboard or the device console |
 | `cancel_memory_test` | Stop the running memory test (restarts the workload if it was held) |
 | `get_memory_test` | Status, coverage %, errors, verdict, retired pages, memory fault, capabilities; flags a fault or an interrupted last test |
 | `list_memory_test_results` | Stored results, newest first (`limit` 1-100); works offline |
@@ -74,13 +74,35 @@ This server uses the historical query. Live tail cannot be opened with a PAT —
 Mutating tools resolve names (ambiguous names return candidates and change nothing), refuse no-ops, and read the
 state back from the API after writing. They run only on an explicit request.
 
+**Two-step confirmation.** Every tool annotated `destructiveHint=true` takes `confirm: bool = false` (always the last
+parameter). Without `confirm=true` it only reads: it resolves names to UUIDs, computes the diff or the affected device
+counts and returns
+
+```json
+{"summary": "Not done yet: <exact effect>", "confirmation_required": true,
+ "action": {"tool": "...", "...": "targets and what changes"}, "preview": {"...": "diff / before-after / counts"},
+ "irreversible": false, "warnings": ["..."],
+ "next": {"tool": "...", "arguments": {"...": "resolved UUIDs", "confirm": true}},
+ "instruction": "Show this to the user and call again with confirm=true only after they explicitly agree."}
+```
+
+Show the preview to the user and call `next` only after they agree. Destructive means: changes what devices run or how
+they behave (reboot, workload commands, documents, local overrides, memory tests, configuration edits/rollbacks/
+deletes, fleet assignment, update policy, device moves and wipes, overrides, rollouts and rollout control), network/
+USB/SSH/security/registry-proxy/custom-metrics policy, and deletes, credential and secret-file changes. Harmless creates
+and metadata (`create_fleet`, `create_configuration`, `update_fleet`, `update_device`, `update_configuration_metadata`,
+`duplicate_*`, support tickets, alert rule create/update, `create_registry_credential`) are not gated.
+`edit_configuration` and `rollback_configuration` without `confirm` behave like the old `dry_run` (still accepted).
+Tests enforce the rule for every registered tool, and `register_extension` rejects an extension tool with
+`destructiveHint=true` that has no `confirm` parameter defaulting to false.
+
 | Tool | Use |
 |---|---|
 | `list_configurations` | Configurations with status, latest version and the fleets using each |
 | `get_configuration` | Metadata, spec of the latest (or a given) version, version history, fleets (credential-looking env values masked) |
 | `diff_configuration_versions` | Structured spec diff between two versions (default: previous → latest) |
 | `create_configuration` | New configuration (image/env/ports/command or a full spec) at version 1 |
-| `edit_configuration` | Edit the latest spec into a **new version**: `image`/`image_tag`, `env_set`/`env_unset`, `merge_patch`, or full `spec`. Needs `change_reason`; `base_version` guards concurrent edits; `dry_run` previews; shows which fleets follow `latest` vs pinned |
+| `edit_configuration` | Edit the latest spec into a **new version**: `image`/`image_tag`, `env_set`/`env_unset`, `merge_patch`, or full `spec`. Needs `change_reason` to write; `base_version` guards concurrent edits; without `confirm` it previews the diff; shows which fleets follow `latest` vs pinned |
 | `update_configuration_metadata` | Name, description, tags and lifecycle status |
 | `rollback_configuration` | New latest version copied from an earlier one |
 | `delete_configuration` | Refuses while a fleet or unfinished rollout still uses it |
@@ -90,13 +112,36 @@ state back from the API after writing. They run only on an explicit request.
 | `create_fleet`, `update_fleet` | Create a fleet; rename/describe/relocate and add/remove/replace tags |
 | `set_fleet_update_policy` | OS update policy (`latest`/`pinned` targets) and update window |
 | `update_device` | Name, notes, location, tags |
-| `move_device_to_fleet` | Move a device; it takes the new fleet's configuration immediately |
+| `move_device_to_fleet` | Move a device; it takes the new fleet's configuration immediately. `wipe=true` (`wipe_images`, `wipe_volumes`, `wipe_secure`) first erases its payload data: irreversible, needs a higher device permission and an online device, aborts the move if the wipe fails |
 | `get_device_configuration` | Inherited configuration, per-device override and the merged result |
 | `set_device_configuration_override`, `clear_device_configuration_override` | Per-device override layered over the fleet configuration |
 | `list_rollouts` | Compact rollout rows, filter by fleet/status/type |
 | `preview_rollout` | Read-only plan: current vs target per fleet, spec diff, device impact, strategy, warnings, and the exact `create_rollout` call |
 | `create_rollout` | `config` (default), `reboot`, `restart_workload` or `system_update` over one or more fleets |
 | `get_rollout`, `list_rollout_devices`, `rollout_control`, `watch_rollout` | Inspect, pause/resume/cancel/rollback, and follow a rollout |
+
+### Network, fleet policies, alerting, credentials, secret files
+
+| Tool | Use |
+|---|---|
+| `get_network_configuration` | A device's own and effective network configuration (a device override replaces the fleet's, no merging) or a fleet's default. Wi-Fi passwords are never returned (`has_psk`) |
+| `set_network_configuration` | Device override or fleet default, `mode=merge` (interfaces by MAC, networks by SSID, bridges by name are upserted) or `replace`; validated against the backend model; preview shows the effective diff and the risk of stranding devices |
+| `clear_network_configuration` | Remove the device override (back to the fleet's) or the fleet default |
+| `get_fleet_policies` | SSH, USB, registry proxy, security and custom-metrics policy of a fleet in one call; unentitled features show as a 402 note |
+| `set_fleet_ssh_access`, `set_fleet_custom_metrics` | On/off toggles |
+| `set_fleet_image_proxy`, `get_image_proxy_usage` | Registry proxy (billed by data carried, needs the billing permission) and its usage |
+| `set_fleet_security_policy` | TPM / secure boot / disk encryption / recovery-key escrow requirements; unchanged flags are re-sent |
+| `get_usb_policy`, `set_usb_policy`, `clear_usb_policy` | Fleet policy or per-device override (`off`, `block_storage_hid`, `allowlist` + rules); enterprise feature |
+| `list_alert_rules`, `get_alert_rule`, `list_alerts` | Rules, one rule with its evaluation health, alert history |
+| `preview_alert_rule` | Evaluates a rule definition without saving it (read-only POST) |
+| `create_alert_rule`, `update_alert_rule`, `delete_alert_rule` | Manage rules (Telemetry add-on for writes) |
+| `list_registry_credentials`, `get_registry_credential`, `delete_registry_credential` | Credentials never show secret values (`has_*` flags only); delete refuses while a configuration references it |
+| `create_registry_credential`, `update_registry_credential` | Stdio only. The secret is read from `secret_file` (a local path) or `secret_env` (an environment variable of the MCP process); it is never an argument and never appears in output |
+| `list_secret_files`, `delete_secret_file` | Secret file metadata of a configuration or device (path, mode, size, sha256, apply state); never contents |
+| `upload_secret_file` | Stdio only. Uploads a local `source_path` (64 KiB max) to a configuration or device; the confirmed call pins the file's sha256 |
+
+The stdio-only tools are excluded from the browser and hosted builds (`browser.EXCLUDED_TOOLS`,
+`hosted.HOSTED_EXCLUDED_TOOLS`): those runtimes cannot read your files or environment.
 
 **Applying a configuration change.** Saving a new version or assigning a configuration to a fleet pushes nothing: a
 device reads its desired state when it (re)connects and when a rollout, fleet move or document push reaches it. A
@@ -174,7 +219,7 @@ Hermes prefixes tools as `mcp_admrl_*`. Restart the desktop app after adding.
 `admrl_mcp.browser` runs the same tools inside Pyodide in a Web Worker, authenticated with the
 dashboard user's session token (`Authorization: Bearer` + `X-Organization-ID`) instead of a PAT.
 HTTP goes through a synchronous-XHR httpx transport; `set_auth()` is called before every tool call.
-Tools that cannot work there (`watch_*` SSE streams) are not offered
+Tools that cannot work there (`watch_*` SSE streams, and the stdio-only secret tools) are not offered
 (`browser.EXCLUDED_TOOLS`). The PAT/stdio server is unchanged. The dashboard builds the wheel set
 with `npm run mcp:bundle`; see `admiral-dashboard/src/lib/assistant/runtime/README.md`.
 
@@ -182,7 +227,8 @@ with `npm run mcp:bundle`; see `admiral-dashboard/src/lib/assistant/runtime/READ
 
 Extra tool packages can be plugged in without changing this package. An extension is an importable
 module with `register(mcp: FastMCP) -> list[str]` that adds tools and returns their names. Every tool it
-adds must set `ToolAnnotations(readOnlyHint=...)` explicitly, or the extension is rejected. Optional module
+adds must set `ToolAnnotations(readOnlyHint=...)` explicitly, and a tool with `destructiveHint=True` must take a
+`confirm: bool = False` parameter (see the two-step confirmation above), or the extension is rejected. Optional module
 attributes: `INSTRUCTIONS` (text appended to the server instructions) and `BROWSER_EXCLUDED_TOOLS`
 (`{tool: reason}`, tools the browser must not offer).
 

@@ -270,7 +270,7 @@ def test_patch_device_document_sends_merge_patch_with_if_match(monkeypatch):
     install(monkeypatch, api)
     patch = {"spec": {"system": {"screenshots": "disabled"}}}
 
-    out = json.loads(server.patch_device_document("dan-qemu-3", patch, if_match="rv7", change_reason="test"))
+    out = json.loads(server.patch_device_document("dan-qemu-3", patch, if_match="rv7", change_reason="test", confirm=True))
 
     req = api.only()
     assert req.method == "PATCH"
@@ -287,9 +287,9 @@ def test_patch_device_document_accepts_json_string_and_rejects_empty(monkeypatch
     api.on("PATCH", f"/devices/{DEV}/document", httpx.Response(200, json=DOC))
     install(monkeypatch, api)
 
-    assert "error" in json.loads(server.patch_device_document(DEV, {}))
+    assert "error" in json.loads(server.patch_device_document(DEV, {}, confirm=True))
     assert api.seen == []
-    json.loads(server.patch_device_document(DEV, '{"spec": {"fleet": "f2"}}'))
+    json.loads(server.patch_device_document(DEV, '{"spec": {"fleet": "f2"}}', confirm=True))
     req = api.only()
     assert json.loads(req.content) == {"spec": {"fleet": "f2"}}
     assert "If-Match" not in req.headers
@@ -299,7 +299,7 @@ def test_patch_device_document_conflict(monkeypatch):
     api = FakeAPI()
     api.on("PATCH", f"/devices/{DEV}/document", httpx.Response(409, json={"code": 409, "msg": "resourceVersion mismatch"}))
     install(monkeypatch, api)
-    out = json.loads(server.patch_device_document(DEV, {"spec": {}}, if_match="old"))
+    out = json.loads(server.patch_device_document(DEV, {"spec": {}}, if_match="old", confirm=True))
     assert "409" in out["error"]
 
 
@@ -313,7 +313,10 @@ def test_render_device_document_is_dry_run_by_default(monkeypatch):
     assert dict(api.seen[-1].url.params) == {"dryRun": "1"}
     assert out["dry_run"] is True and out["render"]["revision"] == "r1"
 
-    json.loads(server.render_device_document("dan-qemu-3", push=True))
+    gated = json.loads(server.render_device_document("dan-qemu-3", push=True))
+    assert gated["confirmation_required"] is True and dict(api.seen[-1].url.params) == {"dryRun": "1"}
+    assert gated["next"]["arguments"] == {"device": DEV, "push": True, "confirm": True, "organization_id": "org-1"}
+    json.loads(server.render_device_document("dan-qemu-3", push=True, confirm=True))
     assert dict(api.seen[-1].url.params) == {}
     assert api.seen[-1].method == "POST"
     assert_pat(api.seen[-1])
@@ -325,7 +328,7 @@ def test_adopt_local_override(monkeypatch):
         200, json={"adopted": ["network"], "notAdopted": [], "document": DOC}, headers={"ETag": '"rv9"'}))
     install(monkeypatch, api)
 
-    out = json.loads(server.adopt_local_override("dan-qemu-3", if_match="rv8"))
+    out = json.loads(server.adopt_local_override("dan-qemu-3", if_match="rv8", confirm=True))
 
     req = api.only()
     assert req.method == "POST" and req.headers["If-Match"] == '"rv8"'
@@ -338,11 +341,11 @@ def test_discard_local_override_defaults_to_all_paths(monkeypatch):
            lambda r: httpx.Response(200, json={"deviceId": DEV, "paths": json.loads(r.content)["paths"], "sent": True}))
     install(monkeypatch, api)
 
-    out = json.loads(server.discard_local_override("dan-qemu-3"))
+    out = json.loads(server.discard_local_override("dan-qemu-3", confirm=True))
     assert json.loads(api.seen[-1].content) == {"paths": ["*"]}
     assert out["result"]["sent"] is True
 
-    json.loads(server.discard_local_override("dan-qemu-3", paths=["network", "system.hostname"]))
+    json.loads(server.discard_local_override("dan-qemu-3", paths=["network", "system.hostname"], confirm=True))
     assert json.loads(api.seen[-1].content) == {"paths": ["network", "system.hostname"]}
 
 
@@ -444,7 +447,7 @@ def test_create_rollout_resolves_names_latest_version_and_strategy(monkeypatch):
 
     out = json.loads(server.create_rollout(
         "AlexConfigTest", "kiosk", "latest",
-        strategy={"canary": 1, "max_in_flight": 5, "failureThreshold": 0.2, "progress_deadline": "10m"}))
+        strategy={"canary": 1, "max_in_flight": 5, "failureThreshold": 0.2, "progress_deadline": "10m"}, confirm=True))
 
     post = api.seen[-1]
     assert post.method == "POST" and post.url.path == "/v1/rollouts"
@@ -466,7 +469,7 @@ def test_create_rollout_with_uuids_and_explicit_version_skips_lookups(monkeypatc
     api.on("POST", "/rollouts", httpx.Response(201, json=envelope({"id": ROLLOUT})))
     install(monkeypatch, api)
 
-    json.loads(server.create_rollout(FLEET, CONFIG, 3, name="r1"))
+    json.loads(server.create_rollout(FLEET, CONFIG, 3, name="r1", confirm=True))
 
     body = json.loads(api.only().content)
     assert body["fleet_ids"] == [FLEET] and body["config_spec"] == {"config_id": CONFIG, "config_version": 3}
@@ -476,7 +479,7 @@ def test_create_rollout_with_uuids_and_explicit_version_skips_lookups(monkeypatc
 def test_create_rollout_rejects_unknown_strategy_field(monkeypatch):
     api = FakeAPI()
     install(monkeypatch, api)
-    out = json.loads(server.create_rollout(FLEET, CONFIG, 3, strategy={"batch": 3}))
+    out = json.loads(server.create_rollout(FLEET, CONFIG, 3, strategy={"batch": 3}, confirm=True))
     assert "Unknown strategy field" in out["error"] and api.seen == []
 
 
@@ -506,7 +509,7 @@ def test_rollout_control_actions(monkeypatch, action):
         {"rolloutId": ROLLOUT, "action": action, "status": "signalled"})))
     install(monkeypatch, api)
 
-    out = json.loads(server.rollout_control(ROLLOUT, action.upper(), reason="because"))
+    out = json.loads(server.rollout_control(ROLLOUT, action.upper(), reason="because", confirm=True))
 
     req = api.only()
     assert json.loads(req.content) == {"reason": "because"}
@@ -517,7 +520,7 @@ def test_rollout_control_actions(monkeypatch, action):
 def test_rollout_control_rejects_unknown_action(monkeypatch):
     api = FakeAPI()
     install(monkeypatch, api)
-    out = json.loads(server.rollout_control(ROLLOUT, "delete"))
+    out = json.loads(server.rollout_control(ROLLOUT, "delete", confirm=True))
     assert "Unsupported" in out["error"] and api.seen == []
 
 

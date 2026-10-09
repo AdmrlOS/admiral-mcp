@@ -75,13 +75,31 @@ How to answer naturally:
   device to compare one device with its fleet), get_fleet_health, get_fleet_uptime, get_org_metrics (org-wide, by
   fleet or device, top N), query_telemetry_metrics (raw PromQL), get_telemetry_scope. A 402 means the organisation
   lacks the Telemetry add-on (billing gate, not an outage).
-- Memory tests: start_memory_test (mode live keeps the workload running; full_online stops it and needs
-  confirm=true after the user agrees), cancel_memory_test, get_memory_test, list_memory_test_results.
+- Memory tests: start_memory_test (mode live keeps the workload running; full_online stops it),
+  cancel_memory_test, get_memory_test, list_memory_test_results.
   A test boot is not available here: the user starts it from the dashboard or the device console.
-- Destructive actions (reboot, document patches, local-override adopt/discard, configuration edits, rollbacks and
-  deletes, fleet assignment, moving a device, rollouts and rollout control) require an explicit user request.
-  Confirm the exact device/fleet/configuration first; ambiguous names return candidates and change nothing. Every
-  mutating tool reads the state back from the API and reports it: trust that, not the 200.
+- Network: get_network_configuration / set_network_configuration / clear_network_configuration for a device (override,
+  replaces the fleet's) or a fleet (default). A wrong network config can strand devices: read the preview's diff and risks.
+- Fleet policies: get_fleet_policies (SSH, USB, registry proxy, security, custom metrics in one call), set_fleet_ssh_access,
+  get_usb_policy / set_usb_policy / clear_usb_policy (fleet or device), set_fleet_image_proxy (billed) with
+  get_image_proxy_usage, set_fleet_security_policy, set_fleet_custom_metrics. A 402 is a billing entitlement, not a fault.
+- Alerting: list_alert_rules, get_alert_rule, list_alerts (history), preview_alert_rule (evaluates, saves nothing),
+  create_alert_rule, update_alert_rule, delete_alert_rule. Needs the Telemetry add-on for writes and previews.
+- Registry credentials: list_registry_credentials, get_registry_credential, delete_registry_credential. Secret files:
+  list_secret_files, delete_secret_file. Secret values and file contents are never returned.
+- Local secrets (stdio only): create_registry_credential / update_registry_credential read the secret from a local secret_file
+  or a secret_env variable and upload_secret_file reads a local source_path; secrets and contents are never tool arguments.
+- Two-step confirmation: every destructive tool (annotated destructiveHint) takes confirm=false by default and then only
+  READS: it resolves names to UUIDs and returns {summary: "Not done yet: ...", confirmation_required, action, preview
+  (diff, before/after, affected counts), irreversible, next: {tool, arguments incl. confirm: true}}. Show that to the
+  user, and call the tool again with `next.arguments` (confirm=true) only after they explicitly agree. Never set
+  confirm=true on the first call, and never reuse a confirmation for a different target. Covered: reboot, workload
+  commands, document patches/pushes, local-override adopt/discard, memory tests, configuration edits/rollbacks/deletes,
+  fleet assignment and update policy, moving a device (wipe=true erases its data, irreversible), device overrides,
+  rollouts and rollout control, network/USB/SSH/security/registry-proxy/custom-metrics policy, alert rule deletes,
+  registry credential changes/deletes and secret file uploads/deletes.
+- Ambiguous names return candidates and change nothing. Every mutating tool reads the state back from the API and
+  reports it: trust that, not the 200.
 
 Auth is a Personal API Token (X-API-Token-ID + X-API-Secret-Key). Organisation
 context is X-Organization-ID; list_organisations if ADMRL_ORG_ID is unset.
@@ -147,6 +165,8 @@ def _err(exc: Exception) -> str:
         )
     if isinstance(exc, ToolRefusal):
         return _dumps(exc.payload)
+    if isinstance(exc, Reply):
+        return _dumps(exc.payload)
     if isinstance(exc, AdmiralAPIError):
         out: dict[str, Any] = {"error": str(exc)}
         if exc.status == 402:
@@ -162,6 +182,33 @@ def _err(exc: Exception) -> str:
     if isinstance(exc, ConfigError):
         return _dumps({"error": str(exc)})
     return _dumps({"error": f"{type(exc).__name__}: {exc}"})
+
+
+def _gate(
+    confirm: Any,
+    tool: str,
+    effect: str,
+    *,
+    action: dict[str, Any],
+    args: dict[str, Any],
+    org_id: str | None = None,
+    preview: dict[str, Any] | None = None,
+    irreversible: bool = False,
+    warnings: list[str] | None = None,
+) -> str | None:
+    """Confirmation gate for destructive tools: ``None`` when ``confirm`` is true, else the preview payload.
+
+    Callers resolve everything (names to UUIDs, current state, the diff) with reads first, then call this
+    before the first mutating request. ``args`` are the resolved arguments of the confirmed call.
+    """
+    if confirm is True:
+        return None
+    arguments = dict(args)
+    if org_id:
+        arguments["organization_id"] = org_id
+    return _dumps(
+        ops.confirmation(tool, effect, action=action, preview=preview, arguments=arguments, irreversible=irreversible, warnings=warnings)
+    )
 
 
 def _rfc3339_hours_ago(hours: float) -> tuple[str, str]:
@@ -1369,15 +1416,27 @@ def search(query: str, organization_id: str | None = None, limit: int = 20) -> s
 
 
 @mcp.tool(
-    description="Reboot a device. Destructive. Only call when the user explicitly asked to reboot this specific device.",
+    description="Reboot a device. Destructive: without confirm=true it only resolves the device and returns a preview; call again with confirm=true after the user explicitly agrees to reboot this specific device.",
     annotations=ToolAnnotations(destructiveHint=True, idempotentHint=False, readOnlyHint=False),
 )
-def reboot_device(device: str, organization_id: str | None = None) -> str:
+def reboot_device(device: str, organization_id: str | None = None, confirm: bool = False) -> str:
     try:
         found = _resolve_device(device, organization_id)
         if not found.get("match"):
             return _dumps(found)
-        result = get_client().reboot_device(found["match"]["id"], org_id=found["organization_id"])
+        match = found["match"]
+        gate = _gate(
+            confirm,
+            "reboot_device",
+            f"reboot {match.get('name') or match['id']}. The device goes offline while it restarts and its workload is interrupted.",
+            action={"device": {"id": match["id"], "name": match.get("name")}, "changes": "the device reboots now"},
+            args={"device": match["id"]},
+            org_id=found["organization_id"],
+            preview={"device": match},
+        )
+        if gate:
+            return gate
+        result = get_client().reboot_device(match["id"], org_id=found["organization_id"])
         return _dumps({"device": found["match"], "result": result})
     except Exception as inf:
         return _err(inf)
@@ -1389,7 +1448,7 @@ def reboot_device(device: str, organization_id: str | None = None) -> str:
         "Resolves the device first (ambiguous names return candidates and send nothing). "
         "start/stop toggle the current workload; restart relaunches the same image; "
         "recreate tears down the workload bundle and rebuilds it from the current configuration. "
-        "Destructive — only on an explicit user request for a uniquely resolved device. "
+        "Destructive — without confirm=true it only previews; confirm after the user explicitly agrees. "
         "The result is the edge's acknowledgement, not steady state: confirm with "
         "get_device_workload afterwards. Runtime-only: the configuration still points at the "
         "workload, so a config push or rollout can start a stopped workload again."
@@ -1400,6 +1459,7 @@ def change_workload_status(
     device: str,
     action: str,
     organization_id: str | None = None,
+    confirm: bool = False,
 ) -> str:
     try:
         normalised = (action or "").strip().lower()
@@ -1414,6 +1474,17 @@ def change_workload_status(
         found = _resolve_device(device, organization_id)
         if not found.get("match"):
             return _dumps(found)
+        if confirm is not True:
+            now = _safe(lambda: get_client().get_device_workload(found["match"]["id"], org_id=found["organization_id"]), [], "workload")
+            return _gate(
+                confirm,
+                "change_workload_status",
+                f"{normalised} the workload on {found['match'].get('name') or found['match']['id']}. It is interrupted while the device applies the command.",
+                action={"device": found["match"], "workload_action": normalised, "changes": "the running workload"},
+                args={"device": found["match"]["id"], "action": normalised},
+                org_id=found["organization_id"],
+                preview={"workload_now": now},
+            ) or ""
         result = get_client().workload_command(
             found["match"]["id"], action=normalised, org_id=found["organization_id"]
         )
@@ -1568,7 +1639,7 @@ def get_device_document(device: str, format: str = "json", organization_id: str 
         "metadata.generation and push desired state to the device. spec.workload.from, spec.system.updates and "
         "spec.secrets are read-only. if_match = resource_version from get_device_document (409 on mismatch). "
         "Returns push outcome (X-Admrl-Push: sent|failed|skipped|unavailable), changed paths and the new document. "
-        "Mutating — only on an explicit user request for a uniquely resolved device."
+        "Destructive: without confirm=true it only shows the diff; confirm after the user explicitly agrees."
     ),
     annotations=ToolAnnotations(destructiveHint=True, idempotentHint=False, readOnlyHint=False),
 )
@@ -1578,6 +1649,7 @@ def patch_device_document(
     if_match: str | None = None,
     change_reason: str | None = None,
     organization_id: str | None = None,
+    confirm: bool = False,
 ) -> str:
     try:
         patch = json.loads(merge_patch) if isinstance(merge_patch, str) else merge_patch
@@ -1586,6 +1658,21 @@ def patch_device_document(
         found = _resolve_device(device, organization_id)
         if not found.get("match"):
             return _dumps(found)
+        if confirm is not True:
+            current = get_client().get_device_document(found["match"]["id"], org_id=found["organization_id"])
+            doc = _json_or_text(current)
+            rows = ops.json_diff(doc, ops.merge_patch(doc, patch)) if isinstance(doc, dict) else []
+            return _gate(
+                confirm,
+                "patch_device_document",
+                f"patch the desired-state document of {found['match'].get('name') or found['match']['id']} "
+                f"({len(rows)} field(s) change); it is pushed to the device.",
+                action={"device": found["match"], "changes": "the device's desired state (spec)"},
+                args={"device": found["match"]["id"], "merge_patch": patch, "if_match": if_match or _etag(current), "change_reason": change_reason},
+                org_id=found["organization_id"],
+                preview={"resource_version": _etag(current), "diff": rows[:60], "diff_truncated": len(rows) > 60},
+                warnings=["if_match is pinned to the version just read: the confirmed call fails with 409 if the document changed in between."],
+            ) or ""
         response = get_client().patch_device_document(
             found["match"]["id"],
             patch,
@@ -1612,15 +1699,27 @@ def patch_device_document(
         "Render the desired-state bundle a device would receive (POST /devices/{id}/document:render): bundle "
         "(secrets stripped, credentials redacted), revision, diff [{path, from, to}] against what the device "
         "last reported, converged, pushed. Dry run by default (nothing is sent). push=true also pushes the "
-        "bundle to the device — only on an explicit request."
+        "bundle to the device: that needs confirm=true (without it the dry-run diff is returned as a preview)."
     ),
-    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True),
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True),
 )
-def render_device_document(device: str, push: bool = False, organization_id: str | None = None) -> str:
+def render_device_document(device: str, push: bool = False, organization_id: str | None = None, confirm: bool = False) -> str:
     try:
         found = _resolve_device(device, organization_id)
         if not found.get("match"):
             return _dumps(found)
+        if push and confirm is not True:
+            dry = get_client().render_device_document(found["match"]["id"], org_id=found["organization_id"], dry_run=True)
+            diff = dry.get("diff") if isinstance(dry, dict) else None
+            return _gate(
+                confirm,
+                "render_device_document",
+                f"push the rendered desired state to {found['match'].get('name') or found['match']['id']} now ({len(diff or [])} difference(s) vs what it reported).",
+                action={"device": found["match"], "changes": "pushes the desired-state bundle to the device"},
+                args={"device": found["match"]["id"], "push": True},
+                org_id=found["organization_id"],
+                preview={"diff": diff, "revision": dry.get("revision") if isinstance(dry, dict) else None, "converged": dry.get("converged") if isinstance(dry, dict) else None},
+            ) or ""
         result = get_client().render_device_document(
             found["match"]["id"], org_id=found["organization_id"], dry_run=not push
         )
@@ -1634,15 +1733,31 @@ def render_device_document(device: str, push: bool = False, organization_id: str
         "Adopt a device's local override (made on the device via TUI, BLE or console) into its spec "
         "(POST /devices/{id}/document:adoptLocalOverride): network → spec.network, system fields → spec.system. "
         "Bumps generation and pushes; the device then clears its override. Paths the backend cannot store are "
-        "listed in notAdopted. 409 when there is no local override or if_match is stale. Mutating."
+        "listed in notAdopted. 409 when there is no local override or if_match is stale. Destructive: needs confirm=true."
     ),
     annotations=ToolAnnotations(destructiveHint=True, idempotentHint=False, readOnlyHint=False),
 )
-def adopt_local_override(device: str, if_match: str | None = None, organization_id: str | None = None) -> str:
+def adopt_local_override(
+    device: str, if_match: str | None = None, organization_id: str | None = None, confirm: bool = False
+) -> str:
     try:
         found = _resolve_device(device, organization_id)
         if not found.get("match"):
             return _dumps(found)
+        if confirm is not True:
+            current = get_client().get_device_document(found["match"]["id"], org_id=found["organization_id"])
+            doc = _json_or_text(current)
+            status = (doc.get("status") or {}) if isinstance(doc, dict) else {}
+            return _gate(
+                confirm,
+                "adopt_local_override",
+                f"copy the local override on {found['match'].get('name') or found['match']['id']} into its stored spec (network, system fields); it is pushed and the device clears its override.",
+                action={"device": found["match"], "changes": "the device's stored spec.network / spec.system"},
+                args={"device": found["match"]["id"], "if_match": if_match or _etag(current)},
+                org_id=found["organization_id"],
+                preview={"resource_version": _etag(current), "local_override": status.get("localOverride") or status.get("local_override"), "spec": (doc.get("spec") if isinstance(doc, dict) else None)},
+                warnings=["409 if the device has no local override."],
+            ) or ""
         response = get_client().adopt_local_override(
             found["match"]["id"], org_id=found["organization_id"], if_match=if_match
         )
@@ -1658,17 +1773,29 @@ def adopt_local_override(device: str, if_match: str | None = None, organization_
         "Tell a device to drop its local override (POST /devices/{id}/document:discardLocalOverride). paths "
         "defaults to [\"*\"]; valid paths: network, system.diagnosticsMode, system.timezone, system.hostname. "
         "Can remove connectivity from a device that depends on a locally entered network. Protocol-1 firmware "
-        "only (409 otherwise). Destructive — explicit request only."
+        "only (409 otherwise). Destructive: needs confirm=true after the user agrees."
     ),
     annotations=ToolAnnotations(destructiveHint=True, idempotentHint=True, readOnlyHint=False),
 )
 def discard_local_override(
-    device: str, paths: list[str] | None = None, organization_id: str | None = None
+    device: str, paths: list[str] | None = None, organization_id: str | None = None, confirm: bool = False
 ) -> str:
     try:
         found = _resolve_device(device, organization_id)
         if not found.get("match"):
             return _dumps(found)
+        gate = _gate(
+            confirm,
+            "discard_local_override",
+            f"drop the local override ({', '.join(paths or ['*'])}) on {found['match'].get('name') or found['match']['id']}. "
+            "A device that depends on a locally entered network can lose connectivity.",
+            action={"device": found["match"], "paths": paths or ["*"], "changes": "removes settings made locally on the device"},
+            args={"device": found["match"]["id"], "paths": paths or ["*"]},
+            org_id=found["organization_id"],
+            preview={"device": found["match"]},
+        )
+        if gate:
+            return gate
         result = get_client().discard_local_override(
             found["match"]["id"], org_id=found["organization_id"], paths=paths or ["*"]
         )
@@ -1719,8 +1846,8 @@ def _memtest_error(exc: Exception) -> str:
     description=(
         "Start a RAM test on a device. mode='live': the workload keeps running and a bounded slice of free "
         "memory is tested (quick=true is a shorter, lighter preset). mode='full_online': the workload is STOPPED "
-        "for the whole test so nearly all free memory is tested; because that interrupts the workload you must "
-        "pass confirm=true after the user agreed. passes sets the number of passes (live default 1, full online "
+        "for the whole test so nearly all free memory is tested. Without confirm=true nothing starts: you get a preview "
+        "(both modes), and call again with confirm=true after the user agreed. passes sets the number of passes (live default 1, full online "
         "default 2). A test boot (reboot into a dedicated test) is not available here: the user starts that "
         "from the dashboard or the device console. The device must be online. One test per device at a time; "
         "starts are rate-limited to one per 5 seconds. Returns the run id: follow progress with get_memory_test, "
@@ -1733,8 +1860,8 @@ def start_memory_test(
     mode: str = "live",
     quick: bool | None = None,
     passes: int | None = None,
-    confirm: bool = False,
     organization_id: str | None = None,
+    confirm: bool = False,
 ) -> str:
     try:
         norm = (mode or "").strip().lower().replace("-", "_").replace(" ", "_")
@@ -1742,23 +1869,27 @@ def start_memory_test(
             return _dumps({"error": memtest.OFFLINE_MESSAGE, "code": "operator_required"})
         if norm not in memtest.MODES:
             return _dumps({"error": f"Unknown mode {mode!r}. Use 'live' or 'full_online'."})
-        if norm == "full_online" and confirm is not True:
-            return _dumps(
-                {
-                    "error": "confirmation_required",
-                    "message": (
-                        "mode 'full_online' stops the device's workload for the duration of the test (typically tens of "
-                        "minutes or more). Ask the user to confirm, then call again with confirm=true. "
-                        "mode 'live' leaves the workload running."
-                    ),
-                }
-            )
         if passes is not None and not 1 <= int(passes) <= 20:
             return _dumps({"error": "passes must be between 1 and 20."})
         found = _resolve_device(device, organization_id)
         if not found.get("match"):
             return _dumps(found)
         body = memtest.start_body(norm, quick, passes)
+        if confirm is not True:
+            now = _safe(lambda: get_client().get_memory_test(found["match"]["id"], org_id=found["organization_id"]), [], "memory test")
+            now = now if isinstance(now, dict) else {}
+            stops = norm == "full_online"
+            return _gate(
+                confirm,
+                "start_memory_test",
+                f"start a {norm} memory test on {found['match'].get('name') or found['match']['id']}"
+                + (": the workload is STOPPED for the whole test (typically tens of minutes or more) and restarts when it ends." if stops else "; the workload keeps running."),
+                action={"device": found["match"], "mode": norm, "changes": "stops the workload for the duration of the test" if stops else "adds memory-test load"},
+                args={"device": found["match"]["id"], "mode": norm, "quick": quick, "passes": passes},
+                org_id=found["organization_id"],
+                preview={"request": body, "workload_stopped": stops, "current": memtest.summarise_status(now.get("status")), "supported": bool(now.get("supported"))},
+                warnings=["The device must be online; one test per device at a time."],
+            ) or ""
         result = get_client().start_memory_test(found["match"]["id"], body, org_id=found["organization_id"])
         result = result if isinstance(result, dict) else {}
         out: dict[str, Any] = {
@@ -1780,15 +1911,29 @@ def start_memory_test(
     description=(
         "Cancel the memory test running on a device. If a full online test had stopped the workload, the device "
         "restarts it. Optional run_id (from start_memory_test) guards against cancelling a different run. "
-        "Answers with a clear message when no test is running."
+        "Answers with a clear message when no test is running. Needs confirm=true (without it: a preview of the running test)."
     ),
     annotations=ToolAnnotations(destructiveHint=True, idempotentHint=True, readOnlyHint=False),
 )
-def cancel_memory_test(device: str, run_id: str | None = None, organization_id: str | None = None) -> str:
+def cancel_memory_test(
+    device: str, run_id: str | None = None, organization_id: str | None = None, confirm: bool = False
+) -> str:
     try:
         found = _resolve_device(device, organization_id)
         if not found.get("match"):
             return _dumps(found)
+        if confirm is not True:
+            now = _safe(lambda: get_client().get_memory_test(found["match"]["id"], org_id=found["organization_id"]), [], "memory test")
+            now = now if isinstance(now, dict) else {}
+            return _gate(
+                confirm,
+                "cancel_memory_test",
+                f"cancel the memory test on {found['match'].get('name') or found['match']['id']}; if a full online test had stopped the workload, the device restarts it.",
+                action={"device": found["match"], "run_id": run_id, "changes": "stops the running memory test"},
+                args={"device": found["match"]["id"], "run_id": run_id},
+                org_id=found["organization_id"],
+                preview={"current": memtest.summarise_status(now.get("status"))},
+            ) or ""
         result = get_client().cancel_memory_test(
             found["match"]["id"], run_id=run_id, org_id=found["organization_id"]
         )
@@ -1926,7 +2071,8 @@ def _pick_by_name(rows: list[dict[str, Any]], name: str, what: str) -> dict[str,
         "maxUnavailable, failureThreshold (0-1 of admitted), progressDeadline (\"30m\" or seconds)}. Devices are admitted "
         "only while online, canary first, then a window of maxInFlight; the rollout pauses on the failure budget and "
         "stays in_progress until every target converges. A config rollout to the version a device already runs never "
-        "converges: run preview_rollout first. Changes devices — explicit request only. Follow with watch_rollout."
+        "converges: run preview_rollout first. Changes devices: without confirm=true it only returns the plan (fleets, device counts, impact); "
+        "call again with confirm=true after the user agrees. Follow with watch_rollout."
     ),
     annotations=ToolAnnotations(destructiveHint=True, idempotentHint=False, readOnlyHint=False),
 )
@@ -1944,6 +2090,7 @@ def create_rollout(
     use_current_versions: bool = False,
     version_ids: list[str] | None = None,
     final_action: str | None = None,
+    confirm: bool = False,
 ) -> str:
     try:
         client = get_client()
@@ -2002,6 +2149,45 @@ def create_rollout(
             body["description"] = description
         if strat:
             body["strategy"] = strat
+        if confirm is not True:
+            details = _parallel_map(lambda fid: _safe(lambda: client.get(f"fleets/{fid}", org_id=org_id), [], "fleet"), fleet_ids)
+            counts = [
+                {"id": fid, "name": (d or {}).get("name") or next((f.get("name") for f in fleet_rows if str(f["id"]) == fid), None),
+                 "devices": (d or {}).get("devices"), "online": (d or {}).get("online")}
+                for fid, d in zip(fleet_ids, details)
+            ]
+            impact = _safe(lambda: client.post("rollouts/impact", org_id=org_id, json={"fleet_ids": fleet_ids, "type": kind}), [], "impact")
+            total = sum(int(c["devices"] or 0) for c in counts)
+            next_args: dict[str, Any] = {
+                "fleet": fleet_ids if len(fleet_ids) > 1 else fleet_ids[0],
+                "type": kind,
+                "name": body["name"],
+                "description": description,
+                "strategy": strategy,
+            }
+            if kind == "config":
+                next_args.update({"configuration": body["config_spec"]["config_id"], "version": body["config_spec"]["config_version"]})
+            else:
+                next_args.update(
+                    {
+                        "force": True if force else None,
+                        "container_target": container_target,
+                        "use_current_versions": True if use_current_versions else None,
+                        "version_ids": version_ids,
+                        "final_action": final_action,
+                    }
+                )
+            return _gate(
+                confirm,
+                "create_rollout",
+                f"create a {kind} rollout over {', '.join(str(c['name'] or c['id']) for c in counts)} ({total} device(s)); "
+                "devices are admitted canary-first and change as soon as the rollout starts.",
+                action={"type": kind, "fleets": [{"id": c["id"], "name": c["name"]} for c in counts], "changes": "what the fleet's devices run or do"},
+                args=next_args,
+                org_id=org_id,
+                preview={"request": body, "fleets": counts, "impact": impact},
+                warnings=["Run preview_rollout first for the spec diff and warnings (a config rollout to the version a device already runs never converges)."],
+            ) or ""
         result = client.create_rollout(body, org_id=org_id)
         return _dumps({"request": body, "rollout": result, "watch_with": "watch_rollout"})
     except Exception as exc:
@@ -2053,13 +2239,14 @@ def list_rollout_devices(
 @mcp.tool(
     description=(
         "Control a rollout: pause, resume, cancel or rollback (POST /rollouts/{id}/{action}, optional reason ≤ "
-        "500 chars). rollback reverts only admitted devices. Returns the signalled acknowledgement (202), not "
-        "the new steady state — confirm with get_rollout or watch_rollout. Explicit request only."
+        "500 chars). rollback reverts only admitted devices. Without confirm=true it only shows the rollout's state; "
+        "call again with confirm=true after the user agrees. Returns the signalled acknowledgement (202), not "
+        "the new steady state — confirm with get_rollout or watch_rollout."
     ),
     annotations=ToolAnnotations(destructiveHint=True, idempotentHint=False, readOnlyHint=False),
 )
 def rollout_control(
-    rollout_id: str, action: str, reason: str | None = None, organization_id: str | None = None
+    rollout_id: str, action: str, reason: str | None = None, organization_id: str | None = None, confirm: bool = False
 ) -> str:
     try:
         normalised = (action or "").strip().lower()
@@ -2067,6 +2254,21 @@ def rollout_control(
             return _dumps({"error": f"Unsupported action {action!r}", "choices": list(AdmiralClient.ROLLOUT_ACTIONS)})
         client = get_client()
         org_id = DeviceResolver(client).resolve_org(organization_id)
+        if confirm is not True:
+            current = client.get_rollout(rollout_id.strip(), org_id=org_id)
+            current = current if isinstance(current, dict) else {}
+            final = normalised in ("cancel", "rollback")
+            return _gate(
+                confirm,
+                "rollout_control",
+                f"{normalised} rollout {current.get('name') or rollout_id} (now {current.get('status')}).",
+                action={"rollout": {"id": rollout_id.strip(), "name": current.get("name")}, "control": normalised, "changes": "the rollout and the devices it already admitted"},
+                args={"rollout_id": rollout_id.strip(), "action": normalised, "reason": reason},
+                org_id=org_id,
+                preview={"status": current.get("status"), "paused_reason": current.get("pausedReason"), "counts": current.get("counts")},
+                irreversible=final,
+                warnings=(["cancel keeps the device pins and cannot be resumed; a cancelled rollout cannot be rolled back."] if normalised == "cancel" else ["rollback reverts only the devices already admitted."] if normalised == "rollback" else None),
+            ) or ""
         result = client.rollout_control(rollout_id.strip(), normalised, org_id=org_id, reason=reason)
         return _dumps({"rollout_id": rollout_id, "action": normalised, "result": result, "verify_with": "get_rollout"})
     except Exception as exc:
@@ -2662,8 +2864,8 @@ def create_configuration(
         "/configurations/{id}/spec). Edits: image (full reference) or image_tag (swap the tag only), env_set {NAME: value}, "
         "env_unset [NAME], merge_patch (RFC 7386 JSON merge patch over the spec, null deletes a key, lists replace), or spec "
         "(whole replacement, exclusive with the others). change_reason is required to write. base_version refuses the edit "
-        "if the latest version is no longer that number (someone else edited). dry_run=true returns the diff and the "
-        "effect without writing. No-op edits are refused. The result lists old → new version, the diff, which fleets follow "
+        "if the latest version is no longer that number (someone else edited). Without confirm=true (or with the legacy "
+        "dry_run=true) it only returns the diff and the effect; call again with confirm=true after the user agrees. No-op edits are refused. The result lists old → new version, the diff, which fleets follow "
         "'latest' (they resolve the new version immediately but devices only receive it when they reconnect or get a push; "
         "no canary) versus pinned (unaffected until a rollout or assignment), and the next step. A 402 means the "
         "organisation lacks an entitlement used by the spec (for example an image signature policy). Changes what "
@@ -2683,11 +2885,13 @@ def edit_configuration(
     base_version: int | None = None,
     dry_run: bool = False,
     organization_id: str | None = None,
+    confirm: bool = False,
 ) -> str:
     try:
         reason = (change_reason or "").strip()
-        if not dry_run and not reason:
-            return _dumps({"error": "change_reason is required (it is recorded in the version history). Use dry_run=true to preview without one."})
+        preview_only = dry_run or confirm is not True
+        if not preview_only and not reason:
+            return _dumps({"error": "change_reason is required (it is recorded in the version history). Without confirm=true you get the preview without one."})
         client, org_id = _ctx(organization_id)
         cfg = _find_config(client, org_id, configuration)
         cid = cfg["id"]
@@ -2716,11 +2920,13 @@ def edit_configuration(
         usage = _fleet_usage(_paged_items(client, "fleets", org_id), cid)
         new_version = (latest or 0) + 1
         warnings = _delivery_warnings(usage, new_version)
-        if dry_run and usage["follow_latest"]:
+        if preview_only and usage["follow_latest"]:
             warnings.append(
                 "To stage this safely, pin those fleets to the current version first (assign_fleet_configuration with "
                 f"version={latest}), save, then apply with create_rollout."
             )
+        if preview_only and not reason:
+            warnings.append("change_reason is required on the confirmed call; add it to next.arguments.")
         result: dict[str, Any] = {
             "configuration": {**_ref(meta), "status": meta.get("status")},
             "old_version": latest,
@@ -2729,16 +2935,23 @@ def edit_configuration(
             "notes": notes,
             "warnings": warnings,
         }
-        if dry_run:
-            result.update(
-                {
-                    "summary": f"DRY RUN {meta.get('name')} v{latest} → v{new_version}: {ops.diff_summary(rows)}. Nothing was written.",
-                    "dry_run": True,
-                    "new_version": new_version,
-                    "next": [{"tool": "edit_configuration", "why": "Repeat without dry_run to save it.", "arguments": {"configuration": cid, "base_version": latest}}],
-                }
+        if preview_only:
+            edits = {"image": image, "image_tag": image_tag, "env_set": env_set, "env_unset": env_unset, "merge_patch": merge_patch, "spec": spec}
+            out = json.loads(
+                _gate(
+                    False,
+                    "edit_configuration",
+                    f"save {meta.get('name')} v{new_version} (from v{latest}): {ops.diff_summary(rows)}. Fleets that follow 'latest' resolve it immediately.",
+                    action={"configuration": _ref(meta), "from_version": latest, "to_version": new_version, "changes": "the configuration spec (a new version)"},
+                    args={"configuration": cid, "base_version": latest, "change_reason": reason or None, **{k: v for k, v in edits.items() if v}},
+                    org_id=org_id,
+                    preview={"diff": rows, "fleets": usage, "notes": notes},
+                    warnings=warnings,
+                )
             )
-            return _dumps({k: v for k, v in result.items() if v not in ([], None)} | {"dry_run": True})
+            if dry_run:
+                out["dry_run"] = True
+            return _dumps(out)
         client.put(f"configurations/{cid}/spec", org_id=org_id, json={"spec": new_spec, "change_reason": reason})
         back = client.get(f"configurations/{cid}/details", org_id=org_id)
         back = back if isinstance(back, dict) else {}
@@ -2843,8 +3056,8 @@ def update_configuration_metadata(
         "Roll a configuration back to an earlier version (POST /configurations/{id}/rollback). This does not rewrite "
         "history: it creates a NEW latest version that is a copy of target_version, so fleets following 'latest' resolve "
         "it immediately (devices receive it when they reconnect or get a push) and pinned fleets are unaffected until a "
-        "rollout. reason is recorded. dry_run=true shows the diff only. Returns old → new version and the diff, read back. "
-        "Changes what devices will run — explicit request only."
+        "rollout. reason is recorded. Without confirm=true (or with the legacy dry_run=true) it shows the diff only. "
+        "Returns old → new version and the diff, read back. Changes what devices will run: confirm after the user agrees."
     ),
     annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False),
 )
@@ -2854,6 +3067,7 @@ def rollback_configuration(
     reason: str | None = None,
     dry_run: bool = False,
     organization_id: str | None = None,
+    confirm: bool = False,
 ) -> str:
     try:
         client, org_id = _ctx(organization_id)
@@ -2874,14 +3088,22 @@ def rollback_configuration(
         if not rows:
             warnings.append(f"v{target} has the same spec as v{latest}; the rollback creates an identical version.")
         base = {"configuration": _ref(cfg), "old_version": latest, "target_version": target, "diff": rows, "fleets": usage, "warnings": warnings}
-        if dry_run:
-            return _dumps(
-                {
-                    "summary": f"DRY RUN {cfg.get('name')}: v{latest} → copy of v{target} as v{new_version}: {ops.diff_summary(rows)}. Nothing was written.",
-                    "dry_run": True,
-                    **base,
-                }
+        if dry_run or confirm is not True:
+            out = json.loads(
+                _gate(
+                    False,
+                    "rollback_configuration",
+                    f"roll {cfg.get('name')} back: v{latest} → a new v{new_version} that copies v{target} ({ops.diff_summary(rows)}). Fleets that follow 'latest' resolve it immediately.",
+                    action={"configuration": _ref(cfg), "from_version": latest, "target_version": target, "to_version": new_version, "changes": "the configuration's latest spec"},
+                    args={"configuration": cid, "target_version": target, "reason": reason},
+                    org_id=org_id,
+                    preview={"diff": rows, "fleets": usage},
+                    warnings=warnings,
+                )
             )
+            if dry_run:
+                out["dry_run"] = True
+            return _dumps(out)
         body: dict[str, Any] = {"target_version": target}
         if reason and reason.strip():
             body["reason"] = reason.strip()
@@ -2911,11 +3133,11 @@ def rollback_configuration(
         "Delete a configuration and all its versions (DELETE /configurations/{id}). Irreversible. The backend would "
         "silently detach fleets that still use it, so this tool refuses while any fleet is assigned to the configuration or "
         "an unfinished rollout references it, and lists them; reassign those first (assign_fleet_configuration). Reads "
-        "back that it is gone. Destructive — explicit request for a named configuration only."
+        "back that it is gone. Destructive and irreversible: without confirm=true it only checks usage and previews."
     ),
     annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False),
 )
-def delete_configuration(configuration: str, organization_id: str | None = None) -> str:
+def delete_configuration(configuration: str, organization_id: str | None = None, confirm: bool = False) -> str:
     try:
         client, org_id = _ctx(organization_id)
         cfg = _find_config(client, org_id, configuration)
@@ -2938,6 +3160,18 @@ def delete_configuration(configuration: str, organization_id: str | None = None)
                 rollouts=busy,
                 next=[{"tool": "assign_fleet_configuration", "why": "Move each fleet to another configuration first."}],
             )
+        gate = _gate(
+            confirm,
+            "delete_configuration",
+            f"permanently delete configuration {cfg.get('name')} with all {_latest_of(cfg) or '?'} version(s). No fleet or unfinished rollout uses it.",
+            action={"configuration": _ref(cfg), "changes": "deletes the configuration and every version"},
+            args={"configuration": cid},
+            org_id=org_id,
+            preview={"configuration": {**_ref(cfg), "status": cfg.get("status"), "latest_version": _latest_of(cfg)}, "fleets_using": 0, "unfinished_rollouts": 0},
+            irreversible=True,
+        )
+        if gate:
+            return gate
         client.delete(f"configurations/{cid}", org_id=org_id)
         gone = False
         try:
@@ -3070,7 +3304,7 @@ def get_fleet(fleet: str, organization_id: str | None = None) -> str:
         "once, with no canary, no failure budget and no convergence check. Nothing is pushed to connected devices; each "
         "device picks the new desired state up when it reconnects or next receives a push, so a running fleet changes "
         "unevenly. For a fleet with live devices use create_rollout (preview_rollout first) instead. Returns before/after "
-        "read back from the API. Refuses no-ops and unknown versions. Changes what devices run — explicit request only."
+        "read back from the API. Refuses no-ops and unknown versions. Changes what devices run: without confirm=true it only previews the diff; confirm after the user agrees."
     ),
     annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False),
 )
@@ -3079,6 +3313,7 @@ def assign_fleet_configuration(
     configuration: str,
     version: int | str = "latest",
     organization_id: str | None = None,
+    confirm: bool = False,
 ) -> str:
     try:
         client, org_id = _ctx(organization_id)
@@ -3111,6 +3346,19 @@ def assign_fleet_configuration(
         body: dict[str, Any] = {"configuration_id": cid}
         if pin is not None:
             body["version"] = pin
+        if confirm is not True:
+            target_spec = _safe(lambda: client.get(f"configurations/{cid}/versions/{pin or latest}", org_id=org_id), [], "target spec")
+            target_rows = ops.spec_diff(before_spec, (target_spec or {}).get("spec") if isinstance(target_spec, dict) else {})
+            return _gate(
+                confirm,
+                "assign_fleet_configuration",
+                f"assign {cfg.get('name')} ({'latest' if wants_latest else 'v' + str(pin)}) to fleet {fl.get('name')} directly, with no canary or health gate.",
+                action={"fleet": _ref(fl), "configuration": _ref(cfg), "version": "latest" if wants_latest else pin, "changes": "the fleet's desired configuration"},
+                args={"fleet": fid, "configuration": cid, "version": "latest" if wants_latest else pin},
+                org_id=org_id,
+                preview={"before": before, "diff": target_rows, "devices": {"total": fl.get("devices"), "online": fl.get("online")}},
+                warnings=warnings,
+            ) or ""
         client.post(f"fleets/{fid}/configuration", org_id=org_id, json=body)
         after, after_spec = _fleet_assignment(client, org_id, fid)
         after_cfg = after["configuration"] or {}
@@ -3367,7 +3615,7 @@ def _policy_view(payload: Any) -> dict[str, Any]:
         "limits when devices apply updates; disable_update_window=true turns it off. Policy via PUT "
         "/fleets/{id}/update-policy (replaces the whole policy; the existing targets are kept when you only change the "
         "window), window alone via PUT /fleets/{id}/update-window. Returns before/after read back. Changes what OS "
-        "versions devices install — explicit request only."
+        "versions devices install: without confirm=true it only previews; confirm after the user agrees."
     ),
     annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True),
 )
@@ -3378,6 +3626,7 @@ def set_fleet_update_policy(
     update_window: dict[str, Any] | None = None,
     disable_update_window: bool = False,
     organization_id: str | None = None,
+    confirm: bool = False,
 ) -> str:
     try:
         if update_window is not None and disable_update_window:
@@ -3421,11 +3670,29 @@ def set_fleet_update_policy(
                 body["targets"] = new_targets
             if window is not None:
                 body["update_window"] = window
-            client.put(f"fleets/{fid}/update-policy", org_id=org_id, json=body)
+            plan = (f"fleets/{fid}/update-policy", body)
         else:
             if window == before["update_window"]:
                 raise ToolRefusal("No change: the fleet already has this update window.", before=before)
-            client.put(f"fleets/{fid}/update-window", org_id=org_id, json=window)
+            plan = (f"fleets/{fid}/update-window", window)
+        gate = _gate(
+            confirm,
+            "set_fleet_update_policy",
+            f"change the OS update policy of fleet {fl.get('name')}" + (f" (mode {before['mode']} → {plan[1].get('mode')})" if policy_change else " (update window only)") + ".",
+            action={"fleet": _ref(fl), "changes": "which OS versions the fleet's devices install and when"},
+            args={
+                "fleet": fid,
+                "mode": want_mode,
+                "targets": targets,
+                "update_window": update_window,
+                "disable_update_window": True if disable_update_window else None,
+            },
+            org_id=org_id,
+            preview={"before": before, "request": plan[1], "endpoint": "PUT /" + plan[0]},
+        )
+        if gate:
+            return gate
+        client.put(plan[0], org_id=org_id, json=plan[1])
         after = _policy_view(client.get(f"fleets/{fid}/update-policy", org_id=org_id))
         confirmed = (not policy_change or (after["mode"] == body["mode"])) and (window is None or after["update_window"] == window)
         return _dumps(
@@ -3544,13 +3811,27 @@ def update_device(
         "Move a device to another fleet (PUT /devices/{id}/fleet). The device takes the new fleet's configuration, which is "
         "pushed to it immediately (the workload changes now, without a rollout), and its fleet-level tags, update window "
         "and policies change. device = name/UUID/tag (ambiguous matches return candidates); fleet = name or UUID. The "
-        "result shows the device's old and new fleet and the configuration it now resolves to, read back. Data wipe is not "
-        "offered here. Destructive: changes what the device runs — explicit request only."
+        "result shows the device's old and new fleet and the configuration it now resolves to, read back. wipe=true first "
+        "erases the device's payload data (wipe_images: cached images, wipe_volumes: persistent application data, both default on; "
+        "wipe_secure: slower secure erase) BEFORE it joins the new fleet, e.g. when the new fleet has different owners: IRREVERSIBLE, "
+        "needs a higher device permission than a plain move (403 otherwise) and an online device (504 otherwise), and the move is aborted if the wipe fails. Destructive: without "
+        "confirm=true it only previews; confirm after the user explicitly agrees."
     ),
     annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True),
 )
-def move_device_to_fleet(device: str, fleet: str, organization_id: str | None = None) -> str:
+def move_device_to_fleet(
+    device: str,
+    fleet: str,
+    organization_id: str | None = None,
+    wipe: bool = False,
+    wipe_images: bool = True,
+    wipe_volumes: bool = True,
+    wipe_secure: bool = False,
+    confirm: bool = False,
+) -> str:
     try:
+        if wipe and not (wipe_images or wipe_volumes):
+            return _dumps({"error": "wipe needs wipe_images and/or wipe_volumes (the backend rejects a wipe that destroys nothing)."})
         found = _resolve_device(device, organization_id)
         if not found.get("match"):
             return _dumps(found)
@@ -3561,11 +3842,50 @@ def move_device_to_fleet(device: str, fleet: str, organization_id: str | None = 
         if str(old_fleet.get("id") or "").lower() == str(target["id"]).lower():
             raise ToolRefusal(f"No change: {found['match'].get('name')} is already in {target.get('name')}.", device=found["match"])
         new_cfg = _safe(lambda: _fleet_assignment(client, org_id, target["id"])[0], [], "target configuration")
-        client.put(f"devices/{did}/fleet", org_id=org_id, json={"flotilla_id": target["id"]})
+        move_body: dict[str, Any] = {"flotilla_id": target["id"]}
+        wipes: list[str] = []
+        if wipe:
+            wipes = [w for w, on in (("cached container images", wipe_images), ("persistent volumes (application data)", wipe_volumes)) if on]
+            move_body["wipe"] = True
+            move_body["wipe_options"] = {"images": bool(wipe_images), "volumes": bool(wipe_volumes), "secure": bool(wipe_secure)}
+        if confirm is not True:
+            cfg_now = (new_cfg or {}).get("configuration")
+            warnings = [
+                "The new fleet's configuration is pushed to the device immediately (no rollout); its fleet-level tags, update window and policies change too.",
+            ]
+            if wipe:
+                warnings += [
+                    "IRREVERSIBLE DATA LOSS: the device wipes " + " and ".join(wipes) + (" with a secure erase (slower)" if wipe_secure else "") + " BEFORE it joins the new fleet. Deleted data cannot be recovered.",
+                    "A wipe needs a higher device permission than a plain move (editor is enough for that) and the device must be online: if the wipe fails the whole move is aborted.",
+                ]
+                if not (before.get("isOnline") or {}).get("isOnline", True):
+                    warnings.append("The device looks offline, so the wipe will probably fail (504) and nothing will move.")
+            return _gate(
+                confirm,
+                "move_device_to_fleet",
+                f"move {found['match'].get('name') or did} from {old_fleet.get('name')} to {target.get('name')}"
+                + (f" and WIPE its {' and '.join(wipes)} (irreversible)" if wipe else "")
+                + (f"; it will run {cfg_now.get('name')} @ {new_cfg['assignment']}" if cfg_now else "; the new fleet has no configuration")
+                + ".",
+                action={
+                    "device": {"id": did, "name": found["match"].get("name")},
+                    "from_fleet": {"id": old_fleet.get("id"), "name": old_fleet.get("name")},
+                    "to_fleet": _ref(target),
+                    "wipe": ({"images": bool(wipe_images), "volumes": bool(wipe_volumes), "secure": bool(wipe_secure)} if wipe else False),
+                    "changes": "the device's fleet, configuration, policies" + (" and erases its data" if wipe else ""),
+                },
+                args={"device": did, "fleet": target["id"], "wipe": True if wipe else None, "wipe_images": wipe_images if wipe else None, "wipe_volumes": wipe_volumes if wipe else None, "wipe_secure": True if wipe and wipe_secure else None},
+                org_id=org_id,
+                preview={"configuration_after_move": new_cfg, "wipes": wipes},
+                irreversible=wipe,
+                warnings=warnings,
+            ) or ""
+        client.put(f"devices/{did}/fleet", org_id=org_id, json=move_body)
         after = _device_detail(client, did, org_id)
         new_fleet = after.get("fleet") or {}
         confirmed = str(new_fleet.get("id") or "").lower() == str(target["id"]).lower()
         cfg = (new_cfg or {}).get("configuration")
+        wiped_note = {"wiped": wipes} if wipe else {}
         return _dumps(
             {
                 "summary": f"{found['match'].get('name')}: {old_fleet.get('name')} → {new_fleet.get('name') or target.get('name')}"
@@ -3576,6 +3896,7 @@ def move_device_to_fleet(device: str, fleet: str, organization_id: str | None = 
                 "from_fleet": {"id": old_fleet.get("id"), "name": old_fleet.get("name")},
                 "to_fleet": {"id": new_fleet.get("id") or target["id"], "name": new_fleet.get("name") or target.get("name")},
                 "configuration": new_cfg,
+                **wiped_note,
                 "read_back": {"confirmed": confirmed},
                 "next": [{"tool": "get_device_workload", "why": "Confirm the workload that is running after the move.", "arguments": {"device": did}}],
             }
@@ -3648,7 +3969,7 @@ def _check_override(override: Any) -> dict[str, Any]:
         "volumes, ports, image_cleaning, registry_credential_id, desiredState (RUNNING|STOPPED; STOPPED stops only this "
         "device's workload). By default the override is merged into the existing one (merge patch: null removes a field); "
         "replace=true replaces it entirely. Unknown keys are rejected. Stores the override; it reaches the device when it "
-        "reconnects or receives a push (render_device_document with push=true pushes this one device now). Returns the effective changes, read back. Changes what the device runs — explicit request only."
+        "reconnects or receives a push (render_device_document with push=true pushes this one device now). Returns the effective changes, read back. Changes what the device runs: without confirm=true it only previews the effective changes."
     ),
     annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True),
 )
@@ -3658,6 +3979,7 @@ def set_device_configuration_override(
     reason: str | None = None,
     replace: bool = False,
     organization_id: str | None = None,
+    confirm: bool = False,
 ) -> str:
     try:
         override = _check_override(override)
@@ -3678,6 +4000,18 @@ def set_device_configuration_override(
         body: dict[str, Any] = {"override": wanted}
         if reason and reason.strip():
             body["reason"] = reason.strip()
+        if confirm is not True:
+            base_cfg = ops.norm_spec((current or {}).get("base_config"))
+            merged_after = ops.norm_spec(ops.merge_patch(base_cfg, wanted))
+            return _gate(
+                confirm,
+                "set_device_configuration_override",
+                f"set a configuration override on {found['match'].get('name') or did}: {ops.diff_summary(ops.spec_diff(base_cfg, merged_after))}.",
+                action={"device": found["match"], "replace": bool(replace), "changes": "what this one device runs (layered over its fleet configuration)"},
+                args={"device": did, "override": override, "replace": True if replace else None, "reason": reason},
+                org_id=org_id,
+                preview={"override_before": existing or None, "override_after": wanted, "effective_changes": ops.spec_diff(base_cfg, merged_after)},
+            ) or ""
         client.put(f"devices/{did}/configuration", org_id=org_id, json=body)
         after = _device_config_view(client.get(f"devices/{did}/configuration", org_id=org_id))
         confirmed = after["has_override"] and not ops.spec_diff(after["override"], wanted, mask=False)
@@ -3702,11 +4036,13 @@ def set_device_configuration_override(
     description=(
         "Remove a device's configuration override (DELETE /devices/{id}/configuration/override) so it follows its fleet's "
         "configuration again. Refuses when there is no override. reason is recorded. Returns the read-back state. "
-        "Changes what the device will run (it reconnects/pushes to apply) — explicit request only."
+        "Changes what the device will run (it reconnects/pushes to apply): without confirm=true it only previews what is removed."
     ),
     annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True),
 )
-def clear_device_configuration_override(device: str, reason: str | None = None, organization_id: str | None = None) -> str:
+def clear_device_configuration_override(
+    device: str, reason: str | None = None, organization_id: str | None = None, confirm: bool = False
+) -> str:
     try:
         found = _resolve_device(device, organization_id)
         if not found.get("match"):
@@ -3715,6 +4051,17 @@ def clear_device_configuration_override(device: str, reason: str | None = None, 
         before = _device_config_view(client.get(f"devices/{did}/configuration", org_id=org_id))
         if not before["has_override"]:
             raise ToolRefusal(f"No change: {found['match'].get('name')} has no configuration override.", device=found["match"])
+        gate = _gate(
+            confirm,
+            "clear_device_configuration_override",
+            f"remove the configuration override on {found['match'].get('name') or did}; it follows its fleet's configuration again.",
+            action={"device": found["match"], "changes": "what this one device runs"},
+            args={"device": did, "reason": reason},
+            org_id=org_id,
+            preview={"override_removed": before["override"], "effective_changes_removed": before["overridden_fields"]},
+        )
+        if gate:
+            return gate
         client.delete(f"devices/{did}/configuration/override", org_id=org_id, params={"reason": (reason or "").strip() or None})
         after = _device_config_view(client.get(f"devices/{did}/configuration", org_id=org_id))
         confirmed = not after["has_override"]
@@ -4525,6 +4872,1827 @@ def fleet_health_report(
         if docs_note:
             out["docs_note"] = docs_note
         return _dumps(out)
+    except Exception as exc:
+        return _err(exc)
+
+
+# ---------------------------------------------------------------------------
+# Network configuration, fleet policies, alerting, registry credentials, secret files
+# ---------------------------------------------------------------------------
+
+
+class Reply(Exception):
+    """Answer the tool call with ``payload`` as-is (for example resolver candidates)."""
+
+    def __init__(self, payload: dict[str, Any]):
+        super().__init__("reply")
+        self.payload = payload
+
+
+def _scope(device: str | None, fleet: str | None, organization_id: str | None) -> dict[str, Any]:
+    """Resolve exactly one of device / fleet. Ambiguity raises NeedsChoice / Reply, nothing is changed."""
+    if bool(device) == bool(fleet):
+        raise ToolRefusal("Pass exactly one of device or fleet.")
+    if device:
+        found = _resolve_device(device, organization_id)
+        if not found.get("match"):
+            raise Reply(found)
+        match = found["match"]
+        return {"kind": "device", "id": match["id"], "ref": {"id": match["id"], "name": match.get("name")}, "row": match, "org_id": found["organization_id"], "client": get_client()}
+    client, org_id = _ctx(organization_id)
+    row = _find_fleet(client, org_id, fleet or "")
+    return {"kind": "fleet", "id": row["id"], "ref": _ref(row), "row": row, "org_id": org_id, "client": client}
+
+
+def _cap(text: str) -> str:
+    return text[:1].upper() + text[1:]
+
+
+def _label(target: dict[str, Any]) -> str:
+    return f"{target['kind']} {target['ref'].get('name') or target['id']}"
+
+
+# ------------------------------------------------------- network config ---
+
+
+def _net_path(target: dict[str, Any], leaf: str = "configuration") -> str:
+    return f"{target['kind']}s/{target['id']}/network/{leaf}"
+
+
+def _net_stored(client: AdmiralClient, target: dict[str, Any]) -> dict[str, Any] | None:
+    """The target's own stored configuration (``None`` when it has none; the API answers 200 with no data)."""
+    payload = client.get(_net_path(target), org_id=target["org_id"])
+    return payload if isinstance(payload, dict) and payload.get("interfaces") is not None else None
+
+
+def _net_effective(client: AdmiralClient, target: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+    """Effective configuration and its source. The API answers 500 (not an empty 200) for a device whose fleet has
+    no network configuration either; that is treated as 'none'."""
+    if target["kind"] != "device":
+        return None, None
+    try:
+        payload = client.get(_net_path(target, "effective-configuration"), org_id=target["org_id"])
+    except AdmiralAPIError as exc:
+        if exc.status == 500:
+            return None, None
+        raise
+    if isinstance(payload, dict) and isinstance(payload.get("configuration"), dict):
+        return payload["configuration"], payload.get("source")
+    return None, None
+
+
+_NET_STRAND = (
+    "A wrong network configuration can strand a device: applying it can drop the link, a device that cannot reach "
+    "Admiral afterwards cannot receive a corrected configuration remotely (it needs a reboot, a local override via "
+    "console/TUI/BLE, or physical access), and the push is attempted for up to 2 minutes."
+)
+
+
+def _net_risks(old: dict[str, Any] | None, new: dict[str, Any]) -> list[str]:
+    risks = []
+    enabled = [i for i in new.get("interfaces") or [] if i.get("enabled")]
+    if new.get("interfaces") and not enabled:
+        risks.append("No interface is enabled in the new configuration: the device would have no network.")
+    old_macs = {str(i.get("match_mac", "")).lower() for i in (old or {}).get("interfaces") or [] if i.get("enabled")}
+    new_macs = {str(i.get("match_mac", "")).lower() for i in enabled}
+    if old_macs and new.get("interfaces") and not (old_macs & new_macs):
+        risks.append("None of the currently enabled interfaces stays enabled; the device would have to reconnect over a different link.")
+    for iface in enabled:
+        ip = (iface.get("ethernet") or {}).get("ip") or {}
+        if ip.get("ipv4") and not ip.get("dhcp_v4"):
+            risks.append(f"{iface.get('match_mac')}: static IPv4 {ip['ipv4'].get('address')}; a wrong address or gateway cuts the device off.")
+    return risks
+
+
+def _put_network(client: AdmiralClient, target: dict[str, Any], body: dict[str, Any]) -> Any:
+    try:
+        return client.put(_net_path(target), org_id=target["org_id"], json=body, timeout=130.0)
+    except AdmiralAPIError as exc:
+        if exc.status == 502 and "saved" in str(exc).lower():
+            raise ToolRefusal(
+                "The configuration was saved but the device did not accept it.",
+                saved=True,
+                applied=False,
+                hint="Check get_device_network / troubleshoot_device; the device retries when it reconnects.",
+            ) from None
+        raise
+
+
+def _clean_or_none(cfg: dict[str, Any] | None, fleet: bool) -> dict[str, Any] | None:
+    if not cfg:
+        return None
+    try:
+        return ops.clean_network_config(cfg, fleet=fleet)
+    except ValueError:  # a stored shape this version does not know: show the brief only
+        return None
+
+
+@mcp.tool(
+    description=(
+        "Network configuration of a device or a fleet (exactly one of device / fleet; read-only). Device: its own stored "
+        "configuration (the override; the API answers 'none' when it has none) and the effective configuration with its "
+        "source ('device' override or 'fleet' default; a device override replaces the fleet configuration entirely, they are "
+        "not merged). Fleet: the fleet-wide default that applies to devices without their own. Shape: interfaces [{match_mac, "
+        "enabled, type wifi|ethernet|bridge, wifi{mode client|ap, country_code, powersave, access_point{ssid, channel, hidden, "
+        "security}}, ethernet{ip{dhcp_v4, ipv4{address, gateway, dns}, ipv6, proxy{server, ignore_tls}}}}], client_networks "
+        "[{ssid, priority, hidden, interface_mac, ip, has_psk}], bridges [{name, member_macs, ip}], nameservers. Wi-Fi "
+        "passwords are never returned (has_psk only). Fleet configurations only carry a proxy under ip (no static addressing). "
+        "Edit with set_network_configuration."
+    ),
+    annotations=_READ_ONLY,
+)
+def get_network_configuration(device: str | None = None, fleet: str | None = None, organization_id: str | None = None) -> str:
+    try:
+        target = _scope(device, fleet, organization_id)
+        client = target["client"]
+        own = _net_stored(client, target)
+        eff, source = _net_effective(client, target)
+        out: dict[str, Any] = {
+            "summary": f"{_cap(_label(target))}: "
+            + ("has its own network configuration" if own else "no own network configuration")
+            + (f"; effective source is {source}" if source else "")
+            + ".",
+            "target": {"kind": target["kind"], **target["ref"]},
+            "own": ops.network_brief(own),
+            "own_configuration": _clean_or_none(own, target["kind"] == "fleet"),
+            "effective": {"source": source, "configuration": ops.network_brief(eff)} if source else None,
+            "next": [{"tool": "set_network_configuration", "why": "Change it (previews the effective diff first)."}],
+        }
+        if target["kind"] == "device":
+            out["next"].append({"tool": "get_device_network", "why": "Live addresses and interface state."})
+        return _dumps({k: v for k, v in out.items() if v not in (None, [], {})})
+    except Reply as reply:
+        return _dumps(reply.payload)
+    except ToolRefusal as refusal:
+        return _dumps(refusal.payload)
+    except Exception as exc:
+        return _err(exc)
+
+
+@mcp.tool(
+    description=(
+        "Set the network configuration of a device (PUT /devices/{id}/network/configuration, an override that replaces the "
+        "fleet's) or of a fleet (PUT /fleets/{id}/network/configuration, the default for devices without an override; pushed "
+        "to the whole fleet in the background). exactly one of device / fleet. configuration is validated against the "
+        "backend model (unknown keys are rejected). mode 'merge' (default) merges into the current own configuration (for "
+        "a device without one: its effective configuration): objects merge, null deletes a key, and interfaces (by match_mac), "
+        "client_networks (by ssid) and bridges (by name) are upserted item by item, so other entries stay; nameservers "
+        "replace. 'replace' sends exactly what you pass (needed to remove an interface, network or bridge; "
+        "get_network_configuration, edit, send back). Wi-Fi passwords: "
+        "give psk only for networks you add or change; a network sent without psk keeps its stored password. A wrong "
+        "configuration can strand devices (they cannot be corrected remotely once offline). Destructive: without "
+        "confirm=true nothing is written; you get the diff against the effective configuration, the risks, and the exact "
+        "confirmed call (psk values are masked there: put them back when you confirm). Applying a device change waits up to "
+        "2 minutes; an offline device saves it and applies on reconnect."
+    ),
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True),
+)
+def set_network_configuration(
+    configuration: dict[str, Any],
+    device: str | None = None,
+    fleet: str | None = None,
+    mode: str = "merge",
+    organization_id: str | None = None,
+    confirm: bool = False,
+) -> str:
+    try:
+        norm_mode = (mode or "").strip().lower()
+        if norm_mode not in ("merge", "replace"):
+            return _dumps({"error": f"Unknown mode {mode!r}", "choices": ["merge", "replace"]})
+        if not isinstance(configuration, dict) or not configuration:
+            return _dumps({"error": "configuration must be a non-empty JSON object."})
+        target = _scope(device, fleet, organization_id)
+        client, is_fleet = target["client"], target["kind"] == "fleet"
+        own = _net_stored(client, target)
+        eff, source = _net_effective(client, target)
+        base = own or eff
+        if norm_mode == "merge":
+            try:
+                wanted = ops.merge_network(ops.clean_network_config(base, fleet=is_fleet) if base else {"interfaces": []}, configuration)
+            except ValueError as exc:
+                return _dumps({"error": str(exc)})
+        else:
+            wanted = configuration
+        try:
+            body = ops.clean_network_config(wanted, fleet=is_fleet)
+        except ValueError as exc:
+            return _dumps({"error": str(exc), "hint": "get_network_configuration shows the accepted shape."})
+        before = eff if not is_fleet else own
+        rows = ops.network_diff(before, body)
+        supplied = ops.network_psk_supplied(body)
+        if not rows and not supplied:
+            raise ToolRefusal("No change: the effective network configuration already matches.", target=target["ref"])
+        risks = _net_risks(before, body)
+        warnings = [_NET_STRAND, *risks]
+        if is_fleet:
+            warnings.append(
+                f"Applies to every device of the fleet that has no own override ({target['row'].get('devices', '?')} device(s) in the fleet); "
+                "it is pushed to all of them in the background."
+            )
+        elif source == "fleet":
+            warnings.append("This device now gets its own override and stops following the fleet's network configuration.")
+        if supplied:
+            warnings.append(f"psk supplied for: {', '.join(supplied)} (masked in this preview; include it again in the confirmed call).")
+        gate = _gate(
+            confirm,
+            "set_network_configuration",
+            f"set the network configuration of {_label(target)} ({len(rows)} change(s)"
+            + (f", e.g. {rows[0]['path']}" if rows else "")
+            + "). It is pushed to the device(s) immediately.",
+            action={"target": {"kind": target["kind"], **target["ref"]}, "mode": norm_mode, "changes": "network interfaces, Wi-Fi, addressing and DNS of the target"},
+            args={
+                "configuration": ops.mask_network_secrets(body),
+                "mode": "replace",
+                target["kind"]: target["id"],
+            },
+            org_id=target["org_id"],
+            preview={
+                "before": {"source": source or ("fleet" if is_fleet else None), "configuration": ops.network_brief(before)},
+                "diff": rows,
+                "after": ops.mask_network_secrets(body),
+            },
+            warnings=warnings,
+        )
+        if gate:
+            return gate
+        result = _put_network(client, target, body)
+        back = _net_stored(client, target)
+        drift = ops.network_diff(
+            ops.mask_network_secrets({k: v for k, v in body.items()}),
+            ops.mask_network_secrets(ops.clean_network_config(back, fleet=is_fleet)) if back else {},
+        )
+        # Passwords are write-only: a network whose psk we sent reads back as has_psk, which is not a drift.
+        drift = [r for r in drift if not r["path"].endswith(".psk")]
+        confirmed = bool(back) and not drift
+        applied = result.get("applied") if isinstance(result, dict) else None
+        return _dumps(
+            {
+                "summary": f"{_cap(_label(target))}: network configuration saved"
+                + (" and applied" if applied else " (not applied yet: the device is offline and applies it when it reconnects)" if applied is False else "")
+                + ("" if confirmed else "; read-back differs (NOT confirmed)")
+                + ".",
+                "target": {"kind": target["kind"], **target["ref"]},
+                "saved": True if not isinstance(result, dict) else result.get("saved", True),
+                "applied": applied,
+                "diff": rows,
+                "read_back": {"confirmed": confirmed, "drift": drift},
+                "next": [
+                    {"tool": "get_network_configuration", "why": "Review the stored configuration.", "arguments": {target["kind"]: target["id"]}},
+                    *([{"tool": "get_device_network", "why": "Check the live addresses after the change.", "arguments": {"device": target["id"]}}] if not is_fleet else []),
+                ],
+            }
+        )
+    except Reply as reply:
+        return _dumps(reply.payload)
+    except ToolRefusal as refusal:
+        return _dumps(refusal.payload)
+    except Exception as exc:
+        return _err(exc)
+
+
+@mcp.tool(
+    description=(
+        "Clear the network configuration of a device (DELETE /devices/{id}/network/configuration: the device returns to its "
+        "fleet's configuration, or to defaults when the fleet has none) or of a fleet (DELETE /fleets/{id}/network/"
+        "configuration: devices without their own override lose the fleet default). exactly one of device / fleet. Pushed in "
+        "the background. A wrong change can strand devices. Destructive: without confirm=true it shows what the target falls "
+        "back to; confirm after the user explicitly agrees."
+    ),
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True),
+)
+def clear_network_configuration(
+    device: str | None = None, fleet: str | None = None, organization_id: str | None = None, confirm: bool = False
+) -> str:
+    try:
+        target = _scope(device, fleet, organization_id)
+        client, is_fleet = target["client"], target["kind"] == "fleet"
+        own = _net_stored(client, target)
+        if not own:
+            raise ToolRefusal(f"No change: {_label(target)} has no own network configuration.", target=target["ref"])
+        eff, source = _net_effective(client, target)
+        fallback = None
+        if not is_fleet:
+            fleet_id = (_device_detail(client, target["id"], target["org_id"]).get("fleet") or {}).get("id")
+            if fleet_id:
+                fallback_cfg = _safe(lambda: client.get(f"fleets/{fleet_id}/network/configuration", org_id=target["org_id"]), [], "fleet network")
+                fallback = fallback_cfg if isinstance(fallback_cfg, dict) and fallback_cfg.get("interfaces") is not None else None
+        after = None if is_fleet else fallback
+        rows = ops.network_diff(own if is_fleet else own, after or {})
+        warnings = [_NET_STRAND]
+        if not is_fleet and not fallback:
+            warnings.append("The device's fleet has no network configuration: the device falls back to its defaults.")
+        if is_fleet:
+            warnings.append("Devices of this fleet without their own override lose this default.")
+        gate = _gate(
+            confirm,
+            "clear_network_configuration",
+            f"remove the network configuration of {_label(target)}" + ("" if is_fleet else "; it follows the fleet's configuration" if fallback else "; it falls back to defaults") + ".",
+            action={"target": {"kind": target["kind"], **target["ref"]}, "changes": "network configuration of the target"},
+            args={target["kind"]: target["id"]},
+            org_id=target["org_id"],
+            preview={"removed": ops.network_brief(own), "falls_back_to": ops.network_brief(after), "diff": rows},
+            warnings=warnings,
+        )
+        if gate:
+            return gate
+        client.delete(_net_path(target), org_id=target["org_id"], timeout=60.0)
+        back = _net_stored(client, target)
+        return _dumps(
+            {
+                "summary": f"Cleared the network configuration of {_label(target)}." if not back else f"Delete sent for {_label(target)} but a configuration still reads back (NOT confirmed).",
+                "target": {"kind": target["kind"], **target["ref"]},
+                "read_back": {"confirmed": not back},
+            }
+        )
+    except Reply as reply:
+        return _dumps(reply.payload)
+    except ToolRefusal as refusal:
+        return _dumps(refusal.payload)
+    except Exception as exc:
+        return _err(exc)
+
+
+# ------------------------------------------------------- fleet policies ---
+
+_POLICY_NAMES = ("ssh", "usb", "image_proxy", "security", "custom_metrics")
+
+
+def _fleet_policy_reads(client: AdmiralClient, org_id: str, fid: str) -> tuple[dict[str, Any], list[str]]:
+    paths = {
+        "ssh": f"fleets/{fid}/ssh",
+        "usb": f"fleets/{fid}/usb-policy",
+        "image_proxy": f"fleets/{fid}/image-proxy",
+        "security": f"fleets/{fid}/security-policy",
+        "custom_metrics": f"fleets/{fid}/custom-metrics",
+    }
+    notes: list[str] = []
+
+    def one(name: str) -> Any:
+        try:
+            return client.get(paths[name], org_id=org_id)
+        except AdmiralAPIError as exc:
+            if exc.status == 402:
+                notes.append(f"{name}: needs a billing entitlement the organisation lacks (402).")
+            else:
+                notes.append(f"{name}: {exc}")
+            return None
+
+    values = _parallel_map(one, list(paths))
+    return dict(zip(paths, values)), notes
+
+
+def _usb_view(payload: Any) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+    pol = payload.get("policy")
+    if pol is None and "mode" in payload:
+        pol = payload
+    if not isinstance(pol, dict):
+        return {"mode": "off", "allow": [], "set": False}
+    return {"mode": pol.get("mode"), "allow": pol.get("allow") or [], "updated_at": pol.get("updated_at")}
+
+
+@mcp.tool(
+    description=(
+        "All policies of one fleet in a single call: SSH access (GET /fleets/{id}/ssh; on by default, off refuses remote "
+        "shells), USB policy (/usb-policy: off, block_storage_hid or allowlist with rules), registry proxy (/image-proxy: "
+        "image pulls over the control plane, billed by data carried), security policy (/security-policy: required TPM, "
+        "secure boot, disk encryption, recovery-key escrow, plus how many devices are non-compliant) and custom workload "
+        "metrics (/custom-metrics). A policy the organisation is not entitled to is reported as such (402), not as a "
+        "failure. fleet = name or UUID. Read-only. Change them with set_fleet_ssh_access, set_usb_policy, "
+        "set_fleet_image_proxy, set_fleet_security_policy, set_fleet_custom_metrics."
+    ),
+    annotations=_READ_ONLY,
+)
+def get_fleet_policies(fleet: str, organization_id: str | None = None) -> str:
+    try:
+        client, org_id = _ctx(organization_id)
+        fl = _find_fleet(client, org_id, fleet)
+        raw, notes = _fleet_policy_reads(client, org_id, fl["id"])
+        ssh, usb, proxy, sec, metrics = (raw.get(k) for k in _POLICY_NAMES)
+        ssh_on = ssh.get("enabled") if isinstance(ssh, dict) else None
+        usb_v = _usb_view(usb)
+        proxy_on = proxy.get("enabled") if isinstance(proxy, dict) else None
+        sec_d = sec if isinstance(sec, dict) else None
+        metrics_on = metrics.get("enabled") if isinstance(metrics, dict) else None
+        bits = [
+            f"ssh {'on' if ssh_on else 'off'}" if ssh_on is not None else None,
+            f"usb {usb_v['mode']}" + ("" if usb_v.get("set", True) else " (not set)") if usb_v else None,
+            f"registry proxy {'on' if proxy_on else 'off'}" if proxy_on is not None else None,
+            ("security " + ("enforced" if sec_d.get("enforced") else "not enforced")) if sec_d else None,
+            f"custom metrics {'on' if metrics_on else 'off'}" if metrics_on is not None else None,
+        ]
+        out = {
+            "summary": f"{fl.get('name')}: " + ", ".join(b for b in bits if b) + ".",
+            "fleet": _ref(fl),
+            "ssh": {"enabled": ssh_on} if ssh_on is not None else None,
+            "usb": usb_v,
+            "image_proxy": {"enabled": proxy_on, "enabled_at": proxy.get("enabled_at")} if isinstance(proxy, dict) else None,
+            "security": (
+                {
+                    **{k: sec_d.get(k) for k in ("require_tpm", "require_secure_boot", "require_disk_encryption", "require_recovery_key_escrow", "enforced")},
+                    "devices": {"total": sec_d.get("devices_total"), "non_compliant": sec_d.get("devices_noncompliant"), "not_reported": sec_d.get("devices_not_reported")},
+                    "can_manage": sec_d.get("can_manage"),
+                }
+                if sec_d
+                else None
+            ),
+            "custom_metrics": {"enabled": metrics_on} if metrics_on is not None else None,
+            "warnings": notes,
+            "next": [
+                {"tool": "set_fleet_ssh_access", "why": "Turn SSH access on or off."},
+                {"tool": "set_usb_policy", "why": "Set the fleet or a device USB policy."},
+                {"tool": "set_fleet_image_proxy", "why": "Pull images over the control plane (billed by data)."},
+                {"tool": "set_fleet_security_policy", "why": "Require TPM / secure boot / disk encryption."},
+                {"tool": "set_fleet_custom_metrics", "why": "Collect custom workload metrics."},
+            ],
+        }
+        return _dumps({k: v for k, v in out.items() if v not in (None, [], {})})
+    except Exception as exc:
+        return _err(exc)
+
+
+def _set_fleet_toggle(
+    *,
+    tool: str,
+    leaf: str,
+    what: str,
+    fleet: str,
+    enabled: bool,
+    organization_id: str | None,
+    confirm: bool,
+    on_effect: str,
+    off_effect: str,
+    warnings: list[str] | None = None,
+) -> str:
+    client, org_id = _ctx(organization_id)
+    fl = _find_fleet(client, org_id, fleet)
+    fid = fl["id"]
+    before = client.get(f"fleets/{fid}/{leaf}", org_id=org_id)
+    current = bool(before.get("enabled")) if isinstance(before, dict) else None
+    if current is enabled:
+        raise ToolRefusal(f"No change: {what} is already {'enabled' if enabled else 'disabled'} for {fl.get('name')}.", fleet=_ref(fl))
+    gate = _gate(
+        confirm,
+        tool,
+        f"{'enable' if enabled else 'disable'} {what} for fleet {fl.get('name')}: {on_effect if enabled else off_effect}",
+        action={"fleet": _ref(fl), "enabled": enabled, "changes": what},
+        args={"fleet": fid, "enabled": enabled},
+        org_id=org_id,
+        preview={"before": {"enabled": current}, "after": {"enabled": enabled}, "devices": {"total": fl.get("devices"), "online": fl.get("online")}},
+        warnings=warnings,
+    )
+    if gate:
+        return gate
+    client.put(f"fleets/{fid}/{leaf}", org_id=org_id, json={"enabled": enabled})
+    after = client.get(f"fleets/{fid}/{leaf}", org_id=org_id)
+    now = bool(after.get("enabled")) if isinstance(after, dict) else None
+    confirmed = now is enabled
+    return _dumps(
+        {
+            "summary": f"{fl.get('name')}: {what} {'enabled' if now else 'disabled'}" + ("" if confirmed else " (NOT confirmed by read-back)") + ".",
+            "fleet": _ref(fl),
+            "before": {"enabled": current},
+            "after": {"enabled": now},
+            "read_back": {"confirmed": confirmed},
+            "next": [{"tool": "get_fleet_policies", "why": "Review all fleet policies.", "arguments": {"fleet": fid}}],
+        }
+    )
+
+
+def _toggle_call(fn: Any) -> str:
+    try:
+        return fn()
+    except ToolRefusal as refusal:
+        return _dumps(refusal.payload)
+    except Exception as exc:
+        return _err(exc)
+
+
+@mcp.tool(
+    description=(
+        "Turn SSH access on or off for a fleet (PUT /fleets/{id}/ssh; on by default). Off makes the devices refuse remote "
+        "shells, which also removes the break-glass path for diagnosing a device. Destructive: without confirm=true it only "
+        "shows the change; confirm after the user explicitly agrees. Read back from the API."
+    ),
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True),
+)
+def set_fleet_ssh_access(fleet: str, enabled: bool, organization_id: str | None = None, confirm: bool = False) -> str:
+    return _toggle_call(
+        lambda: _set_fleet_toggle(
+            tool="set_fleet_ssh_access",
+            leaf="ssh",
+            what="SSH access",
+            fleet=fleet,
+            enabled=enabled,
+            organization_id=organization_id,
+            confirm=confirm,
+            on_effect="remote shells to the fleet's devices are accepted again.",
+            off_effect="the fleet's devices refuse remote shells.",
+            warnings=None if enabled else ["Disabling SSH removes the usual way to inspect a misbehaving device remotely."],
+        )
+    )
+
+
+@mcp.tool(
+    description=(
+        "Switch the registry proxy on or off for a fleet (PUT /fleets/{id}/image-proxy): image pulls then travel over the "
+        "Admiral control plane. It is a BILLED action (charged by data carried) and needs the billing-management permission; a 402/403 "
+        "means the organisation or caller lacks that. Destructive: without confirm=true it only shows the change; confirm "
+        "after the user explicitly agrees. See get_image_proxy_usage for the data carried."
+    ),
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True),
+)
+def set_fleet_image_proxy(fleet: str, enabled: bool, organization_id: str | None = None, confirm: bool = False) -> str:
+    return _toggle_call(
+        lambda: _set_fleet_toggle(
+            tool="set_fleet_image_proxy",
+            leaf="image-proxy",
+            what="the registry proxy",
+            fleet=fleet,
+            enabled=enabled,
+            organization_id=organization_id,
+            confirm=confirm,
+            on_effect="devices pull container images through the control plane; data carried is billed.",
+            off_effect="devices pull images directly from the registry again.",
+            warnings=["Billed by data carried; needs the billing-management permission."] if enabled else ["Devices behind networks that only allow the control plane cannot pull images once the proxy is off."],
+        )
+    )
+
+
+@mcp.tool(
+    description=(
+        "Enable or disable custom workload metrics for a fleet (PUT /fleets/{id}/custom-metrics; not billed). Devices start "
+        "or stop collecting metrics the workload exposes. Destructive (changes device behaviour): without confirm=true it "
+        "only shows the change; confirm after the user agrees."
+    ),
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True),
+)
+def set_fleet_custom_metrics(fleet: str, enabled: bool, organization_id: str | None = None, confirm: bool = False) -> str:
+    return _toggle_call(
+        lambda: _set_fleet_toggle(
+            tool="set_fleet_custom_metrics",
+            leaf="custom-metrics",
+            what="custom workload metrics",
+            fleet=fleet,
+            enabled=enabled,
+            organization_id=organization_id,
+            confirm=confirm,
+            on_effect="devices collect the metrics their workload exposes.",
+            off_effect="devices stop collecting custom workload metrics.",
+        )
+    )
+
+
+@mcp.tool(
+    description=(
+        "Data carried by a fleet's registry proxy (GET /fleets/{id}/image-proxy/usage): totals, per day and per device, for "
+        "start..end (YYYY-MM-DD or RFC 3339; default the current UTC month so far, at most the backend's maximum period). "
+        "This is what is billed. Read-only."
+    ),
+    annotations=_READ_ONLY,
+)
+def get_image_proxy_usage(fleet: str, start: str | None = None, end: str | None = None, organization_id: str | None = None) -> str:
+    try:
+        client, org_id = _ctx(organization_id)
+        fl = _find_fleet(client, org_id, fleet)
+        usage = client.get(f"fleets/{fl['id']}/image-proxy/usage", org_id=org_id, params={"start": start, "end": end})
+        usage = usage if isinstance(usage, dict) else {}
+        totals = usage.get("totals") or {}
+        return _dumps(
+            {
+                "summary": f"{fl.get('name')}: registry proxy usage {str(usage.get('period_start') or '')[:10]} → {str(usage.get('period_end') or '')[:10]}: {totals}",
+                "fleet": _ref(fl),
+                "period": {"start": usage.get("period_start"), "end": usage.get("period_end")},
+                "totals": totals,
+                "daily": usage.get("daily") or [],
+                "devices": (usage.get("devices") or [])[:50],
+            }
+        )
+    except Exception as exc:
+        return _err(exc)
+
+
+@mcp.tool(
+    description=(
+        "Set a fleet's security policy (PUT /fleets/{id}/security-policy): require_tpm, require_secure_boot, "
+        "require_disk_encryption, require_recovery_key_escrow. Only the flags you pass change; the PUT replaces the whole "
+        "policy, so the tool re-sends the others from the current policy. Devices that do not meet an enforced "
+        "requirement are reported non-compliant (the preview shows the current compliance counts). Destructive: without "
+        "confirm=true it only shows before/after; confirm after the user agrees."
+    ),
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True),
+)
+def set_fleet_security_policy(
+    fleet: str,
+    require_tpm: bool | None = None,
+    require_secure_boot: bool | None = None,
+    require_disk_encryption: bool | None = None,
+    require_recovery_key_escrow: bool | None = None,
+    organization_id: str | None = None,
+    confirm: bool = False,
+) -> str:
+    keys = ("require_tpm", "require_secure_boot", "require_disk_encryption", "require_recovery_key_escrow")
+    asked = dict(zip(keys, (require_tpm, require_secure_boot, require_disk_encryption, require_recovery_key_escrow)))
+    return _toggle_call(lambda: _set_security_policy(fleet, {k: v for k, v in asked.items() if v is not None}, organization_id, confirm))
+
+
+def _set_security_policy(fleet: str, asked: dict[str, bool], organization_id: str | None, confirm: bool) -> str:
+    if not asked:
+        raise ToolRefusal("Nothing to change: pass at least one of require_tpm, require_secure_boot, require_disk_encryption, require_recovery_key_escrow.")
+    client, org_id = _ctx(organization_id)
+    fl = _find_fleet(client, org_id, fleet)
+    fid = fl["id"]
+    cur = client.get(f"fleets/{fid}/security-policy", org_id=org_id)
+    cur = cur if isinstance(cur, dict) else {}
+    keys = ("require_tpm", "require_secure_boot", "require_disk_encryption", "require_recovery_key_escrow")
+    before = {k: bool(cur.get(k)) for k in keys}
+    body = {**before, **asked}
+    if body == before:
+        raise ToolRefusal(f"No change: {fl.get('name')} already has this security policy.", before=before)
+    if cur.get("can_manage") is False:
+        raise ToolRefusal("The caller cannot manage this fleet's security policy (can_manage=false).", before=before)
+    changed = [f"{k} {before[k]} → {body[k]}" for k in keys if body[k] != before[k]]
+    gate = _gate(
+        confirm,
+        "set_fleet_security_policy",
+        f"change the security policy of fleet {fl.get('name')}: {'; '.join(changed)}.",
+        action={"fleet": _ref(fl), "changes": "which devices count as compliant (TPM, secure boot, disk encryption, key escrow)"},
+        args={"fleet": fid, **asked},
+        org_id=org_id,
+        preview={
+            "before": before,
+            "after": body,
+            "devices": {"total": cur.get("devices_total"), "non_compliant_now": cur.get("devices_noncompliant"), "not_reported": cur.get("devices_not_reported")},
+        },
+        warnings=["Enforcing a requirement marks devices that cannot meet it as non-compliant."],
+    )
+    if gate:
+        return gate
+    client.put(f"fleets/{fid}/security-policy", org_id=org_id, json=body)
+    after = client.get(f"fleets/{fid}/security-policy", org_id=org_id)
+    after = after if isinstance(after, dict) else {}
+    now = {k: bool(after.get(k)) for k in keys}
+    confirmed = now == body
+    return _dumps(
+        {
+            "summary": f"{fl.get('name')}: security policy {'; '.join(changed)}" + ("" if confirmed else " (NOT confirmed by read-back)") + ".",
+            "fleet": _ref(fl),
+            "before": before,
+            "after": now,
+            "devices": {"total": after.get("devices_total"), "non_compliant": after.get("devices_noncompliant"), "not_reported": after.get("devices_not_reported")},
+            "read_back": {"confirmed": confirmed},
+        }
+    )
+
+
+# ------------------------------------------------------------ USB policy ---
+
+_USB_MODES = ("off", "block_storage_hid", "allowlist")
+_HEX = re.compile(r"^[0-9a-f]+$")
+
+
+def _clean_usb_rules(allow: Any) -> list[dict[str, str]]:
+    if allow is None:
+        return []
+    if not isinstance(allow, list):
+        raise ValueError("allow must be a list of rules {vendor_id, product_id, interface_class, comment}.")
+    if len(allow) > 128:
+        raise ValueError(f"allow has {len(allow)} rules; at most 128 are allowed.")
+    out: list[dict[str, str]] = []
+    seen: set[tuple[str, str, str]] = set()
+    for i, raw in enumerate(allow):
+        if not isinstance(raw, dict):
+            raise ValueError(f"allow[{i}] must be an object.")
+        unknown = sorted(set(raw) - {"vendor_id", "product_id", "interface_class", "comment"})
+        if unknown:
+            raise ValueError(f"allow[{i}]: unknown field(s) {unknown}.")
+        rule = {k: str(raw.get(k) or "").strip().lower() if k != "comment" else str(raw.get(k) or "").strip() for k in ("vendor_id", "product_id", "interface_class", "comment")}
+        for key, width in (("vendor_id", 4), ("product_id", 4), ("interface_class", 2)):
+            if rule[key] and not (len(rule[key]) == width and _HEX.match(rule[key])):
+                raise ValueError(f"allow[{i}].{key} must be exactly {width} hex digits.")
+        if rule["product_id"] and not rule["vendor_id"]:
+            raise ValueError(f"allow[{i}].product_id requires vendor_id.")
+        if not rule["vendor_id"] and not rule["interface_class"]:
+            raise ValueError(f"allow[{i}] must set vendor_id or interface_class.")
+        if len(rule["comment"].encode()) > 128:
+            raise ValueError(f"allow[{i}].comment must be at most 128 bytes.")
+        key3 = (rule["vendor_id"], rule["product_id"], rule["interface_class"])
+        if key3 in seen:
+            continue
+        seen.add(key3)
+        out.append({k: v for k, v in rule.items() if v})
+    return out
+
+
+def _usb_path(target: dict[str, Any]) -> str:
+    return f"{target['kind']}s/{target['id']}/usb-policy"
+
+
+def _usb_state(client: AdmiralClient, target: dict[str, Any]) -> dict[str, Any]:
+    """Own policy (None when unset) plus, for a device, the effective policy and its source."""
+    payload = client.get(_usb_path(target), org_id=target["org_id"])
+    payload = payload if isinstance(payload, dict) else {}
+    if target["kind"] == "fleet":
+        policy = payload.get("policy")
+        return {"own": policy, "effective": policy or {"mode": "off", "allow": []}, "source": "fleet" if policy else "default"}
+    return {
+        "own": payload.get("device_override"),
+        "fleet": payload.get("fleet_policy"),
+        "effective": payload.get("effective"),
+        "source": payload.get("source"),
+    }
+
+
+def _usb_brief(policy: Any) -> dict[str, Any] | None:
+    if not isinstance(policy, dict):
+        return None
+    return {"mode": policy.get("mode"), "allow": policy.get("allow") or []}
+
+
+@mcp.tool(
+    description=(
+        "USB policy of a device or a fleet (exactly one of device / fleet; read-only; GET /devices/{id}/usb-policy or "
+        "/fleets/{id}/usb-policy). Modes: off (nothing enforced), block_storage_hid (blocks mass storage and HID), allowlist "
+        "(only interfaces matching a rule are authorised). Device: its own override, the fleet policy, the effective policy "
+        "and which one wins (device override > fleet > default off). USB policies are an enterprise feature (402 without it)."
+    ),
+    annotations=_READ_ONLY,
+)
+def get_usb_policy(device: str | None = None, fleet: str | None = None, organization_id: str | None = None) -> str:
+    try:
+        target = _scope(device, fleet, organization_id)
+        state = _usb_state(target["client"], target)
+        eff = _usb_brief(state["effective"])
+        return _dumps(
+            {
+                "summary": f"{_cap(_label(target))}: USB policy {(eff or {}).get('mode') or 'off'} (source {state['source']}).",
+                "target": {"kind": target["kind"], **target["ref"]},
+                "own": _usb_brief(state["own"]),
+                "fleet_policy": _usb_brief(state.get("fleet")) if target["kind"] == "device" else None,
+                "effective": eff,
+                "source": state["source"],
+                "next": [{"tool": "set_usb_policy", "why": "Change it."}],
+            }
+        )
+    except Reply as reply:
+        return _dumps(reply.payload)
+    except ToolRefusal as refusal:
+        return _dumps(refusal.payload)
+    except Exception as exc:
+        return _err(exc)
+
+
+@mcp.tool(
+    description=(
+        "Set the USB policy of a fleet (PUT /fleets/{id}/usb-policy) or of one device (PUT /devices/{id}/usb-policy, an "
+        "override of the fleet's). exactly one of device / fleet. mode: off, block_storage_hid, allowlist. allow = rules "
+        "[{vendor_id: 4 hex, product_id: 4 hex (needs vendor_id), interface_class: 2 hex, comment}] (at most 128; each needs "
+        "vendor_id or interface_class), used by allowlist: an allowlist with no rules blocks every USB device. The policy is "
+        "pushed to the device(s); keyboards, scanners or storage a workload depends on stop working if not allowed. Enterprise "
+        "feature (402 without it). Destructive: without confirm=true it only shows before/after; confirm after the user agrees."
+    ),
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True),
+)
+def set_usb_policy(
+    mode: str,
+    allow: list[dict[str, Any]] | None = None,
+    device: str | None = None,
+    fleet: str | None = None,
+    organization_id: str | None = None,
+    confirm: bool = False,
+) -> str:
+    try:
+        norm = (mode or "").strip().lower()
+        if norm not in _USB_MODES:
+            return _dumps({"error": f"Unknown mode {mode!r}", "choices": list(_USB_MODES)})
+        try:
+            rules = _clean_usb_rules(allow)
+        except ValueError as exc:
+            return _dumps({"error": str(exc)})
+        if rules and norm != "allowlist":
+            return _dumps({"error": "allow rules only apply to mode 'allowlist'."})
+        target = _scope(device, fleet, organization_id)
+        client = target["client"]
+        state = _usb_state(client, target)
+        body = {"mode": norm, "allow": rules}
+        if _usb_brief(state["own"]) == {"mode": norm, "allow": rules}:
+            raise ToolRefusal(f"No change: {_label(target)} already has this USB policy.", target=target["ref"])
+        warnings = []
+        if norm == "allowlist" and not rules:
+            warnings.append("An allowlist with no rules blocks every USB device on the target.")
+        if norm == "block_storage_hid":
+            warnings.append("Blocks USB mass storage and HID (keyboards, mice, scanners presenting as HID).")
+        if target["kind"] == "fleet":
+            warnings.append(f"Pushed to the fleet's devices ({target['row'].get('devices', '?')}); a device with its own override keeps that override.")
+        gate = _gate(
+            confirm,
+            "set_usb_policy",
+            f"set the USB policy of {_label(target)} to {norm}" + (f" with {len(rules)} allow rule(s)" if rules else "") + ".",
+            action={"target": {"kind": target["kind"], **target["ref"]}, "changes": "which USB devices the target authorises"},
+            args={"mode": norm, "allow": rules or None, target["kind"]: target["id"]},
+            org_id=target["org_id"],
+            preview={"before": {"own": _usb_brief(state["own"]), "effective": _usb_brief(state["effective"]), "source": state["source"]}, "after": body},
+            warnings=warnings,
+        )
+        if gate:
+            return gate
+        result = client.put(_usb_path(target), org_id=target["org_id"], json=body)
+        back = _usb_state(client, target)
+        confirmed = _usb_brief(back["own"]) == {"mode": norm, "allow": rules}
+        return _dumps(
+            {
+                "summary": f"{_cap(_label(target))}: USB policy {norm}" + ("" if confirmed else " (NOT confirmed by read-back)") + ".",
+                "target": {"kind": target["kind"], **target["ref"]},
+                "after": _usb_brief(back["own"]),
+                "delivered": result.get("delivered") if isinstance(result, dict) else None,
+                "devices_notified": result.get("devices_notified") if isinstance(result, dict) else None,
+                "read_back": {"confirmed": confirmed},
+            }
+        )
+    except Reply as reply:
+        return _dumps(reply.payload)
+    except ToolRefusal as refusal:
+        return _dumps(refusal.payload)
+    except Exception as exc:
+        return _err(exc)
+
+
+@mcp.tool(
+    description=(
+        "Remove the USB policy of a fleet (DELETE /fleets/{id}/usb-policy: the fleet enforces nothing) or the override of a "
+        "device (DELETE /devices/{id}/usb-policy: it follows the fleet policy again). exactly one of device / fleet. "
+        "Destructive (security policy): without confirm=true it only shows what changes; confirm after the user agrees."
+    ),
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True),
+)
+def clear_usb_policy(device: str | None = None, fleet: str | None = None, organization_id: str | None = None, confirm: bool = False) -> str:
+    try:
+        target = _scope(device, fleet, organization_id)
+        client = target["client"]
+        state = _usb_state(client, target)
+        if not state["own"]:
+            raise ToolRefusal(f"No change: {_label(target)} has no USB policy of its own.", target=target["ref"])
+        after = state.get("fleet") if target["kind"] == "device" else None
+        gate = _gate(
+            confirm,
+            "clear_usb_policy",
+            f"remove the USB policy of {_label(target)}; it " + ("follows the fleet policy again" if target["kind"] == "device" and after else "then enforces no USB restrictions") + ".",
+            action={"target": {"kind": target["kind"], **target["ref"]}, "changes": "which USB devices the target authorises"},
+            args={target["kind"]: target["id"]},
+            org_id=target["org_id"],
+            preview={"removed": _usb_brief(state["own"]), "falls_back_to": _usb_brief(after) or {"mode": "off", "allow": []}},
+        )
+        if gate:
+            return gate
+        client.delete(_usb_path(target), org_id=target["org_id"])
+        back = _usb_state(client, target)
+        return _dumps(
+            {
+                "summary": f"Removed the USB policy of {_label(target)}." if not back["own"] else "Delete sent but a policy still reads back (NOT confirmed).",
+                "target": {"kind": target["kind"], **target["ref"]},
+                "effective": _usb_brief(back["effective"]),
+                "read_back": {"confirmed": not back["own"]},
+            }
+        )
+    except Reply as reply:
+        return _dumps(reply.payload)
+    except ToolRefusal as refusal:
+        return _dumps(refusal.payload)
+    except Exception as exc:
+        return _err(exc)
+
+
+# -------------------------------------------------------------- alerting ---
+
+_ALERT_FIELDS = (
+    "name", "description", "datasource", "expr", "for_seconds", "interval_seconds", "severity", "labels",
+    "summary", "details", "fleet_ids", "device_ids", "enabled", "notify_in_app", "notify_webhooks",
+)
+
+
+def _alert_row(r: dict[str, Any]) -> dict[str, Any]:
+    keys = ("id", "name", "severity", "datasource", "enabled", "interval_seconds", "for_seconds", "fleet_ids", "device_ids", "notify_in_app", "notify_webhooks", "updated_at")
+    return {k: r.get(k) for k in keys if r.get(k) not in (None, [])}
+
+
+def _alert_body(rule: dict[str, Any]) -> dict[str, Any]:
+    return {k: rule[k] for k in _ALERT_FIELDS if rule.get(k) is not None}
+
+
+def _find_alert_rule(client: AdmiralClient, org_id: str, ref: str) -> dict[str, Any]:
+    ref = (ref or "").strip()
+    if not ref:
+        raise ValueError("rule is required (name or UUID)")
+    if is_uuid(ref):
+        row = client.get(f"alerting/rules/{ref}", org_id=org_id)
+        row = row if isinstance(row, dict) else {}
+        row.setdefault("id", ref)
+        return row
+    return _unique_by_name(_items(client.get("alerting/rules", org_id=org_id)), ref, "alert_rule")
+
+
+def _scope_ids(client: AdmiralClient, org_id: str, fleets: list[str] | None, devices: list[str] | None, organization_id: str | None) -> tuple[list[str] | None, list[str] | None]:
+    fleet_ids = None if fleets is None else [str(_find_fleet(client, org_id, f)["id"]) for f in fleets]
+    device_ids: list[str] | None = None
+    if devices is not None:
+        device_ids = []
+        for d in devices:
+            found = _resolve_device(d, organization_id)
+            if not found.get("match"):
+                raise Reply(found)
+            device_ids.append(found["match"]["id"])
+    return fleet_ids, device_ids
+
+
+@mcp.tool(
+    description=(
+        "List the organisation's alert rules (GET /alerting/rules): name, severity, datasource (metrics = MetricsQL, logs = "
+        "LogsQL), enabled, evaluation interval, 'for' duration, fleet/device scope, notification channels. Optional search "
+        "filters by name. Includes the firing/critical/warning/info alert counts. Read-only."
+    ),
+    annotations=_READ_ONLY,
+)
+def list_alert_rules(search: str | None = None, organization_id: str | None = None) -> str:
+    try:
+        client, org_id = _ctx(organization_id)
+        rules = _items(client.get("alerting/rules", org_id=org_id))
+        if search:
+            rules = [r for r in rules if search.strip().lower() in str(r.get("name") or "").lower()]
+        counts = _safe(lambda: client.get("alerting/alerts/summary", org_id=org_id), [], "alert summary")
+        return _dumps(
+            {
+                "summary": f"{len(rules)} alert rule(s)" + (f"; {counts.get('firing')} alert(s) firing" if isinstance(counts, dict) and counts.get("firing") is not None else "") + ".",
+                "rules": [_alert_row(r) for r in rules],
+                "alert_counts": counts if isinstance(counts, dict) else None,
+                "next": [{"tool": "get_alert_rule", "why": "Expression, labels and evaluation health of one rule."}, {"tool": "list_alerts", "why": "Alert history."}],
+            }
+        )
+    except Exception as exc:
+        return _err(exc)
+
+
+@mcp.tool(
+    description=(
+        "One alert rule in full (GET /alerting/rules/{id} and /status): expression, labels, summary/details templates, scope, "
+        "and its evaluation health (last evaluation, samples, active alerts, sync or evaluation errors). rule = name or UUID "
+        "(ambiguous names return candidates). Read-only."
+    ),
+    annotations=_READ_ONLY,
+)
+def get_alert_rule(rule: str, organization_id: str | None = None) -> str:
+    try:
+        client, org_id = _ctx(organization_id)
+        row = _find_alert_rule(client, org_id, rule)
+        status = _safe(lambda: client.get(f"alerting/rules/{row['id']}/status", org_id=org_id), [], "status")
+        status = status if isinstance(status, dict) else None
+        health = (status or {}).get("health") or ("not synced" if status and not status.get("synced") else None)
+        return _dumps(
+            {
+                "summary": f"{row.get('name')}: {row.get('severity')} {row.get('datasource')} rule, {'enabled' if row.get('enabled') else 'disabled'}"
+                + (f", health {health}" if health else "")
+                + (f", {status.get('active_alerts')} active alert(s)" if status and status.get("active_alerts") else "")
+                + ".",
+                "rule": {k: row.get(k) for k in ("id", *_ALERT_FIELDS, "created_by", "updated_by", "created_at", "updated_at") if row.get(k) not in (None, [], {})},
+                "status": status,
+            }
+        )
+    except Exception as exc:
+        return _err(exc)
+
+
+@mcp.tool(
+    description=(
+        "Alert history (GET /alerting/alerts): alert instances with state (firing|resolved), severity, rule, fleet/device, "
+        "start/end. Filters: state, severity (info|warning|critical), rule (name or UUID), since (RFC 3339); limit 1-500 "
+        "(default 50). Includes platform alerts as well as custom rule alerts. Read-only."
+    ),
+    annotations=_READ_ONLY,
+)
+def list_alerts(
+    state: str | None = None,
+    severity: str | None = None,
+    rule: str | None = None,
+    since: str | None = None,
+    limit: int = 50,
+    organization_id: str | None = None,
+) -> str:
+    try:
+        if state and state not in ("firing", "resolved"):
+            return _dumps({"error": "state must be firing or resolved."})
+        if severity and severity not in ("info", "warning", "critical"):
+            return _dumps({"error": "severity must be info, warning or critical."})
+        client, org_id = _ctx(organization_id)
+        rule_id = _find_alert_rule(client, org_id, rule)["id"] if rule else None
+        payload = client.get(
+            "alerting/alerts",
+            org_id=org_id,
+            params={"state": state, "severity": severity, "rule_id": rule_id, "since": since, "limit": max(1, min(int(limit), 500))},
+        )
+        payload = payload if isinstance(payload, dict) else {}
+        alerts = payload.get("alerts") or []
+        keys = ("id", "alertname", "severity", "state", "source", "rule_id", "fleet_id", "device_id", "summary", "starts_at", "ends_at", "last_seen_at")
+        return _dumps(
+            {
+                "summary": f"{len(alerts)} of {payload.get('total', len(alerts))} alert(s)" + (f" ({state})" if state else "") + ".",
+                "alerts": [{k: a.get(k) for k in keys if a.get(k) not in (None, "")} for a in alerts],
+                "total": payload.get("total"),
+            }
+        )
+    except Exception as exc:
+        return _err(exc)
+
+
+@mcp.tool(
+    description=(
+        "Evaluate an alert rule definition WITHOUT saving it (POST /alerting/rules/preview): the query result and series count "
+        "for the scope, or the query error. Same arguments as create_alert_rule (name, expr, datasource metrics|logs, scope). "
+        "Writes nothing, notifies nobody. Needs the organisation's Telemetry add-on (402 otherwise). Read-only."
+    ),
+    annotations=ToolAnnotations(readOnlyHint=True, idempotentHint=True),
+)
+def preview_alert_rule(
+    expr: str,
+    datasource: str = "metrics",
+    name: str = "preview",
+    fleets: list[str] | None = None,
+    devices: list[str] | None = None,
+    interval_seconds: int | None = None,
+    for_seconds: int = 0,
+    severity: str = "warning",
+    organization_id: str | None = None,
+) -> str:
+    try:
+        client, org_id = _ctx(organization_id)
+        fleet_ids, device_ids = _scope_ids(client, org_id, fleets, devices, organization_id)
+        body = _alert_body(
+            {"name": name, "datasource": datasource, "expr": expr, "severity": severity, "for_seconds": for_seconds, "interval_seconds": interval_seconds, "fleet_ids": fleet_ids, "device_ids": device_ids}
+        )
+        result = client.post("alerting/rules/preview", org_id=org_id, json=body)
+        result = result if isinstance(result, dict) else {}
+        err = result.get("error")
+        return _dumps(
+            {
+                "summary": (f"Query error: {err}" if err else f"The query returns {result.get('series', 0)} series right now.") + " Nothing was saved.",
+                "read_only": True,
+                "preview": result,
+                "next": [] if err else [{"tool": "create_alert_rule", "why": "Save it as a rule (set name, severity, summary)."}],
+            }
+        )
+    except Reply as reply:
+        return _dumps(reply.payload)
+    except Exception as exc:
+        return _err(exc)
+
+
+@mcp.tool(
+    description=(
+        "Create an alert rule (POST /alerting/rules). expr is MetricsQL (datasource 'metrics') or LogsQL ('logs'; must "
+        "aggregate with a `| stats ...` pipe). severity info|warning|critical (default warning); for_seconds how long the "
+        "condition must hold; interval_seconds evaluation period (metrics >= 30, logs >= 60, <= 3600; default 60); labels, "
+        "summary and details support only {{ $value }} and {{ $labels.name }} templates; fleets (names/UUIDs) and devices "
+        "scope the rule (empty = organisation-wide); notify_in_app / notify_webhooks choose the channels. Run "
+        "preview_alert_rule first. Needs the Telemetry add-on (402 otherwise); at most 200 rules. The rule evaluates and "
+        "notifies from creation on. Read back from the API. Only on an explicit request."
+    ),
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False),
+)
+def create_alert_rule(
+    name: str,
+    expr: str,
+    datasource: str = "metrics",
+    severity: str = "warning",
+    for_seconds: int = 0,
+    interval_seconds: int | None = None,
+    description: str | None = None,
+    summary: str | None = None,
+    details: str | None = None,
+    labels: dict[str, str] | None = None,
+    fleets: list[str] | None = None,
+    devices: list[str] | None = None,
+    enabled: bool = True,
+    notify_in_app: bool = True,
+    notify_webhooks: bool = True,
+    organization_id: str | None = None,
+) -> str:
+    try:
+        if not (name or "").strip() or not (expr or "").strip():
+            return _dumps({"error": "name and expr are required."})
+        client, org_id = _ctx(organization_id)
+        fleet_ids, device_ids = _scope_ids(client, org_id, fleets, devices, organization_id)
+        body = _alert_body(
+            {
+                "name": name.strip(), "description": description, "datasource": datasource, "expr": expr.strip(), "for_seconds": for_seconds,
+                "interval_seconds": interval_seconds, "severity": severity, "labels": labels, "summary": summary, "details": details,
+                "fleet_ids": fleet_ids, "device_ids": device_ids, "enabled": enabled, "notify_in_app": notify_in_app, "notify_webhooks": notify_webhooks,
+            }
+        )
+        created = client.post("alerting/rules", org_id=org_id, json=body)
+        created = created if isinstance(created, dict) else {}
+        rid = created.get("id")
+        back = _safe(lambda: client.get(f"alerting/rules/{rid}", org_id=org_id), [], "read-back") if rid else None
+        confirmed = isinstance(back, dict) and back.get("expr") == body["expr"] and back.get("name") == body["name"]
+        return _dumps(
+            {
+                "summary": f"Created alert rule {body['name']} ({severity}, {datasource})" + ("" if confirmed else " (NOT confirmed by read-back)") + ".",
+                "rule": _alert_row(back if isinstance(back, dict) else created),
+                "read_back": {"confirmed": confirmed},
+                "next": [{"tool": "get_alert_rule", "why": "Check that it evaluates cleanly.", "arguments": {"rule": rid}}],
+            }
+        )
+    except Reply as reply:
+        return _dumps(reply.payload)
+    except Exception as exc:
+        return _err(exc)
+
+
+@mcp.tool(
+    description=(
+        "Update an alert rule (read, change the fields you pass, PUT /alerting/rules/{id}; the API replaces the whole rule, "
+        "so the tool re-sends the rest). rule = name or UUID. Any of: name, description, datasource, expr, severity, "
+        "for_seconds, interval_seconds, labels (replaces), summary, details, fleets / devices (replace the scope; [] makes "
+        "it organisation-wide), enabled (false silences the rule), notify_in_app, notify_webhooks. No-op updates are "
+        "refused; returns before/after read back. Needs the Telemetry add-on. Only on an explicit request."
+    ),
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True),
+)
+def update_alert_rule(
+    rule: str,
+    name: str | None = None,
+    description: str | None = None,
+    datasource: str | None = None,
+    expr: str | None = None,
+    severity: str | None = None,
+    for_seconds: int | None = None,
+    interval_seconds: int | None = None,
+    labels: dict[str, str] | None = None,
+    summary: str | None = None,
+    details: str | None = None,
+    fleets: list[str] | None = None,
+    devices: list[str] | None = None,
+    enabled: bool | None = None,
+    notify_in_app: bool | None = None,
+    notify_webhooks: bool | None = None,
+    organization_id: str | None = None,
+) -> str:
+    try:
+        client, org_id = _ctx(organization_id)
+        current = _find_alert_rule(client, org_id, rule)
+        rid = current["id"]
+        fleet_ids, device_ids = _scope_ids(client, org_id, fleets, devices, organization_id)
+        changes = {
+            "name": name, "description": description, "datasource": datasource, "expr": expr.strip() if expr else None, "severity": severity,
+            "for_seconds": for_seconds, "interval_seconds": interval_seconds, "labels": labels, "summary": summary, "details": details,
+            "fleet_ids": fleet_ids, "device_ids": device_ids, "enabled": enabled, "notify_in_app": notify_in_app, "notify_webhooks": notify_webhooks,
+        }
+        changes = {k: v for k, v in changes.items() if v is not None}
+        if not changes:
+            return _dumps({"error": "Nothing to change: pass at least one field."})
+        before_body = _alert_body(current)
+        body = {**before_body, **changes}
+        # The API treats absent booleans as defaults (true): always send them explicitly.
+        for key in ("enabled", "notify_in_app", "notify_webhooks"):
+            body.setdefault(key, True)
+        rows = ops.json_diff(before_body, body)
+        if not rows:
+            raise ToolRefusal("No change: the rule already has these values.", rule=_ref(current))
+        client.put(f"alerting/rules/{rid}", org_id=org_id, json=body)
+        back = client.get(f"alerting/rules/{rid}", org_id=org_id)
+        back = back if isinstance(back, dict) else {}
+        confirmed = all(back.get(k) == v for k, v in changes.items() if k not in ("labels",)) and (labels is None or (back.get("labels") or {}) == labels)
+        return _dumps(
+            {
+                "summary": f"Updated alert rule {back.get('name') or current.get('name')}: {', '.join(r['path'] for r in rows)}" + ("" if confirmed else " (NOT confirmed by read-back)") + ".",
+                "rule": _alert_row(back),
+                "diff": rows,
+                "read_back": {"confirmed": confirmed},
+            }
+        )
+    except Reply as reply:
+        return _dumps(reply.payload)
+    except ToolRefusal as refusal:
+        return _dumps(refusal.payload)
+    except Exception as exc:
+        return _err(exc)
+
+
+@mcp.tool(
+    description=(
+        "Delete an alert rule (DELETE /alerting/rules/{id}). rule = name or UUID. The rule stops evaluating and its "
+        "notifications stop; past alerts stay in the history. Irreversible. Destructive: without confirm=true it only shows "
+        "the rule and its evaluation state; confirm after the user explicitly agrees."
+    ),
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True),
+)
+def delete_alert_rule(rule: str, organization_id: str | None = None, confirm: bool = False) -> str:
+    try:
+        client, org_id = _ctx(organization_id)
+        row = _find_alert_rule(client, org_id, rule)
+        rid = row["id"]
+        status = _safe(lambda: client.get(f"alerting/rules/{rid}/status", org_id=org_id), [], "status")
+        gate = _gate(
+            confirm,
+            "delete_alert_rule",
+            f"delete alert rule {row.get('name')} ({row.get('severity')}, {row.get('datasource')}); it stops alerting.",
+            action={"rule": _ref(row), "changes": "removes the rule and its notifications"},
+            args={"rule": rid},
+            org_id=org_id,
+            preview={"rule": _alert_row(row), "expr": row.get("expr"), "status": status if isinstance(status, dict) else None},
+            irreversible=True,
+        )
+        if gate:
+            return gate
+        client.delete(f"alerting/rules/{rid}", org_id=org_id)
+        gone = False
+        try:
+            client.get(f"alerting/rules/{rid}", org_id=org_id)
+        except AdmiralAPIError as exc:
+            gone = exc.status == 404
+        return _dumps(
+            {
+                "summary": f"Deleted alert rule {row.get('name')}." if gone else f"Delete sent for {row.get('name')} but it still reads back.",
+                "rule": _ref(row),
+                "deleted": gone,
+                "read_back": {"confirmed": gone},
+            }
+        )
+    except Exception as exc:
+        return _err(exc)
+
+
+# ---------------------------------------------------- registry credentials ---
+
+_CRED_TYPES = ("basic", "aws_ecr")
+_CRED_SECRET_FIELDS = {
+    "basic": ("password", "registry_token", "identity_token", "auth"),
+    "aws_ecr": ("aws_secret_access_key", "aws_session_token"),
+}
+
+
+def _cred_row(c: dict[str, Any]) -> dict[str, Any]:
+    """Whitelisted view of a credential: identity and has_* flags only, never a secret value."""
+    keys = (
+        "id", "name", "description", "registry", "type", "username", "aws_region", "aws_access_key_id",
+        "has_password", "has_auth", "has_identity_token", "has_registry_token", "has_aws_secret_access_key", "has_aws_session_token",
+        "created_at", "updated_at",
+    )
+    return {k: c.get(k) for k in keys if c.get(k) not in (None, "")}
+
+
+def _find_credential(client: AdmiralClient, org_id: str, ref: str) -> dict[str, Any]:
+    ref = (ref or "").strip()
+    if not ref:
+        raise ValueError("credential is required (name or UUID)")
+    if is_uuid(ref):
+        row = client.get(f"registry-credentials/{ref}", org_id=org_id)
+        row = row if isinstance(row, dict) else {}
+        row.setdefault("id", ref)
+        return row
+    return _unique_by_name(_items(client.get("registry-credentials", org_id=org_id, params={"search": ref, "limit": 100})), ref, "registry_credential")
+
+
+def _credential_users(client: AdmiralClient, org_id: str, cid: str) -> tuple[list[dict[str, Any]], int, bool]:
+    """Configurations whose latest spec names the credential: (users, configurations checked, truncated)."""
+    rows = _paged_items(client, "configurations", org_id, limit=100, max_pages=3)
+    cap = rows[:60]
+
+    def one(c: dict[str, Any]) -> dict[str, Any] | None:
+        try:
+            d = client.get(f"configurations/{c['id']}/details", org_id=org_id)
+        except AdmiralAPIError:
+            return None
+        spec = (d or {}).get("latest_spec") if isinstance(d, dict) else None
+        if isinstance(spec, dict) and str(spec.get("registry_credential_id") or "").lower() == str(cid).lower():
+            return {"id": c["id"], "name": c.get("name")}
+        return None
+
+    users = [u for u in _parallel_map(one, cap) if u]
+    return users, len(cap), len(rows) > len(cap)
+
+
+@mcp.tool(
+    description=(
+        "List registry credentials (GET /registry-credentials): name, registry, type (basic | aws_ecr), username and which "
+        "secrets are stored (has_password, has_registry_token ...). Secret values are never returned by the API or this tool. "
+        "Optional search. Read-only. Attach a credential to a workload with registry_credential_id in the configuration spec."
+    ),
+    annotations=_READ_ONLY,
+)
+def list_registry_credentials(search: str | None = None, limit: int = 50, organization_id: str | None = None) -> str:
+    try:
+        client, org_id = _ctx(organization_id)
+        payload = client.get("registry-credentials", org_id=org_id, params={"search": search, "limit": max(1, min(int(limit), 200))})
+        rows = _items(payload)
+        total = (payload.get("pagination") or {}).get("total") if isinstance(payload, dict) else None
+        return _dumps(
+            {
+                "summary": f"{len(rows)} of {total if total is not None else len(rows)} registry credential(s).",
+                "credentials": [_cred_row(r) for r in rows],
+                "next": [{"tool": "get_registry_credential", "why": "One credential."}],
+            }
+        )
+    except Exception as exc:
+        return _err(exc)
+
+
+@mcp.tool(
+    description="One registry credential (GET /registry-credentials/{id}); credential = name or UUID. Shows which secrets are stored, never their values. Read-only.",
+    annotations=_READ_ONLY,
+)
+def get_registry_credential(credential: str, organization_id: str | None = None) -> str:
+    try:
+        client, org_id = _ctx(organization_id)
+        row = _find_credential(client, org_id, credential)
+        return _dumps({"summary": f"{row.get('name')}: {row.get('type')} credential for {row.get('registry')}.", "credential": _cred_row(row)})
+    except Exception as exc:
+        return _err(exc)
+
+
+def _secret_field(kind: str, field: str | None) -> str:
+    allowed = _CRED_SECRET_FIELDS[kind]
+    chosen = (field or allowed[0]).strip().lower()
+    if chosen not in allowed:
+        raise ValueError(f"secret_field for type {kind} must be one of {list(allowed)}.")
+    return chosen
+
+
+@mcp.tool(
+    description=(
+        "Create a registry credential (POST /registry-credentials). name and registry (host, e.g. registry.example.com) are "
+        "required. type 'basic' (username + a secret: password by default, or registry_token / identity_token / auth via "
+        "secret_field) or 'aws_ecr' (aws_region, aws_access_key_id + aws_secret_access_key by default, or "
+        "aws_session_token). THE SECRET IS NEVER A TOOL ARGUMENT: give secret_file (a local path read by this MCP process) "
+        "or secret_env (the name of an environment variable of this process). The value is sent to the API once and never "
+        "appears in any output. Only available over stdio (the hosted and browser builds cannot read your files). The "
+        "result lists which secrets are stored (has_*). Explicit request only."
+    ),
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False),
+)
+def create_registry_credential(
+    name: str,
+    registry: str,
+    type: str = "basic",
+    username: str | None = None,
+    secret_file: str | None = None,
+    secret_env: str | None = None,
+    secret_field: str | None = None,
+    description: str | None = None,
+    aws_region: str | None = None,
+    aws_access_key_id: str | None = None,
+    organization_id: str | None = None,
+) -> str:
+    try:
+        kind = (type or "basic").strip().lower()
+        if kind not in _CRED_TYPES:
+            return _dumps({"error": f"Unknown type {type!r}", "choices": list(_CRED_TYPES)})
+        if not (name or "").strip() or not (registry or "").strip():
+            return _dumps({"error": "name and registry are required."})
+        field = _secret_field(kind, secret_field)
+        secret = ops.read_local_secret(secret_file, secret_env)
+        client, org_id = _ctx(organization_id)
+        body: dict[str, Any] = {"type": kind, "name": name.strip(), "registry": registry.strip(), field: secret}
+        for key, value in (("description", description), ("username", username), ("aws_region", aws_region), ("aws_access_key_id", aws_access_key_id)):
+            if value:
+                body[key] = value
+        created = client.post("registry-credentials", org_id=org_id, json=body)
+        del secret, body
+        created = created if isinstance(created, dict) else {}
+        back = _safe(lambda: client.get(f"registry-credentials/{created.get('id')}", org_id=org_id), [], "read-back") if created.get("id") else None
+        row = _cred_row(back if isinstance(back, dict) else created)
+        confirmed = bool(row.get(f"has_{field}"))
+        return _dumps(
+            {
+                "summary": f"Created registry credential {name.strip()} for {registry.strip()}; {field} stored" + ("" if confirmed else " (NOT confirmed by read-back)") + ".",
+                "credential": row,
+                "read_back": {"confirmed": confirmed},
+                "next": [{"tool": "edit_configuration", "why": "Reference it from a configuration with merge_patch {registry_credential_id: <id>}.", "arguments": {"merge_patch": {"registry_credential_id": row.get("id")}}}],
+            }
+        )
+    except ops.SecretInputError as exc:
+        return _dumps({"error": str(exc)})
+    except Exception as exc:
+        return _err(exc)
+
+
+@mcp.tool(
+    description=(
+        "Update a registry credential (PUT /registry-credentials/{id}); credential = name or UUID. Change name, description, "
+        "registry, username, aws_region, aws_access_key_id, and/or rotate a secret: secret_file or secret_env (never the "
+        "value itself) plus secret_field (basic: password|registry_token|identity_token|auth; aws_ecr: "
+        "aws_secret_access_key|aws_session_token). Only the fields you pass change. Devices use the new secret the next time "
+        "they pull an image; a wrong one breaks pulls for every configuration that references the credential. Only available "
+        "over stdio. Destructive: without confirm=true it shows what changes (and which configurations use it) without "
+        "reading the secret into any output; confirm after the user agrees."
+    ),
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True),
+)
+def update_registry_credential(
+    credential: str,
+    name: str | None = None,
+    description: str | None = None,
+    registry: str | None = None,
+    username: str | None = None,
+    aws_region: str | None = None,
+    aws_access_key_id: str | None = None,
+    secret_file: str | None = None,
+    secret_env: str | None = None,
+    secret_field: str | None = None,
+    organization_id: str | None = None,
+    confirm: bool = False,
+) -> str:
+    try:
+        client, org_id = _ctx(organization_id)
+        row = _find_credential(client, org_id, credential)
+        cid, kind = row["id"], str(row.get("type") or "basic")
+        rotating = bool(secret_file or secret_env)
+        field = _secret_field(kind if kind in _CRED_SECRET_FIELDS else "basic", secret_field) if rotating else None
+        secret = ops.read_local_secret(secret_file, secret_env) if rotating else None
+        asked = {"name": name, "description": description, "registry": registry, "username": username, "aws_region": aws_region, "aws_access_key_id": aws_access_key_id}
+        changes = {k: v for k, v in asked.items() if v is not None and v != (row.get(k) or "")}
+        if not changes and not rotating:
+            raise ToolRefusal("No change: pass a field that differs from the stored value, or secret_file / secret_env to rotate a secret.", credential=_cred_row(row))
+        users, checked, truncated = _credential_users(client, org_id, cid)
+        if confirm is not True:
+            del secret
+            return _gate(
+                confirm,
+                "update_registry_credential",
+                f"update registry credential {row.get('name')}"
+                + (f" ({', '.join(changes)})" if changes else "")
+                + (f" and replace its {field} from {'file ' + secret_file if secret_file else 'environment variable ' + str(secret_env)}" if rotating else "")
+                + ".",
+                action={"credential": _ref(row), "changes": "registry access used by devices when pulling images"},
+                args={"credential": cid, **changes, "secret_file": secret_file, "secret_env": secret_env, "secret_field": field},
+                org_id=org_id,
+                preview={
+                    "field_changes": {k: {"old": row.get(k), "new": v} for k, v in changes.items()},
+                    "secret": {"replaced": rotating, "field": field, "source": "secret_file" if secret_file else "secret_env" if secret_env else None},
+                    "used_by_configurations": users,
+                    "configurations_checked": checked,
+                    "list_truncated": truncated,
+                },
+                warnings=["The secret value is read from the local source when you confirm and is never shown."] if rotating else None,
+            ) or ""
+        body: dict[str, Any] = dict(changes)
+        if rotating:
+            body[field or "password"] = secret
+        client.put(f"registry-credentials/{cid}", org_id=org_id, json=body)
+        del secret, body
+        back = client.get(f"registry-credentials/{cid}", org_id=org_id)
+        back = back if isinstance(back, dict) else {}
+        confirmed = all(back.get(k) == v for k, v in changes.items()) and (not rotating or bool(back.get(f"has_{field}")))
+        return _dumps(
+            {
+                "summary": f"Updated registry credential {back.get('name') or row.get('name')}"
+                + (f" ({', '.join(changes)})" if changes else "")
+                + (f"; {field} replaced" if rotating else "")
+                + ("" if confirmed else " (NOT confirmed by read-back)")
+                + ".",
+                "credential": _cred_row(back),
+                "read_back": {"confirmed": confirmed},
+            }
+        )
+    except ops.SecretInputError as exc:
+        return _dumps({"error": str(exc)})
+    except ToolRefusal as refusal:
+        return _dumps(refusal.payload)
+    except Exception as exc:
+        return _err(exc)
+
+
+@mcp.tool(
+    description=(
+        "Delete a registry credential (DELETE /registry-credentials/{id}); credential = name or UUID. The backend refuses "
+        "with 409 while any configuration version references it; this tool checks the latest spec of the organisation's "
+        "configurations first and refuses, listing them. Irreversible (the secret cannot be recovered). Destructive: "
+        "without confirm=true it only checks usage and previews."
+    ),
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True),
+)
+def delete_registry_credential(credential: str, organization_id: str | None = None, confirm: bool = False) -> str:
+    try:
+        client, org_id = _ctx(organization_id)
+        row = _find_credential(client, org_id, credential)
+        cid = row["id"]
+        users, checked, truncated = _credential_users(client, org_id, cid)
+        if users:
+            raise ToolRefusal(
+                f"{row.get('name')} is referenced by {len(users)} configuration(s); nothing was deleted.",
+                credential=_ref(row),
+                configurations=users,
+                next=[{"tool": "edit_configuration", "why": "Remove or change registry_credential_id in those configurations first."}],
+            )
+        gate = _gate(
+            confirm,
+            "delete_registry_credential",
+            f"permanently delete registry credential {row.get('name')} ({row.get('registry')}). No configuration's latest spec uses it.",
+            action={"credential": _ref(row), "changes": "deletes the stored credential and its secrets"},
+            args={"credential": cid},
+            org_id=org_id,
+            preview={"credential": _cred_row(row), "configurations_checked": checked, "list_truncated": truncated},
+            irreversible=True,
+            warnings=["Older versions of a configuration may still reference it: the backend then refuses with 409."] + (["Only the first 60 configurations were checked."] if truncated else []),
+        )
+        if gate:
+            return gate
+        client.delete(f"registry-credentials/{cid}", org_id=org_id)
+        gone = False
+        try:
+            client.get(f"registry-credentials/{cid}", org_id=org_id)
+        except AdmiralAPIError as exc:
+            gone = exc.status == 404
+        return _dumps(
+            {
+                "summary": f"Deleted registry credential {row.get('name')}." if gone else f"Delete sent for {row.get('name')} but it still reads back.",
+                "credential": _ref(row),
+                "deleted": gone,
+                "read_back": {"confirmed": gone},
+            }
+        )
+    except ToolRefusal as refusal:
+        return _dumps(refusal.payload)
+    except Exception as exc:
+        return _err(exc)
+
+
+# ----------------------------------------------------------- secret files ---
+
+_SECRET_MAX_BYTES = 64 * 1024
+_SECRET_MAX_FILES = 32
+_SECRET_MAX_TOTAL = 512 * 1024
+_SECRET_RESERVED = (
+    "/proc", "/sys", "/dev", "/boot", "/app", "/bin", "/sbin", "/lib", "/lib64", "/usr", "/run", "/tmp",
+    "/etc/admrl-preload", "/etc/passwd", "/etc/shadow", "/etc/group", "/etc/gshadow", "/etc/sudoers", "/etc/sudoers.d",
+    "/etc/ld.so.conf", "/etc/ld.so.conf.d", "/etc/ld.so.preload", "/etc/s6", "/etc/init.d", "/etc/fstab", "/etc/mtab",
+)
+
+
+def _check_secret_path(path: str) -> str:
+    import posixpath
+
+    p = path or ""
+    if not p.startswith("/") or p.endswith("/") or p == "/":
+        raise ValueError("path must be an absolute path naming a file (for example /admrl/secrets/api.key).")
+    if len(p) > 1024 or any(ord(c) < 0x20 or c in "\x7f\\" for c in p):
+        raise ValueError("path is too long or contains control or backslash characters.")
+    if ".." in p.split("/") or posixpath.normpath(p) != p:
+        raise ValueError("path must be canonical (no '..', '.', empty or repeated segments).")
+    for prefix in _SECRET_RESERVED:
+        if p == prefix or p.startswith(prefix + "/"):
+            raise ValueError(f"path is under a reserved system location ({prefix}).")
+    if p == "/admrl" or p.startswith("/admrl/"):
+        if not any(p.startswith(a + "/") for a in ("/admrl/secrets", "/admrl/volumes")):
+            raise ValueError("under /admrl only /admrl/secrets and /admrl/volumes are available.")
+    return p
+
+
+def _check_secret_mode(mode: str) -> str:
+    text = (mode or "0600").strip()
+    if not text or len(text) > 4 or any(c not in "01234567" for c in text):
+        raise ValueError("mode must be at most four octal digits, for example 0600.")
+    value = int(text, 8)
+    if value & ~0o777:
+        raise ValueError("setuid, setgid and sticky bits are not allowed.")
+    if not value & 0o400:
+        raise ValueError("mode must grant the owner read access.")
+    if value & 0o022:
+        raise ValueError("mode must not be group or world writable.")
+    return f"{value:04o}"
+
+
+def _secret_target(configuration: str | None, device: str | None, organization_id: str | None) -> dict[str, Any]:
+    if bool(configuration) == bool(device):
+        raise ToolRefusal("Pass exactly one of configuration or device.")
+    if device:
+        found = _resolve_device(device, organization_id)
+        if not found.get("match"):
+            raise Reply(found)
+        m = found["match"]
+        return {"kind": "device", "id": m["id"], "ref": {"id": m["id"], "name": m.get("name")}, "org_id": found["organization_id"], "client": get_client(), "base": f"devices/{m['id']}/secret-files"}
+    client, org_id = _ctx(organization_id)
+    row = _find_config(client, org_id, configuration or "")
+    return {"kind": "configuration", "id": row["id"], "ref": _ref(row), "org_id": org_id, "client": client, "base": f"configurations/{row['id']}/secret-files"}
+
+
+def _secret_meta(f: dict[str, Any]) -> dict[str, Any]:
+    keys = ("id", "path", "mode", "uid", "gid", "size", "sha256", "updated_at", "apply")
+    return {k: f.get(k) for k in keys if f.get(k) is not None}
+
+
+def _secret_list(target: dict[str, Any]) -> dict[str, Any]:
+    payload = target["client"].get(target["base"], org_id=target["org_id"])
+    return payload if isinstance(payload, dict) else {}
+
+
+@mcp.tool(
+    description=(
+        "List the secret files attached to a configuration or a device (exactly one of configuration / device; GET "
+        "/configurations/{id}/secret-files or /devices/{id}/secret-files). Metadata only: path, mode, owner, size, sha256, "
+        "updated_at and, for a device, whether each file is applied on it (pending|applied|failed|overridden) plus the "
+        "files inherited from its configuration. File contents are never returned by the API or this tool. Limits: "
+        f"{_SECRET_MAX_BYTES // 1024} KiB per file, {_SECRET_MAX_FILES} files and {_SECRET_MAX_TOTAL // 1024} KiB per scope. Read-only."
+    ),
+    annotations=_READ_ONLY,
+)
+def list_secret_files(configuration: str | None = None, device: str | None = None, organization_id: str | None = None) -> str:
+    try:
+        target = _secret_target(configuration, device, organization_id)
+        data = _secret_list(target)
+        files = [_secret_meta(f) for f in data.get("files") or []]
+        inherited = [_secret_meta(f) for f in data.get("inherited") or []]
+        return _dumps(
+            {
+                "summary": f"{_cap(target['kind'])} {target['ref'].get('name') or target['id']}: {len(files)} secret file(s)"
+                + (f", {len(inherited)} inherited from its configuration" if inherited else "")
+                + ("" if data.get("enabled", True) else " (secret files are disabled on this server)")
+                + ".",
+                "target": {"kind": target["kind"], **target["ref"]},
+                "files": files,
+                "inherited": inherited or None,
+                "limits": data.get("limits"),
+                "enabled": data.get("enabled"),
+            }
+        )
+    except Reply as reply:
+        return _dumps(reply.payload)
+    except ToolRefusal as refusal:
+        return _dumps(refusal.payload)
+    except Exception as exc:
+        return _err(exc)
+
+
+@mcp.tool(
+    description=(
+        "Delete one secret file of a configuration or a device (DELETE .../secret-files/{id}); file = its id or its path. "
+        "exactly one of configuration / device. The stored content is destroyed and cannot be recovered. A device "
+        "change is pushed to the device at once; a configuration change reaches devices when they next sync their "
+        "configuration. Destructive: without confirm=true it only shows the file; confirm after the user agrees."
+    ),
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True),
+)
+def delete_secret_file(
+    file: str,
+    configuration: str | None = None,
+    device: str | None = None,
+    organization_id: str | None = None,
+    confirm: bool = False,
+) -> str:
+    try:
+        target = _secret_target(configuration, device, organization_id)
+        files = _secret_list(target).get("files") or []
+        ref = (file or "").strip()
+        hits = [f for f in files if str(f.get("id")).lower() == ref.lower()] or [f for f in files if f.get("path") == ref]
+        if len(hits) != 1:
+            raise NeedsChoice("secret_file", ref, [{"id": f.get("id"), "path": f.get("path")} for f in files[:20]] if not hits else [{"id": f.get("id"), "path": f.get("path")} for f in hits])
+        meta = hits[0]
+        gate = _gate(
+            confirm,
+            "delete_secret_file",
+            f"delete secret file {meta.get('path')} from {target['kind']} {target['ref'].get('name') or target['id']}; its content is destroyed.",
+            action={"target": {"kind": target["kind"], **target["ref"]}, "file": {"id": meta.get("id"), "path": meta.get("path")}, "changes": "removes the file from the workload's secrets"},
+            args={"file": meta.get("id"), target["kind"]: target["id"]},
+            org_id=target["org_id"],
+            preview={"file": _secret_meta(meta)},
+            irreversible=True,
+            warnings=["A workload that reads this file fails until it is uploaded again."],
+        )
+        if gate:
+            return gate
+        target["client"].delete(f"{target['base']}/{meta['id']}", org_id=target["org_id"])
+        left = [f.get("id") for f in _secret_list(target).get("files") or []]
+        gone = meta.get("id") not in left
+        return _dumps(
+            {
+                "summary": f"Deleted secret file {meta.get('path')}." if gone else f"Delete sent for {meta.get('path')} but it still reads back.",
+                "target": {"kind": target["kind"], **target["ref"]},
+                "deleted": gone,
+                "read_back": {"confirmed": gone},
+            }
+        )
+    except Reply as reply:
+        return _dumps(reply.payload)
+    except ToolRefusal as refusal:
+        return _dumps(refusal.payload)
+    except Exception as exc:
+        return _err(exc)
+
+
+@mcp.tool(
+    description=(
+        "Upload (or replace, by path) a secret file for a configuration or a device (exactly one of configuration / device; "
+        "POST .../secret-files). THE CONTENT IS NEVER A TOOL ARGUMENT: source_path is a local file read by this MCP process "
+        "(at most 64 KiB, not empty); path is where the workload sees it (absolute, for example /admrl/secrets/api.key; "
+        "system locations are refused), mode octal (default 0600; no group/world write), uid/gid owner. Only available over "
+        "stdio. The content is never echoed: previews and results carry size and sha256 only. A device upload is pushed to "
+        "the device at once; a configuration upload reaches devices when they next sync. Destructive (replaces what the "
+        "workload reads): without confirm=true it validates the file and shows what would be replaced; the confirmed call "
+        "pins the file's sha256 and refuses if the file changed in between."
+    ),
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True),
+)
+def upload_secret_file(
+    source_path: str,
+    path: str,
+    configuration: str | None = None,
+    device: str | None = None,
+    mode: str = "0600",
+    uid: int = 0,
+    gid: int = 0,
+    expected_sha256: str | None = None,
+    organization_id: str | None = None,
+    confirm: bool = False,
+) -> str:
+    import hashlib
+    import os
+
+    try:
+        try:
+            dest = _check_secret_path(path)
+            octal = _check_secret_mode(mode)
+        except ValueError as exc:
+            return _dumps({"error": str(exc)})
+        if uid < 0 or gid < 0 or uid > 0x7FFFFFFF or gid > 0x7FFFFFFF:
+            return _dumps({"error": "uid and gid must be between 0 and 2147483647."})
+        local = os.path.expanduser((source_path or "").strip())
+        try:
+            if not os.path.isfile(local):
+                return _dumps({"error": f"{local} is not a readable file."})
+            size = os.path.getsize(local)
+            if size == 0:
+                return _dumps({"error": f"{local} is empty; the backend refuses empty files."})
+            if size > _SECRET_MAX_BYTES:
+                return _dumps({"error": f"{local} is {size} bytes; the limit is {_SECRET_MAX_BYTES} per file."})
+            with open(local, "rb") as fh:
+                content = fh.read(_SECRET_MAX_BYTES + 1)
+        except OSError as exc:
+            return _dumps({"error": f"Cannot read {local}: {exc.strerror or type(exc).__name__}."})
+        digest = hashlib.sha256(content).hexdigest()
+        if expected_sha256 and expected_sha256.lower() != digest:
+            return _dumps(
+                {
+                    "error": "The local file changed since the preview (sha256 differs); nothing was uploaded. Run the tool again without expected_sha256 to review it.",
+                    "expected_sha256": expected_sha256.lower(),
+                    "actual_sha256": digest,
+                }
+            )
+        target = _secret_target(configuration, device, organization_id)
+        listing = _secret_list(target)
+        existing = [f for f in listing.get("files") or []]
+        same = next((f for f in existing if f.get("path") == dest), None)
+        limits = listing.get("limits") or {}
+        max_files = int(limits.get("max_files_per_scope") or _SECRET_MAX_FILES)
+        max_total = int(limits.get("max_total_bytes") or _SECRET_MAX_TOTAL)
+        if not same and len(existing) >= max_files:
+            raise ToolRefusal(f"This {target['kind']} already has {len(existing)} secret files (limit {max_files}); delete one first.", target=target["ref"])
+        total_after = sum(int(f.get("size") or 0) for f in existing if f is not same) + size
+        if total_after > max_total:
+            raise ToolRefusal(f"The files would total {total_after} bytes (limit {max_total}).", target=target["ref"])
+        if same and same.get("sha256") == digest and same.get("mode") == octal and int(same.get("uid") or 0) == uid and int(same.get("gid") or 0) == gid:
+            raise ToolRefusal(f"No change: {dest} already has this content, mode and owner.", file=_secret_meta(same))
+        warnings = []
+        if target["kind"] == "device":
+            warnings.append("Pushed to the device immediately; it overrides a configuration file with the same path.")
+        else:
+            warnings.append("Devices running this configuration receive the file when they next sync their configuration.")
+        gate = _gate(
+            confirm,
+            "upload_secret_file",
+            f"{'replace' if same else 'add'} secret file {dest} ({size} bytes, mode {octal}) on {target['kind']} {target['ref'].get('name') or target['id']}.",
+            action={"target": {"kind": target["kind"], **target["ref"]}, "path": dest, "changes": "the secret file the workload reads"},
+            args={"source_path": source_path, "path": dest, "mode": octal, "uid": uid, "gid": gid, "expected_sha256": digest, target["kind"]: target["id"]},
+            org_id=target["org_id"],
+            preview={
+                "upload": {"path": dest, "mode": octal, "uid": uid, "gid": gid, "size": size, "sha256": digest},
+                "replaces": _secret_meta(same) if same else None,
+                "files_after": len(existing) + (0 if same else 1),
+                "limits": {"max_file_bytes": _SECRET_MAX_BYTES, "max_files_per_scope": max_files, "max_total_bytes": max_total},
+            },
+            warnings=warnings,
+        )
+        if gate:
+            return gate
+        import base64
+
+        body = {"path": dest, "mode": octal, "uid": uid, "gid": gid, "content_base64": base64.b64encode(content).decode("ascii")}
+        meta = target["client"].post(target["base"], org_id=target["org_id"], json=body)
+        del body, content
+        back = next((f for f in _secret_list(target).get("files") or [] if f.get("path") == dest), None)
+        confirmed = bool(back) and back.get("sha256") == digest
+        return _dumps(
+            {
+                "summary": f"Uploaded secret file {dest} ({size} bytes) to {target['kind']} {target['ref'].get('name') or target['id']}" + ("" if confirmed else " (NOT confirmed by read-back)") + ".",
+                "target": {"kind": target["kind"], **target["ref"]},
+                "file": _secret_meta(back or (meta if isinstance(meta, dict) else {})),
+                "read_back": {"confirmed": confirmed},
+                "next": [{"tool": "list_secret_files", "why": "Check the apply state on the device.", "arguments": {target["kind"]: target["id"]}}],
+            }
+        )
+    except Reply as reply:
+        return _dumps(reply.payload)
+    except NeedsChoice as exc:
+        return _err(exc)
+    except ToolRefusal as refusal:
+        return _dumps(refusal.payload)
     except Exception as exc:
         return _err(exc)
 

@@ -133,7 +133,7 @@ async def test_initialize_and_tools_list_exclude_watchers():
         tools = {t["name"]: t for t in r.json()["result"]["tools"]}
     assert "list_devices" in tools
     assert not [n for n in tools if n.startswith("watch_")]
-    assert set(hosted.HOSTED_EXCLUDED_TOOLS) == {"watch_device_state", "watch_rollout"}
+    assert set(hosted.HOSTED_EXCLUDED_TOOLS) == {"watch_device_state", "watch_rollout", "create_registry_credential", "update_registry_credential", "upload_secret_file"}
     assert all(t["annotations"]["readOnlyHint"] is not None for t in tools.values())
     blob = json.dumps(tools)
     assert "this PAT" not in blob and "ADMRL_ORG_ID" not in blob

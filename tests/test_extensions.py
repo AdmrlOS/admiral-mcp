@@ -110,3 +110,60 @@ def test_browser_load_extension_in_open_session_filters_excluded_and_rewrites():
 
 def test_public_server_has_no_extension_tools_by_default():
     assert not any(t.name.startswith("ext_") for t in server.mcp._tool_manager.list_tools())
+
+
+# ------------------------------------------------------ confirmation gate ---
+
+
+def _destructive_module(name: str, *, gated: bool, default: bool = False):
+    mod = types.ModuleType(name)
+
+    def risky_gated(thing: str, confirm: bool = default) -> str:
+        return "ok"
+
+    def risky_open(thing: str) -> str:
+        return "ok"
+
+    def register(mcp):
+        ann = ToolAnnotations(readOnlyHint=False, destructiveHint=True)
+        mcp.tool(description="does a risky thing", annotations=ann)(risky_gated if gated else risky_open)
+        return ["risky_gated" if gated else "risky_open"]
+
+    mod.register = register
+    sys.modules[name] = mod
+    return mod
+
+
+def test_destructive_extension_tool_without_confirm_is_rejected():
+    _destructive_module("fake_ext_open", gated=False)
+    srv = FastMCP(name="t", instructions="base")
+    with pytest.raises(ExtensionError, match="confirm"):
+        register_extension("fake_ext_open", srv)
+    assert _names(srv) == []  # rolled back
+
+
+def test_destructive_extension_tool_with_confirm_default_true_is_rejected():
+    _destructive_module("fake_ext_true", gated=True, default=True)
+    srv = FastMCP(name="t", instructions="base")
+    with pytest.raises(ExtensionError, match="confirm"):
+        register_extension("fake_ext_true", srv)
+    assert _names(srv) == []
+
+
+def test_destructive_extension_tool_with_confirm_false_default_is_accepted():
+    _destructive_module("fake_ext_gated", gated=True)
+    srv = FastMCP(name="t", instructions="base")
+    assert register_extension("fake_ext_gated", srv) == ["risky_gated"]
+
+
+def test_non_destructive_extension_tools_need_no_confirm():
+    _module("fake_ext_plain")
+    srv = FastMCP(name="t", instructions="base")
+    assert register_extension("fake_ext_plain", srv) == ["ext_read", "ext_write"]
+
+
+def test_env_loader_skips_an_ungated_destructive_extension(monkeypatch, capsys):
+    _destructive_module("fake_ext_envopen", gated=False)
+    srv = FastMCP(name="t", instructions="base")
+    assert load_env_extensions(srv, {"ADMRL_MCP_EXTENSIONS": "fake_ext_envopen"}) == {}
+    assert "confirm" in capsys.readouterr().err
