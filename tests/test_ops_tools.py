@@ -284,7 +284,7 @@ def test_edit_configuration_saves_new_version_and_explains_delivery(api):
     new = spec(image="registry.example.com/kiosk:2.0")
     edit_api(api, after_spec=new)
 
-    out = j(server.edit_configuration(CONFIG, change_reason=" bump ", image_tag="2.0", base_version=7))
+    out = j(server.edit_configuration(CONFIG, change_reason=" bump ", image_tag="2.0", base_version=7, confirm=True))
 
     put = bodies(api, "PUT", "/spec")[0]
     assert put["change_reason"] == "bump" and put["spec"]["image"].endswith(":2.0")
@@ -304,44 +304,51 @@ def test_edit_configuration_saves_new_version_and_explains_delivery(api):
 def test_edit_configuration_dry_run_never_writes(api):
     edit_api(api)
     out = j(server.edit_configuration(CONFIG, env_set={"NEW": "1"}, dry_run=True))
-    assert out["dry_run"] is True and out["new_version"] == 8 and out["summary"].startswith("DRY RUN")
-    assert not [r for r in api.seen if r.method == "PUT"]
-    assert out["diff"][0]["path"] == "environment.NEW"
+    assert out["confirmation_required"] is True and out["summary"].startswith("Not done yet") and out["dry_run"] is True
+    assert out["preview"]["diff"][0]["path"] == "environment.NEW"
     assert any("pin those fleets" in w for w in out["warnings"])
-    assert out["next"][0]["tool"] == "edit_configuration"
+    assert any("change_reason is required" in w for w in out["warnings"])
+    assert out["next"]["tool"] == "edit_configuration"
+    assert out["next"]["arguments"] == {"configuration": CONFIG, "base_version": 7, "env_set": {"NEW": "1"}, "confirm": True, "organization_id": "org-1"}
+    assert out["action"]["from_version"] == 7 and out["action"]["to_version"] == 8
+    # dry_run wins over confirm=true; without confirm the call is a preview as well
+    for kwargs in ({"dry_run": True, "confirm": True}, {}):
+        again = j(server.edit_configuration(CONFIG, env_set={"NEW": "1"}, **kwargs))
+        assert again["confirmation_required"] is True
+    assert not [r for r in api.seen if r.method == "PUT"]
 
 
 def test_edit_configuration_requires_reason_unless_dry_run(api):
-    out = j(server.edit_configuration(CONFIG, image_tag="2"))
+    out = j(server.edit_configuration(CONFIG, image_tag="2", confirm=True))
     assert "change_reason is required" in out["error"] and api.seen == []
 
 
 def test_edit_configuration_base_version_conflict_refuses(api):
     edit_api(api)
-    out = j(server.edit_configuration(CONFIG, change_reason="x", image_tag="2", base_version=6))
+    out = j(server.edit_configuration(CONFIG, change_reason="x", image_tag="2", base_version=6, confirm=True))
     assert out["latest_version"] == 7 and out["base_version"] == 6 and "Nothing was written" in out["error"]
     assert not [r for r in api.seen if r.method == "PUT"]
 
 
 def test_edit_configuration_refuses_no_op(api):
     edit_api(api)
-    out = j(server.edit_configuration(CONFIG, change_reason="x", env_set={"MODE": "prod"}, env_unset=["ghost"]))
+    out = j(server.edit_configuration(CONFIG, change_reason="x", env_set={"MODE": "prod"}, env_unset=["ghost"], confirm=True))
     assert out["error"].startswith("No change") and out["notes"] == ["env_unset: ghost was not set (ignored)"]
     assert not [r for r in api.seen if r.method == "PUT"]
 
 
 def test_edit_configuration_bad_edit_arguments_are_errors_not_writes(api):
     edit_api(api)
-    out = j(server.edit_configuration(CONFIG, change_reason="x", spec={"image": "a"}, image_tag="2"))
+    out = j(server.edit_configuration(CONFIG, change_reason="x", spec={"image": "a"}, image_tag="2", confirm=True))
     assert "cannot be combined" in out["error"]
-    out = j(server.edit_configuration(CONFIG, change_reason="x", image="a:1", image_tag="2"))
+    out = j(server.edit_configuration(CONFIG, change_reason="x", image="a:1", image_tag="2", confirm=True))
     assert "not both" in out["error"]
     assert not [r for r in api.seen if r.method == "PUT"]
 
 
 def test_edit_configuration_full_replacement_and_merge_patch(api):
     edit_api(api, after_spec=spec(image="other:1", environment={}, ports=[]))
-    out = j(server.edit_configuration(CONFIG, change_reason="swap", spec={"image": "other:1"}))
+    out = j(server.edit_configuration(CONFIG, change_reason="swap", spec={"image": "other:1"}, confirm=True))
     assert bodies(api, "PUT", "/spec")[0]["spec"]["image"] == "other:1"
     assert {c["path"] for c in out["diff"]} >= {"image", "environment.MODE", "ports[tcp/80]"}
 
@@ -350,7 +357,7 @@ def test_edit_configuration_merge_patch_deletes_and_sets(monkeypatch):
     fake = FakeAPI()
     install(monkeypatch, fake)
     edit_api(fake, after_spec=spec(environment={"MODE": "prod"}, options={"privileged": True}))
-    out = j(server.edit_configuration(CONFIG, change_reason="p", merge_patch={"environment": {"API_TOKEN": None}, "options": {"privileged": True}}))
+    out = j(server.edit_configuration(CONFIG, change_reason="p", merge_patch={"environment": {"API_TOKEN": None}, "options": {"privileged": True}}, confirm=True))
     sent = bodies(fake, "PUT", "/spec")[0]["spec"]
     assert sent["environment"] == {"MODE": "prod"} and sent["options"] == {"privileged": True}
     assert {c["path"] for c in out["diff"]} == {"environment.API_TOKEN", "options.privileged"}
@@ -360,13 +367,13 @@ def test_edit_configuration_merge_patch_deletes_and_sets(monkeypatch):
 def test_edit_configuration_402_signature_policy_is_surfaced_as_billing_gate(api):
     edit_api(api)
     api.on("PUT", f"/configurations/{CONFIG}/spec", httpx.Response(402, json={"msg": "signature_policy feature is not enabled"}))
-    out = j(server.edit_configuration(CONFIG, change_reason="sign", merge_patch={"signaturePolicy": {"required": True}}))
+    out = j(server.edit_configuration(CONFIG, change_reason="sign", merge_patch={"signaturePolicy": {"required": True}}, confirm=True))
     assert out["billing_gate"] is True and "402" in out["error"] and "entitlement" in out["hint"]
 
 
 def test_edit_configuration_detects_concurrent_edit_and_unconfirmed_write(api):
     edit_api(api, after_spec=spec(image="registry.example.com/kiosk:3.0"), after_latest=9)
-    out = j(server.edit_configuration(CONFIG, change_reason="x", image_tag="2.0"))
+    out = j(server.edit_configuration(CONFIG, change_reason="x", image_tag="2.0", confirm=True))
     assert out["read_back"]["confirmed"] is False and out["new_version"] == 9
     assert any("another edit landed" in w for w in out["warnings"])
     assert any("differs from what was sent" in w for w in out["warnings"])
@@ -374,13 +381,13 @@ def test_edit_configuration_detects_concurrent_edit_and_unconfirmed_write(api):
 
 def test_edit_configuration_unused_config_suggests_assignment(api):
     edit_api(api, after_spec=spec(image="x:2"), fleets=[])
-    out = j(server.edit_configuration(CONFIG, change_reason="x", image="x:2"))
+    out = j(server.edit_configuration(CONFIG, change_reason="x", image="x:2", confirm=True))
     assert out["next"][0]["tool"] == "assign_fleet_configuration" and "delivery" not in out and not out.get("warnings")
 
 
 def test_edit_configuration_ambiguous_name_changes_nothing(api):
     api.on("GET", "/configurations", ok([cfg(id=CONFIG, name="kiosk-a"), cfg(id=CONFIG2, name="kiosk-b")]))
-    out = j(server.edit_configuration("kiosk", change_reason="x", image_tag="2"))
+    out = j(server.edit_configuration("kiosk", change_reason="x", image_tag="2", confirm=True))
     assert len(out["candidates"]) == 2 and calls(api) == ["GET /configurations"]
 
 
@@ -425,7 +432,7 @@ def rollback_api(api: FakeAPI, new_spec: dict[str, Any] | None = None) -> None:
 
 def test_rollback_configuration_creates_new_version_and_reads_back(api):
     rollback_api(api)
-    out = j(server.rollback_configuration(CONFIG, 4, reason=" bad build "))
+    out = j(server.rollback_configuration(CONFIG, 4, reason=" bad build ", confirm=True))
     assert bodies(api, "POST", "/rollback") == [{"target_version": 4, "reason": "bad build"}]
     assert out["old_version"] == 7 and out["new_version"] == 8
     assert out["read_back"] == {"latest_version": 8, "matches_target": True, "confirmed": True}
@@ -437,15 +444,15 @@ def test_rollback_configuration_dry_run_and_guards(api):
     rollback_api(api)
     out = j(server.rollback_configuration(CONFIG, 4, dry_run=True))
     assert out["dry_run"] is True and not [r for r in api.seen if r.method == "POST"]
-    assert "already the latest" in j(server.rollback_configuration(CONFIG, 7))["error"]
-    assert "between 1 and 7" in j(server.rollback_configuration(CONFIG, 9))["error"]
-    assert "between 1 and 7" in j(server.rollback_configuration(CONFIG, 0))["error"]
+    assert "already the latest" in j(server.rollback_configuration(CONFIG, 7, confirm=True))["error"]
+    assert "between 1 and 7" in j(server.rollback_configuration(CONFIG, 9, confirm=True))["error"]
+    assert "between 1 and 7" in j(server.rollback_configuration(CONFIG, 0, confirm=True))["error"]
 
 
 def test_rollback_configuration_flags_identical_specs_and_drift(api):
     rollback_api(api, new_spec=spec(image="something-else"))
     api.on("GET", f"/configurations/{CONFIG}/versions/4", ok({"version_number": 4, "spec": spec(image="kiosk:7")}))
-    out = j(server.rollback_configuration(CONFIG, 4))
+    out = j(server.rollback_configuration(CONFIG, 4, confirm=True))
     assert out["read_back"]["matches_target"] is False and out["read_back"]["confirmed"] is False
     assert any("identical version" in w for w in out["warnings"])
 
@@ -454,7 +461,7 @@ def test_delete_configuration_refuses_while_fleets_or_rollouts_use_it(api):
     api.on("GET", f"/configurations/{CONFIG}", ok(cfg()))
     api.on("GET", "/fleets", page([fleet_row(), fleet_row(FLEET2, "lab", CONFIG, 3)]))
     api.on("GET", "/rollouts", page([{"id": ROLLOUT, "name": "r", "type": "config", "status": "in_progress", "config": CONFIG, "fleet_ids": [FLEET]}]))
-    out = j(server.delete_configuration(CONFIG))
+    out = j(server.delete_configuration(CONFIG, confirm=True))
     assert out["error"].endswith("nothing was deleted.") and "2 fleet(s), 1 unfinished" in out["error"]
     assert len(out["fleets"]) == 2 and out["rollouts"][0]["id"] == ROLLOUT
     assert not [r for r in api.seen if r.method == "DELETE"]
@@ -466,7 +473,7 @@ def test_delete_configuration_happy_path_confirms_with_404(api):
     api.on("GET", "/fleets", page([fleet_row(cid=CONFIG2)]))
     api.on("GET", "/rollouts", page([]))
     api.on("DELETE", f"/configurations/{CONFIG}", ok(None))
-    out = j(server.delete_configuration(CONFIG))
+    out = j(server.delete_configuration(CONFIG, confirm=True))
     assert out["deleted"] is True and out["read_back"]["confirmed"] is True
 
 
@@ -475,7 +482,7 @@ def test_delete_configuration_reports_when_it_still_reads_back(api):
     api.on("GET", "/fleets", page([]))
     api.on("GET", "/rollouts", page([]))
     api.on("DELETE", f"/configurations/{CONFIG}", ok(None))
-    out = j(server.delete_configuration(CONFIG))
+    out = j(server.delete_configuration(CONFIG, confirm=True))
     assert out["deleted"] is False and "still reads back" in out["summary"]
 
 
@@ -548,7 +555,7 @@ def test_assign_fleet_configuration_pins_a_version_and_returns_before_after(api)
         fleet_cfg(CONFIG2, "signage", 2, False, spec(image="sign:1")),
         fleet_cfg(CONFIG, "kiosk", 5, True, spec(image="kiosk:5")),
     )
-    out = j(server.assign_fleet_configuration(FLEET, CONFIG, 5))
+    out = j(server.assign_fleet_configuration(FLEET, CONFIG, 5, confirm=True))
 
     assert bodies(api, "POST", "/configuration") == [{"configuration_id": CONFIG, "version": 5}]
     assert out["before"]["configuration"]["name"] == "signage" and out["after"]["assignment"] == 5
@@ -565,30 +572,30 @@ def test_assign_fleet_configuration_latest_omits_version_and_warns_about_active_
         fleet_cfg(CONFIG, "kiosk", 7, False),
         rollouts=[{"id": ROLLOUT, "name": "r", "type": "config", "status": "in_progress", "fleet_ids": [FLEET]}],
     )
-    out = j(server.assign_fleet_configuration(FLEET, CONFIG))
+    out = j(server.assign_fleet_configuration(FLEET, CONFIG, confirm=True))
     assert bodies(api, "POST", "/configuration") == [{"configuration_id": CONFIG}]
     assert any("unfinished rollout" in w for w in out["warnings"]) and out["after"]["assignment"] == "latest"
 
 
 def test_assign_fleet_configuration_refuses_no_ops_and_bad_versions(api):
     assign_api(api, fleet_cfg(CONFIG, "kiosk", 7, False), fleet_cfg(CONFIG, "kiosk", 7, False))
-    assert j(server.assign_fleet_configuration(FLEET, CONFIG, "latest"))["error"].startswith("No change")
+    assert j(server.assign_fleet_configuration(FLEET, CONFIG, "latest", confirm=True))["error"].startswith("No change")
     api.on("GET", f"/fleets/{FLEET}/configuration", Seq(fleet_cfg(CONFIG, "kiosk", 5, True)))
-    assert j(server.assign_fleet_configuration(FLEET, CONFIG, 5))["error"].startswith("No change")
-    assert "between 1 and 7" in j(server.assign_fleet_configuration(FLEET, CONFIG, 99))["error"]
+    assert j(server.assign_fleet_configuration(FLEET, CONFIG, 5, confirm=True))["error"].startswith("No change")
+    assert "between 1 and 7" in j(server.assign_fleet_configuration(FLEET, CONFIG, 99, confirm=True))["error"]
     assert not [r for r in api.seen if r.method == "POST"]
 
 
 def test_assign_fleet_configuration_flags_an_unconfirmed_write(api):
     assign_api(api, fleet_cfg(CONFIG2, "signage", 2), fleet_cfg(CONFIG2, "signage", 2))
-    out = j(server.assign_fleet_configuration(FLEET, CONFIG))
+    out = j(server.assign_fleet_configuration(FLEET, CONFIG, confirm=True))
     assert out["read_back"]["confirmed"] is False and "NOT confirmed" in out["summary"]
 
 
 def test_assign_fleet_configuration_ambiguity_sends_nothing(api):
     api.on("GET", f"/fleets/{FLEET}", ok(fleet_row()))
     api.on("GET", "/configurations", ok([cfg(id=CONFIG, name="kiosk-a"), cfg(id=CONFIG2, name="kiosk-b")]))
-    out = j(server.assign_fleet_configuration(FLEET, "kiosk"))
+    out = j(server.assign_fleet_configuration(FLEET, "kiosk", confirm=True))
     assert len(out["candidates"]) == 2 and not [r for r in api.seen if r.method == "POST"]
 
 
@@ -696,7 +703,7 @@ WINDOW = {"enabled": True, "days": ["monday", "Friday"], "start_time": "02:00", 
 def test_set_fleet_update_policy_window_only_uses_the_window_route(api):
     clean = {**WINDOW, "days": ["Monday", "Friday"]}
     policy_api(api, {"mode": "latest"}, {"mode": "latest", "update_window": clean})
-    out = j(server.set_fleet_update_policy(FLEET, update_window=WINDOW))
+    out = j(server.set_fleet_update_policy(FLEET, update_window=WINDOW, confirm=True))
     assert bodies(api, "PUT", "/update-window") == [clean]
     assert not bodies(api, "PUT", "/update-policy")
     assert out["read_back"]["confirmed"] is True and "window on" in out["summary"]
@@ -706,7 +713,7 @@ def test_set_fleet_update_policy_pinned_with_targets_and_window(api):
     target = {"architecture": "amd64", "system_version_id": "33333333-4444-5555-6666-777777777777"}
     clean = {**WINDOW, "days": ["Monday", "Friday"]}
     policy_api(api, {"mode": "latest"}, {"mode": "pinned", "targets": [target], "update_window": clean})
-    out = j(server.set_fleet_update_policy(FLEET, targets=[target], update_window=WINDOW))
+    out = j(server.set_fleet_update_policy(FLEET, targets=[target], update_window=WINDOW, confirm=True))
     assert bodies(api, "PUT", "/update-policy") == [{"mode": "pinned", "targets": [target], "update_window": clean}]
     assert out["before"]["mode"] == "latest" and out["after"]["mode"] == "pinned" and out["read_back"]["confirmed"] is True
 
@@ -714,14 +721,14 @@ def test_set_fleet_update_policy_pinned_with_targets_and_window(api):
 def test_set_fleet_update_policy_back_to_latest_drops_targets(api):
     t = {"architecture": "amd64"}
     policy_api(api, {"mode": "pinned", "targets": [t]}, {"mode": "latest"})
-    j(server.set_fleet_update_policy(FLEET, mode="LATEST"))
+    j(server.set_fleet_update_policy(FLEET, mode="LATEST", confirm=True))
     assert bodies(api, "PUT", "/update-policy") == [{"mode": "latest"}]
 
 
 def test_set_fleet_update_policy_keeps_existing_targets_when_only_window_changes_with_mode(api):
     t = {"architecture": "arm64", "board": "b1"}
     policy_api(api, {"mode": "pinned", "targets": [t]}, {"mode": "pinned", "targets": [t], "update_window": {**WINDOW, "days": ["Monday", "Friday"]}})
-    j(server.set_fleet_update_policy(FLEET, mode="pinned", update_window=WINDOW))
+    j(server.set_fleet_update_policy(FLEET, mode="pinned", update_window=WINDOW, confirm=True))
     assert bodies(api, "PUT", "/update-policy")[0]["targets"] == [t]
 
 
@@ -729,33 +736,33 @@ def test_set_fleet_update_policy_disable_window_keeps_the_old_values(api):
     old = {**WINDOW, "days": ["Monday"]}
     off = {**old, "enabled": False}
     policy_api(api, {"mode": "latest", "update_window": old}, {"mode": "latest", "update_window": off})
-    out = j(server.set_fleet_update_policy(FLEET, disable_update_window=True))
+    out = j(server.set_fleet_update_policy(FLEET, disable_update_window=True, confirm=True))
     assert bodies(api, "PUT", "/update-window") == [off] and out["read_back"]["confirmed"] is True
 
 
 def test_set_fleet_update_policy_refusals_and_validation(api):
     policy_api(api, {"mode": "latest"}, {"mode": "latest"})
-    assert j(server.set_fleet_update_policy(FLEET, mode="latest"))["error"].startswith("No change")
-    assert "needs targets" in j(server.set_fleet_update_policy(FLEET, mode="pinned"))["error"]
-    assert "needs an architecture" in j(server.set_fleet_update_policy(FLEET, targets=[{"board": "x"}]))["error"]
-    assert "Unknown mode" in j(server.set_fleet_update_policy(FLEET, mode="fast"))["error"]
-    assert "only apply to mode 'pinned'" in j(server.set_fleet_update_policy(FLEET, mode="latest", targets=[{"architecture": "a"}]))["error"]
-    assert "Nothing to change" in j(server.set_fleet_update_policy(FLEET))["error"]
-    assert "not both" in j(server.set_fleet_update_policy(FLEET, update_window=WINDOW, disable_update_window=True))["error"]
+    assert j(server.set_fleet_update_policy(FLEET, mode="latest", confirm=True))["error"].startswith("No change")
+    assert "needs targets" in j(server.set_fleet_update_policy(FLEET, mode="pinned", confirm=True))["error"]
+    assert "needs an architecture" in j(server.set_fleet_update_policy(FLEET, targets=[{"board": "x"}], confirm=True))["error"]
+    assert "Unknown mode" in j(server.set_fleet_update_policy(FLEET, mode="fast", confirm=True))["error"]
+    assert "only apply to mode 'pinned'" in j(server.set_fleet_update_policy(FLEET, mode="latest", targets=[{"architecture": "a"}], confirm=True))["error"]
+    assert "Nothing to change" in j(server.set_fleet_update_policy(FLEET, confirm=True))["error"]
+    assert "not both" in j(server.set_fleet_update_policy(FLEET, update_window=WINDOW, disable_update_window=True, confirm=True))["error"]
     for bad in ({"enabled": True, "days": [], "start_time": "02:00", "end_time": "03:00", "timezone": "UTC"},
                 {"enabled": True, "days": ["Funday"], "start_time": "02:00", "end_time": "03:00", "timezone": "UTC"},
                 {"enabled": True, "days": ["Monday"], "start_time": "2am", "end_time": "03:00", "timezone": "UTC"},
                 {"enabled": True, "days": ["Monday"], "start_time": "02:00", "end_time": "03:00"},
                 {"enabled": True, "days": ["Monday"], "start_time": "02:00", "end_time": "03:00", "timezone": "UTC", "extra": 1}):
-        assert "error" in j(server.set_fleet_update_policy(FLEET, update_window=bad))
-    assert "update_window must be an object" in j(server.set_fleet_update_policy(FLEET, update_window=["x"]))["error"]
+        assert "error" in j(server.set_fleet_update_policy(FLEET, update_window=bad, confirm=True))
+    assert "update_window must be an object" in j(server.set_fleet_update_policy(FLEET, update_window=["x"], confirm=True))["error"]
     assert not [r for r in api.seen if r.method == "PUT"]
 
 
 def test_set_fleet_update_policy_window_no_op(api):
     clean = {**WINDOW, "days": ["Monday", "Friday"]}
     policy_api(api, {"mode": "latest", "update_window": clean}, {"mode": "latest", "update_window": clean})
-    assert j(server.set_fleet_update_policy(FLEET, update_window=WINDOW))["error"].startswith("No change")
+    assert j(server.set_fleet_update_policy(FLEET, update_window=WINDOW, confirm=True))["error"].startswith("No change")
 
 
 # =============================================================== devices ===
@@ -817,10 +824,10 @@ def test_update_device_unresolved_returns_candidates_and_sends_nothing(api, monk
     monkeypatch.setattr(server, "_resolve_device", lambda q, organization_id=None, fleet_id=None: cands)
     out = j(server.update_device("a", name="b"))
     assert len(out["candidates"]) == 2 and api.seen == []
-    assert len(j(server.move_device_to_fleet("a", FLEET))["candidates"]) == 2
+    assert len(j(server.move_device_to_fleet("a", FLEET, confirm=True))["candidates"]) == 2
     assert len(j(server.get_device_configuration("a"))["candidates"]) == 2
-    assert len(j(server.set_device_configuration_override("a", {"image": "x"}))["candidates"]) == 2
-    assert len(j(server.clear_device_configuration_override("a"))["candidates"]) == 2
+    assert len(j(server.set_device_configuration_override("a", {"image": "x"}, confirm=True))["candidates"]) == 2
+    assert len(j(server.clear_device_configuration_override("a", confirm=True))["candidates"]) == 2
     assert api.seen == []
 
 
@@ -830,7 +837,7 @@ def test_move_device_to_fleet_reads_back_and_reports_new_configuration(api):
     api.on("GET", f"/fleets/{FLEET2}/configuration", fleet_cfg(CONFIG2, "signage", 2, True))
     api.on("PUT", f"/devices/{DEV}/fleet", ok({"id": DEV, "flotilla_id": FLEET2}))
 
-    out = j(server.move_device_to_fleet("dan-qemu-3", FLEET2))
+    out = j(server.move_device_to_fleet("dan-qemu-3", FLEET2, confirm=True))
 
     assert bodies(api, "PUT", "/fleet") == [{"flotilla_id": FLEET2}]
     assert out["from_fleet"]["name"] == "shop" and out["to_fleet"]["name"] == "lab"
@@ -841,17 +848,17 @@ def test_move_device_to_fleet_reads_back_and_reports_new_configuration(api):
 def test_move_device_to_fleet_refuses_same_fleet_and_flags_unconfirmed(api):
     api.on("GET", f"/fleets/{FLEET}", ok(fleet_row()))
     api.on("GET", f"/devices/{DEV}", ok(dev_detail()))
-    assert j(server.move_device_to_fleet("x", FLEET))["error"].startswith("No change")
+    assert j(server.move_device_to_fleet("x", FLEET, confirm=True))["error"].startswith("No change")
     api.on("GET", f"/fleets/{FLEET2}", ok(fleet_row(FLEET2, "lab", None)))
     api.on("GET", f"/fleets/{FLEET2}/configuration", fleet_cfg(None))
     api.on("PUT", f"/devices/{DEV}/fleet", ok({}))
-    out = j(server.move_device_to_fleet("x", FLEET2))
+    out = j(server.move_device_to_fleet("x", FLEET2, confirm=True))
     assert out["read_back"]["confirmed"] is False and "the new fleet has no configuration" in out["summary"]
 
 
 def test_move_device_to_fleet_ambiguous_fleet(api):
     api.on("GET", "/fleets", ok([fleet_row(name="shop-a"), fleet_row(FLEET2, "shop-b")]))
-    out = j(server.move_device_to_fleet("x", "shop"))
+    out = j(server.move_device_to_fleet("x", "shop", confirm=True))
     assert len(out["candidates"]) == 2 and not [r for r in api.seen if r.method == "PUT"]
 
 
@@ -888,7 +895,7 @@ def test_set_device_configuration_override_merges_by_default(api):
     api.on("GET", f"/devices/{DEV}/configuration", Seq(dev_cfg(existing), dev_cfg({"image": "kiosk:debug", "environment": {"A": "9"}})))
     api.on("PUT", f"/devices/{DEV}/configuration", ok({"id": DEV, "has_override": True}))
 
-    out = j(server.set_device_configuration_override("x", {"environment": {"A": "9", "B": None}}, reason=" test "))
+    out = j(server.set_device_configuration_override("x", {"environment": {"A": "9", "B": None}}, reason=" test ", confirm=True))
 
     assert bodies(api, "PUT", f"/devices/{DEV}/configuration") == [{"override": {"image": "kiosk:debug", "environment": {"A": "9"}}, "reason": "test"}]
     assert out["after"]["has_override"] is True and out["read_back"]["confirmed"] is True
@@ -898,27 +905,27 @@ def test_set_device_configuration_override_merges_by_default(api):
 def test_set_device_configuration_override_replace_and_state_toggle(api):
     api.on("GET", f"/devices/{DEV}/configuration", Seq(dev_cfg({"image": "old"}), dev_cfg({"desiredState": "STOPPED"})))
     api.on("PUT", f"/devices/{DEV}/configuration", ok({}))
-    j(server.set_device_configuration_override("x", {"desiredState": "STOPPED"}, replace=True))
+    j(server.set_device_configuration_override("x", {"desiredState": "STOPPED"}, replace=True, confirm=True))
     assert bodies(api, "PUT", f"/devices/{DEV}/configuration")[0] == {"override": {"desiredState": "STOPPED"}}
 
 
 def test_set_device_configuration_override_guards(api):
-    assert "Unknown override field" in j(server.set_device_configuration_override("x", {"imagee": "x"}))["error"]
-    assert "non-empty" in j(server.set_device_configuration_override("x", {}))["error"]
-    assert "RUNNING or STOPPED" in j(server.set_device_configuration_override("x", {"desiredState": "PAUSED"}))["error"]
+    assert "Unknown override field" in j(server.set_device_configuration_override("x", {"imagee": "x"}, confirm=True))["error"]
+    assert "non-empty" in j(server.set_device_configuration_override("x", {}, confirm=True))["error"]
+    assert "RUNNING or STOPPED" in j(server.set_device_configuration_override("x", {"desiredState": "PAUSED"}, confirm=True))["error"]
     assert api.seen == []
     api.on("GET", f"/devices/{DEV}/configuration", dev_cfg({"image": "a"}))
-    assert j(server.set_device_configuration_override("x", {"image": "a"}))["error"].startswith("No change")
-    assert "empty" in j(server.set_device_configuration_override("x", {"image": None}))["error"]
+    assert j(server.set_device_configuration_override("x", {"image": "a"}, confirm=True))["error"].startswith("No change")
+    assert "empty" in j(server.set_device_configuration_override("x", {"image": None}, confirm=True))["error"]
     api.on("GET", f"/devices/{DEV}/configuration", dev_cfg(None, cid=None))
-    assert "no configuration to override" in j(server.set_device_configuration_override("x", {"image": "a"}))["error"]
+    assert "no configuration to override" in j(server.set_device_configuration_override("x", {"image": "a"}, confirm=True))["error"]
     assert not [r for r in api.seen if r.method == "PUT"]
 
 
 def test_clear_device_configuration_override(api):
     api.on("GET", f"/devices/{DEV}/configuration", Seq(dev_cfg({"image": "a"}), dev_cfg(None)))
     api.on("DELETE", f"/devices/{DEV}/configuration/override", ok({"id": DEV, "has_override": False}))
-    out = j(server.clear_device_configuration_override("x", reason=" done "))
+    out = j(server.clear_device_configuration_override("x", reason=" done ", confirm=True))
     delete = next(r for r in api.seen if r.method == "DELETE")
     assert dict(delete.url.params) == {"reason": "done"}
     assert out["read_back"] == {"confirmed": True, "has_override": False} and out["removed_override"] == {"image": "a"}
@@ -926,10 +933,10 @@ def test_clear_device_configuration_override(api):
 
 def test_clear_device_configuration_override_refuses_when_none_and_flags_leftover(api):
     api.on("GET", f"/devices/{DEV}/configuration", dev_cfg(None))
-    assert j(server.clear_device_configuration_override("x"))["error"].startswith("No change")
+    assert j(server.clear_device_configuration_override("x", confirm=True))["error"].startswith("No change")
     api.on("GET", f"/devices/{DEV}/configuration", dev_cfg({"image": "a"}))
     api.on("DELETE", f"/devices/{DEV}/configuration/override", ok({}))
-    out = j(server.clear_device_configuration_override("x"))
+    out = j(server.clear_device_configuration_override("x", confirm=True))
     assert out["read_back"]["confirmed"] is False and "NOT confirmed" in out["summary"]
     assert "reason" not in dict(next(r for r in api.seen if r.method == "DELETE").url.params)
 
@@ -1080,7 +1087,7 @@ def test_preview_rollout_tolerates_a_failing_impact_call(api):
 def test_create_rollout_multiple_fleets(api):
     api.on("GET", "/fleets", Seq(ok([fleet_row(name="shop")])))
     api.on("POST", "/rollouts", httpx.Response(201, json=envelope({"id": ROLLOUT})))
-    out = j(server.create_rollout(["shop", FLEET2], CONFIG, 3))
+    out = j(server.create_rollout(["shop", FLEET2], CONFIG, 3, confirm=True))
     body = bodies(api, "POST", "/rollouts")[0]
     assert body["fleet_ids"] == [FLEET, FLEET2] and body["name"] == f"{CONFIG} v3 → 2 fleets"
     assert out["rollout"]["id"] == ROLLOUT
@@ -1088,11 +1095,11 @@ def test_create_rollout_multiple_fleets(api):
 
 def test_create_rollout_other_types(api):
     api.on("POST", "/rollouts", httpx.Response(201, json=envelope({"id": ROLLOUT})))
-    j(server.create_rollout(FLEET, type="reboot", force=True))
-    j(server.create_rollout(FLEET, type="restart_workload", container_target="default", strategy={"canary": 0}))
-    j(server.create_rollout(FLEET, type="system_update", version_ids=["33333333-4444-5555-6666-777777777777"], final_action="restart", name="os"))
-    j(server.create_rollout(FLEET, type="system_update", use_current_versions=True))
-    j(server.create_rollout(FLEET, type="reboot"))
+    j(server.create_rollout(FLEET, type="reboot", force=True, confirm=True))
+    j(server.create_rollout(FLEET, type="restart_workload", container_target="default", strategy={"canary": 0}, confirm=True))
+    j(server.create_rollout(FLEET, type="system_update", version_ids=["33333333-4444-5555-6666-777777777777"], final_action="restart", name="os", confirm=True))
+    j(server.create_rollout(FLEET, type="system_update", use_current_versions=True, confirm=True))
+    j(server.create_rollout(FLEET, type="reboot", confirm=True))
     posted = bodies(api, "POST", "/rollouts")
     assert posted[0] == {"name": f"reboot → {FLEET}", "type": "reboot", "fleet_ids": [FLEET], "reboot_spec": {"force": True}}
     assert posted[1]["restart_workload_spec"] == {"container_target": "default"} and posted[1]["strategy"] == {"canary": 0}
@@ -1102,33 +1109,33 @@ def test_create_rollout_other_types(api):
 
 
 def test_create_rollout_validation_never_posts(api):
-    assert "configuration is required" in j(server.create_rollout(FLEET))["error"]
-    assert "Unsupported rollout type" in j(server.create_rollout(FLEET, type="wipe"))["error"]
-    assert "version_ids" in j(server.create_rollout(FLEET, type="system_update"))["error"]
-    assert "not both" in j(server.create_rollout(FLEET, type="system_update", use_current_versions=True, version_ids=[FLEET]))["error"]
-    assert "final_action" in j(server.create_rollout(FLEET, type="system_update", use_current_versions=True, final_action="halt"))["error"]
-    assert "must be UUIDs" in j(server.create_rollout(FLEET, type="system_update", version_ids=["v1"]))["error"]
-    assert "listed twice" in j(server.create_rollout([FLEET, FLEET], CONFIG, 1))["error"]
-    assert "fleet is required" in j(server.create_rollout([], CONFIG, 1))["error"]
+    assert "configuration is required" in j(server.create_rollout(FLEET, confirm=True))["error"]
+    assert "Unsupported rollout type" in j(server.create_rollout(FLEET, type="wipe", confirm=True))["error"]
+    assert "version_ids" in j(server.create_rollout(FLEET, type="system_update", confirm=True))["error"]
+    assert "not both" in j(server.create_rollout(FLEET, type="system_update", use_current_versions=True, version_ids=[FLEET], confirm=True))["error"]
+    assert "final_action" in j(server.create_rollout(FLEET, type="system_update", use_current_versions=True, final_action="halt", confirm=True))["error"]
+    assert "must be UUIDs" in j(server.create_rollout(FLEET, type="system_update", version_ids=["v1"], confirm=True))["error"]
+    assert "listed twice" in j(server.create_rollout([FLEET, FLEET], CONFIG, 1, confirm=True))["error"]
+    assert "fleet is required" in j(server.create_rollout([], CONFIG, 1, confirm=True))["error"]
     assert api.seen == []
 
 
 def test_create_rollout_ambiguous_fleet_or_configuration_returns_candidates(api):
     api.on("GET", "/fleets", ok([fleet_row(name="shop-a"), fleet_row(FLEET2, "shop-b")]))
-    out = j(server.create_rollout("shop", CONFIG, 1))
+    out = j(server.create_rollout("shop", CONFIG, 1, confirm=True))
     assert out["candidates"][0]["id"] == FLEET and not [r for r in api.seen if r.method == "POST"]
     api.on("GET", "/configurations", ok([cfg(id=CONFIG, name="kiosk-a"), cfg(id=CONFIG2, name="kiosk-b")]))
-    out = j(server.create_rollout(FLEET, "kiosk", 1))
+    out = j(server.create_rollout(FLEET, "kiosk", 1, confirm=True))
     assert len(out["candidates"]) == 2 and not [r for r in api.seen if r.method == "POST"]
 
 
 def test_create_rollout_latest_for_uuid_configuration_and_unresolvable_latest(api):
     api.on("GET", f"/configurations/{CONFIG}", ok(cfg(9)))
     api.on("POST", "/rollouts", httpx.Response(201, json=envelope({"id": ROLLOUT})))
-    j(server.create_rollout(FLEET, CONFIG))
+    j(server.create_rollout(FLEET, CONFIG, confirm=True))
     assert bodies(api, "POST", "/rollouts")[0]["config_spec"] == {"config_id": CONFIG, "config_version": 9}
     api.on("GET", f"/configurations/{CONFIG}", ok({"id": CONFIG, "name": "kiosk"}))
-    assert "Could not resolve" in j(server.create_rollout(FLEET, CONFIG))["error"]
+    assert "Could not resolve" in j(server.create_rollout(FLEET, CONFIG, confirm=True))["error"]
 
 
 # ===================================================== errors & metadata ===
@@ -1169,7 +1176,8 @@ def test_new_tools_have_the_right_annotations():
     for name, destructive in NEW_MUTATING.items():
         ann = tools[name].annotations
         assert ann.readOnlyHint is False and ann.destructiveHint is destructive, name
-        assert "explicit request" in tools[name].description or "Explicit request" in tools[name].description, name
+        text = tools[name].description
+        assert ("confirm=true" in text) if destructive else ("explicit request" in text.lower()), name
     assert tools["create_rollout"].annotations.destructiveHint is True
 
 

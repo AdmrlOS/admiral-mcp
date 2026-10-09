@@ -30,7 +30,7 @@ def test_change_workload_status_sends_stop_and_reports_acceptance(monkeypatch):
     monkeypatch.setattr(server, "get_client", lambda: StubClient())
     _patch_resolution(monkeypatch)
 
-    out = json.loads(server.change_workload_status("dotmatrixboi", action="stop"))
+    out = json.loads(server.change_workload_status("dotmatrixboi", action="stop", confirm=True))
     assert captured == {
         "device_id": "5f0c2a1e-7b3d-4c8e-9a6f-1d2e3f4a5b6c",
         "action": "stop",
@@ -54,7 +54,7 @@ def test_change_workload_status_supports_all_four_actions(monkeypatch):
     _patch_resolution(monkeypatch)
 
     for action in ("start", "restart", "recreate", "stop"):
-        out = json.loads(server.change_workload_status("dotmatrixboi", action=action))
+        out = json.loads(server.change_workload_status("dotmatrixboi", action=action, confirm=True))
         assert out["result"]["success"] is True
     assert sent == ["start", "restart", "recreate", "stop"]
 
@@ -67,7 +67,7 @@ def test_change_workload_status_rejects_unsupported_actions(monkeypatch):
 
     monkeypatch.setattr(server, "_resolve_device", fail_resolve)
 
-    out = json.loads(server.change_workload_status("dotmatrixboi", action="reset"))
+    out = json.loads(server.change_workload_status("dotmatrixboi", action="reset", confirm=True))
     assert "error" in out
     assert sorted(out["choices"]) == ["recreate", "restart", "start", "stop"]
 
@@ -86,6 +86,6 @@ def test_change_workload_status_ambiguous_device_never_sends(monkeypatch):
         lambda *a, **k: {"match": None, "candidates": [{"id": "x"}, {"id": "y"}], "organization_id": "org-1"},
     )
 
-    out = json.loads(server.change_workload_status("twin", action="stop"))
+    out = json.loads(server.change_workload_status("twin", action="stop", confirm=True))
     assert out.get("match") is None
     assert len(out["candidates"]) == 2

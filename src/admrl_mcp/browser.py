@@ -37,6 +37,9 @@ from .toolset import PAT_PARAGRAPH_START, TEXT_REWRITES, clone_tools, instructio
 EXCLUDED_TOOLS: dict[str, str] = {
     "watch_device_state": "SSE stream: a synchronous XHR cannot deliver events before it ends.",
     "watch_rollout": "SSE stream: a synchronous XHR cannot deliver events before it ends.",
+    "create_registry_credential": "Reads the secret from a local file or environment variable of the MCP process; the browser has neither.",
+    "update_registry_credential": "Reads the secret from a local file or environment variable of the MCP process; the browser has neither.",
+    "upload_secret_file": "Reads the file from a local path of the MCP process; the browser has no such filesystem.",
 }
 
 _PAT_PARAGRAPH_START = PAT_PARAGRAPH_START
