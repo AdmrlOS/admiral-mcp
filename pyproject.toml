@@ -9,6 +9,7 @@ authors = [{ name = "Admiral Operations" }]
 dependencies = [
     "httpx>=0.28.1,<1",
     "mcp>=1.9,<2",
+    "uvicorn>=0.30",
 ]
 [project.optional-dependencies]
 dev = [
@@ -18,6 +19,7 @@ dev = [
 
 [project.scripts]
 admrl-mcp = "admrl_mcp.server:main"
+admrl-mcp-http = "admrl_mcp.hosted:main"
 
 [build-system]
 requires = ["hatchling"]

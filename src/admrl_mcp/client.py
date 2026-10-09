@@ -171,11 +171,9 @@ class AdmiralClient:
     ) -> Any:
         headers: dict[str, str] = {}
         resolved_org = org_id or self.settings.org_id
-        if require_org:
-            if not resolved_org:
-                raise AdmiralAPIError(400, self._org_required_message())
-            headers["X-Organization-ID"] = resolved_org
-        elif resolved_org:
+        if require_org and not resolved_org and not self.settings.org_optional:
+            raise AdmiralAPIError(400, self._org_required_message())
+        if resolved_org:
             headers["X-Organization-ID"] = resolved_org
 
         # Drop empty query params so the API keeps its defaults.
@@ -228,7 +226,7 @@ class AdmiralClient:
 
     def _org_headers(self, org_id: str | None, require_org: bool) -> dict[str, str]:
         resolved_org = org_id or self.settings.org_id
-        if require_org and not resolved_org:
+        if require_org and not resolved_org and not self.settings.org_optional:
             raise AdmiralAPIError(400, self._org_required_message())
         return {"X-Organization-ID": resolved_org} if resolved_org else {}
 

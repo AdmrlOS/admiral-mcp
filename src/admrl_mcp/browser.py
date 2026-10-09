@@ -31,6 +31,7 @@ from typing import Any, Callable
 import httpx
 
 from .config import AUTH_BEARER, DEFAULT_API_BASE, Settings
+from .toolset import PAT_PARAGRAPH_START, TEXT_REWRITES, clone_tools, instructions_with_auth_paragraph, rewrite_description
 
 # Tools that cannot run in a browser worker, with the reason.
 EXCLUDED_TOOLS: dict[str, str] = {
@@ -38,32 +39,14 @@ EXCLUDED_TOOLS: dict[str, str] = {
     "watch_rollout": "SSE stream: a synchronous XHR cannot deliver events before it ends.",
 }
 
-_PAT_PARAGRAPH_START = "Auth is a Personal API Token"
+_PAT_PARAGRAPH_START = PAT_PARAGRAPH_START
 _BROWSER_AUTH_PARAGRAPH = (
     "You are running inside the Admiral dashboard, signed in as the current user. Requests use that user's "
     "session and the dashboard's current organisation, so you only see what that user can see. "
     "Live log tailing and event streaming are not available; "
     "use the historical log and state tools."
 )
-# (old, new) exact-text rewrites applied to the PAT-oriented server text. A
-# test fails if the server text drifts so that one of these stops matching.
-_TEXT_REWRITES: tuple[tuple[str, str], ...] = (
-    (
-        "  Do not try to open the live websocket tail; PAT cannot authenticate it.\n",
-        "  The live websocket tail is not available here.\n",
-    ),
-    (
-        "- Observed state: get_device_state (stored; live=true asks the device), watch_device_state (SSE timeline of\n"
-        "  condition transitions and progress operations). Desired state:",
-        "- Observed state: get_device_state (stored; live=true asks the device). Desired state:",
-    ),
-    (", watch_rollout (SSE until terminal).", "."),
-    (
-        "List organisations visible to this PAT. Use when ADMRL_ORG_ID is unset or the user asks which org to use.",
-        "List organisations visible to the signed-in user. Use when the user asks which org to use.",
-    ),
-    ("PAT cannot open the live websocket tail. ", "The live websocket tail is not available here. "),
-)
+_TEXT_REWRITES = TEXT_REWRITES
 
 # Forbidden request header names for XHR (plus prefixes below).
 _FORBIDDEN_HEADERS = frozenset(
@@ -241,38 +224,19 @@ def set_auth(token: str, organization_id: str | None) -> None:
 
 
 def browser_instructions() -> str:
-    from .server import INSTRUCTIONS
-
-    text = INSTRUCTIONS
-    start = text.index(_PAT_PARAGRAPH_START)
-    text = text[:start] + _BROWSER_AUTH_PARAGRAPH
-    for old, new in _TEXT_REWRITES:
-        text = text.replace(old, new)
-    return text
+    return instructions_with_auth_paragraph(_BROWSER_AUTH_PARAGRAPH)
 
 
 def _rewrite_description(text: str | None) -> str:
-    out = text or ""
-    for old, new in _TEXT_REWRITES:
-        out = out.replace(old, new)
-    return out
+    return rewrite_description(text)
 
 
 def build_browser_server() -> Any:
     """A FastMCP instance with the browser-safe subset of the admrl tools."""
     from mcp.server.fastmcp import FastMCP
 
-    from . import server
-
     srv = FastMCP(name="admrl", instructions=browser_instructions())
-    tools = {}
-    for tool in server.mcp._tool_manager.list_tools():
-        if tool.name in EXCLUDED_TOOLS:
-            continue
-        tools[tool.name] = tool.model_copy(update={"description": _rewrite_description(tool.description)})
-    # Same Tool objects (schemas, output handling, annotations); private dict
-    # because FastMCP has no public "register an existing Tool" API.
-    srv._tool_manager._tools = tools
+    clone_tools(srv, EXCLUDED_TOOLS)
     for module_name in _extensions:
         _apply_extension(srv, module_name)
     return srv
