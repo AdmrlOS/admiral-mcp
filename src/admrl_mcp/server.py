@@ -13,6 +13,7 @@ from __future__ import annotations
 
 import base64
 import json
+import re
 from collections import Counter
 import sys
 import contextvars
@@ -28,6 +29,7 @@ from .config import ConfigError, require_settings
 from . import docs
 from . import fleetmetrics
 from . import memtest
+from . import ops
 from . import troubleshoot as ts
 from .extensions import load_env_extensions
 from .distill import distill_events, distill_logs, health_from_stats
@@ -51,7 +53,18 @@ How to answer naturally:
   org < fleet < device): get_device_policy; change it with patch_device_document on spec.policy.
 - duplicate_fleet / duplicate_configuration create a copy (billed features and secret files are never copied;
   the result lists them under skipped). Only on an explicit request.
-- Rollouts: create_rollout, get_rollout, list_rollout_devices, rollout_control, watch_rollout (SSE until terminal).
+- Rollouts: preview_rollout (read-only plan: impact, spec diff, warnings, the exact create_rollout call), create_rollout
+  (config, reboot, restart_workload, system_update over one or more fleets), list_rollouts, get_rollout,
+  list_rollout_devices, rollout_control, watch_rollout (SSE until terminal).
+- Changing what a fleet runs: list_configurations / get_configuration / diff_configuration_versions to read;
+  edit_configuration (dry_run first; saves a NEW version; base_version guards against concurrent edits),
+  rollback_configuration, update_configuration_metadata, create_configuration, delete_configuration. get_fleet shows
+  which configuration a fleet runs ('latest' or pinned). assign_fleet_configuration applies a configuration/version to
+  a fleet DIRECTLY (no canary, nothing pushed to connected devices; they pick it up when they reconnect or get a push).
+  A fleet that follows 'latest' resolves a new version as soon as it exists. For running fleets the safe path is
+  edit_configuration -> preview_rollout -> create_rollout, then follow it with get_rollout. Fleet/device management: create_fleet,
+  update_fleet, set_fleet_update_policy (OS update policy/window), update_device, move_device_to_fleet,
+  get_device_configuration, set_device_configuration_override, clear_device_configuration_override.
 - For how-to / what-is questions about Admiral itself (concepts, setup, provisioning, configuration), use
   search_docs then read_docs_page, answer from them, and always cite the docs URL.
 - "What is wrong with my device?" -> troubleshoot_device (one call: state, backend diagnosis, fresh probe, logs, events,
@@ -65,8 +78,10 @@ How to answer naturally:
 - Memory tests: start_memory_test (mode live keeps the workload running; full_online stops it and needs
   confirm=true after the user agrees), cancel_memory_test, get_memory_test, list_memory_test_results.
   A test boot is not available here: the user starts it from the dashboard or the device console.
-- Destructive actions (reboot, document patches, local-override adopt/discard, rollouts and rollout control)
-  require an explicit user request. Confirm the exact device first.
+- Destructive actions (reboot, document patches, local-override adopt/discard, configuration edits, rollbacks and
+  deletes, fleet assignment, moving a device, rollouts and rollout control) require an explicit user request.
+  Confirm the exact device/fleet/configuration first; ambiguous names return candidates and change nothing. Every
+  mutating tool reads the state back from the API and reports it: trust that, not the 200.
 
 Auth is a Personal API Token (X-API-Token-ID + X-API-Secret-Key). Organisation
 context is X-Organization-ID; list_organisations if ADMRL_ORG_ID is unset.
@@ -122,7 +137,29 @@ def _dumps(payload: Any) -> str:
 
 
 def _err(exc: Exception) -> str:
-    if isinstance(exc, (ConfigError, AdmiralAPIError)):
+    if isinstance(exc, NeedsChoice):
+        return _dumps(
+            {
+                "error": str(exc),
+                "candidates": exc.candidates,
+                "next": "Call again with the UUID of the intended " + exc.kind + "; nothing was changed.",
+            }
+        )
+    if isinstance(exc, ToolRefusal):
+        return _dumps(exc.payload)
+    if isinstance(exc, AdmiralAPIError):
+        out: dict[str, Any] = {"error": str(exc)}
+        if exc.status == 402:
+            out["billing_gate"] = True
+            out["hint"] = (
+                "The organisation lacks a feature this request needs (a billing/entitlement gate, not a fault). "
+                "Enable it in the dashboard, or remove the setting that needs it."
+            )
+        elif exc.status == 409:
+            out["conflict"] = True
+            out["hint"] = "The resource changed or already exists. Re-read it and retry."
+        return _dumps(out)
+    if isinstance(exc, ConfigError):
         return _dumps({"error": str(exc)})
     return _dumps({"error": f"{type(exc).__name__}: {exc}"})
 
@@ -1879,62 +1916,88 @@ def _pick_by_name(rows: list[dict[str, Any]], name: str, what: str) -> dict[str,
 
 @mcp.tool(
     description=(
-        "Create a convergence-driven configuration rollout (POST /rollouts, type=config). fleet = fleet name or "
-        "UUID; configuration = configuration name or UUID; version = integer or \"latest\". strategy (all "
-        "optional; server defaults canary 1, maxInFlight 50, maxUnavailable 2, failureThreshold 0.1, "
-        "progressDeadline 30m): {canary, maxInFlight, maxUnavailable, failureThreshold (0-1 of admitted), "
-        "progressDeadline (\"30m\" or seconds)}. Devices are admitted only while online, canary first, then a "
-        "window of maxInFlight; the rollout pauses on the failure budget and stays in_progress until every "
-        "target converges. Changes devices — explicit request only. Follow with watch_rollout."
+        "Create a convergence-driven rollout (POST /rollouts) over one or more fleets. fleet = a fleet name/UUID or a "
+        "list of them. type 'config' (default): configuration = name or UUID (required), version = integer or \"latest\"; "
+        "a config rollout may also switch a fleet to a different configuration, and on completion the fleet is pinned to "
+        "the explicit version. Other types need no configuration: 'reboot' (force=true skips the graceful path), "
+        "'restart_workload' (optional container_target) and 'system_update' (OS update: use_current_versions=true or "
+        "version_ids [UUID]; final_action reboot|none|restart). strategy (all optional; server defaults canary 1, "
+        "maxInFlight 50, maxUnavailable 2, failureThreshold 0.1, progressDeadline 30m): {canary, maxInFlight, "
+        "maxUnavailable, failureThreshold (0-1 of admitted), progressDeadline (\"30m\" or seconds)}. Devices are admitted "
+        "only while online, canary first, then a window of maxInFlight; the rollout pauses on the failure budget and "
+        "stays in_progress until every target converges. A config rollout to the version a device already runs never "
+        "converges: run preview_rollout first. Changes devices — explicit request only. Follow with watch_rollout."
     ),
     annotations=ToolAnnotations(destructiveHint=True, idempotentHint=False, readOnlyHint=False),
 )
 def create_rollout(
-    fleet: str,
-    configuration: str,
+    fleet: str | list[str],
+    configuration: str | None = None,
     version: int | str = "latest",
     strategy: dict[str, Any] | None = None,
     name: str | None = None,
     description: str | None = None,
     organization_id: str | None = None,
+    type: str = "config",
+    force: bool = False,
+    container_target: str | None = None,
+    use_current_versions: bool = False,
+    version_ids: list[str] | None = None,
+    final_action: str | None = None,
 ) -> str:
     try:
         client = get_client()
         org_id = DeviceResolver(client).resolve_org(organization_id)
+        kind = _rollout_type(type)
         strat = _normalise_strategy(strategy)
+        refs = _as_list(fleet)
+        if not refs:
+            return _dumps({"error": "fleet is required (a name/UUID or a list)."})
+        fleet_rows: list[dict[str, Any]] = []
+        for ref in refs:
+            if is_uuid(ref):
+                fleet_rows.append({"id": ref, "name": None})
+            else:
+                fleet_rows.append(_unique_by_name(_items(client.list_fleets(org_id=org_id, search=ref, limit=100)), ref, "fleet"))
+        if len({str(f["id"]).lower() for f in fleet_rows}) != len(fleet_rows):
+            return _dumps({"error": "The same fleet was listed twice."})
+        fleet_ids = [str(f["id"]) for f in fleet_rows]
+        where = (fleet_rows[0].get("name") or fleet_ids[0]) if len(fleet_rows) == 1 else f"{len(fleet_rows)} fleets"
 
-        if is_uuid(fleet):
-            fleet_row: dict[str, Any] = {"id": fleet.strip(), "name": None}
-        else:
-            fleet_row = _pick_by_name(_items(client.list_fleets(org_id=org_id, search=fleet, limit=100)), fleet, "Fleet")
-
-        if is_uuid(configuration):
-            config_row: dict[str, Any] = {"id": configuration.strip()}
+        body: dict[str, Any]
+        if kind == "config":
+            if not configuration:
+                return _dumps({"error": "configuration is required for type=config."})
+            if is_uuid(configuration):
+                config_row: dict[str, Any] = {"id": configuration.strip()}
+                if str(version).strip().lower() == "latest":
+                    detail = client.get(f"configurations/{configuration.strip()}", org_id=org_id)
+                    config_row = detail if isinstance(detail, dict) else config_row
+            else:
+                config_row = _unique_by_name(
+                    _items(client.list_configurations(org_id=org_id, search=configuration, limit=100)), configuration, "configuration"
+                )
             if str(version).strip().lower() == "latest":
-                detail = client.get(f"configurations/{configuration.strip()}", org_id=org_id)
-                config_row = detail if isinstance(detail, dict) else config_row
+                resolved_version = config_row.get("latest_version") or config_row.get("latestVersion")
+                if not resolved_version:
+                    return _dumps({"error": "Could not resolve the configuration's latest version; pass version explicitly", "configuration": config_row})
+            else:
+                resolved_version = int(version)
+            config_id = config_row.get("id") or configuration
+            label = config_row.get("name") or config_id
+            body = {
+                "name": name or f"{label} v{resolved_version} → {where}",
+                "type": "config",
+                "fleet_ids": fleet_ids,
+                "config_spec": {"config_id": config_id, "config_version": int(resolved_version)},
+            }
         else:
-            config_row = _pick_by_name(
-                _items(client.list_configurations(org_id=org_id, search=configuration, limit=100)),
-                configuration,
-                "Configuration",
-            )
-
-        if str(version).strip().lower() == "latest":
-            resolved_version = config_row.get("latest_version") or config_row.get("latestVersion")
-            if not resolved_version:
-                return _dumps({"error": "Could not resolve the configuration's latest version; pass version explicitly", "configuration": config_row})
-        else:
-            resolved_version = int(version)
-
-        config_id = config_row.get("id") or configuration
-        label = config_row.get("name") or config_id
-        body: dict[str, Any] = {
-            "name": name or f"{label} v{resolved_version} → {fleet_row.get('name') or fleet_row['id']}",
-            "type": "config",
-            "fleet_ids": [fleet_row["id"]],
-            "config_spec": {"config_id": config_id, "config_version": int(resolved_version)},
-        }
+            body = {
+                "name": name or f"{kind} → {where}",
+                "type": kind,
+                "fleet_ids": fleet_ids,
+                **_type_spec(kind, force, container_target, use_current_versions, version_ids, final_action),
+            }
         if description:
             body["description"] = description
         if strat:
@@ -2038,6 +2101,1891 @@ def watch_rollout(rollout_id: str, timeout_s: float = 120, organization_id: str 
             timeout_s=timeout,
         )
         return _dumps({"rollout_id": rid, "stream": stream, **watch.result()})
+    except Exception as exc:
+        return _err(exc)
+
+
+# ---------------------------------------------------------------------------
+# Operations: configurations, fleets, devices and rollout planning
+# ---------------------------------------------------------------------------
+
+_DELIVERY_NOTE = (
+    "Changing a configuration version or a fleet's assignment does not push anything to devices. A device pulls its "
+    "desired state every time it (re)connects and also receives pushes from rollouts and fleet moves, so connected "
+    "devices keep running what they have until one of those happens; a fleet that follows 'latest' therefore picks "
+    "the change up unevenly, device by device, with no canary and no health gate. create_rollout is the controlled "
+    "way to apply a version (canary, in-flight window, failure budget, convergence check); render_device_document "
+    "with push=true pushes the current desired state to one device immediately."
+)
+_ACTIVE_ROLLOUT_STATUSES = "pending,scheduled,in_progress,paused"
+_CONFIG_STATUSES = ("draft", "active", "testing", "deprecated", "archived")  # stored lower-case (swagger says capitalised)
+_ROLLOUT_TYPES = ("config", "reboot", "restart_workload", "system_update")
+_STRATEGY_DEFAULTS = {
+    "canary": 1,
+    "maxInFlight": 50,
+    "maxUnavailable": 2,
+    "failureThreshold": 0.1,
+    "progressDeadline": "30m",
+}
+_WINDOW_DAYS = ("Sunday", "Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday")
+_OVERRIDE_KEYS = (
+    "image",
+    "command",
+    "environment",
+    "mounts",
+    "options",
+    "volumes",
+    "ports",
+    "image_cleaning",
+    "registry_credential_id",
+    "desiredState",
+)
+
+
+class NeedsChoice(Exception):
+    """A name matched zero or several rows: the caller must pass a UUID."""
+
+    def __init__(self, kind: str, ref: str, candidates: list[dict[str, Any]]):
+        self.kind, self.ref, self.candidates = kind, ref, candidates
+        if candidates:
+            super().__init__(f"{kind.capitalize()} {ref!r} matched {len(candidates)}; pass a UUID.")
+        else:
+            super().__init__(f"No {kind} matches {ref!r}. Use list_{kind}s to find it, or pass a UUID.")
+
+
+class ToolRefusal(Exception):
+    """The request is valid JSON but should not be sent (no-op, guard failed). Payload goes back as-is."""
+
+    def __init__(self, message: str, **extra: Any):
+        super().__init__(message)
+        self.payload = {"error": message, **extra}
+
+
+def _ctx(organization_id: str | None) -> tuple[AdmiralClient, str]:
+    client = get_client()
+    return client, DeviceResolver(client).resolve_org(organization_id)
+
+
+def _paged_items(
+    client: AdmiralClient,
+    path: str,
+    org_id: str,
+    *,
+    params: dict[str, Any] | None = None,
+    limit: int = 200,
+    max_pages: int = 25,
+) -> list[dict[str, Any]]:
+    out: list[dict[str, Any]] = []
+    page = 1
+    while page <= max_pages:
+        payload = client.get(path, org_id=org_id, params={**(params or {}), "page": page, "limit": limit})
+        rows = _items(payload)
+        out.extend(rows)
+        pagination = payload.get("pagination") if isinstance(payload, dict) else None
+        if page >= ((pagination or {}).get("totalPages") or 1) or not rows:
+            break
+        page += 1
+    return out
+
+
+def _unique_by_name(rows: list[dict[str, Any]], ref: str, kind: str) -> dict[str, Any]:
+    needle = ref.strip().lower()
+    hits = [r for r in rows if str(r.get("name") or "").lower() == needle] or [
+        r for r in rows if needle in str(r.get("name") or "").lower()
+    ]
+    if len(hits) == 1:
+        return hits[0]
+    raise NeedsChoice(kind, ref, [{"id": r.get("id"), "name": r.get("name")} for r in hits[:10]])
+
+
+def _find_fleet(client: AdmiralClient, org_id: str, ref: str) -> dict[str, Any]:
+    """Fleet row by UUID (GET) or by name (list search). Several or no matches -> NeedsChoice."""
+    ref = (ref or "").strip()
+    if not ref:
+        raise ValueError("fleet is required (name or UUID)")
+    if is_uuid(ref):
+        row = client.get(f"fleets/{ref}", org_id=org_id)
+        row = row if isinstance(row, dict) else {}
+        row.setdefault("id", ref)
+        return row
+    return _unique_by_name(_items(client.list_fleets(org_id=org_id, search=ref, limit=200)), ref, "fleet")
+
+
+def _find_config(client: AdmiralClient, org_id: str, ref: str) -> dict[str, Any]:
+    """Configuration row (id, name, status, latest_version) by UUID (GET) or by name (list search)."""
+    ref = (ref or "").strip()
+    if not ref:
+        raise ValueError("configuration is required (name or UUID)")
+    if is_uuid(ref):
+        row = client.get(f"configurations/{ref}", org_id=org_id)
+        row = row if isinstance(row, dict) else {}
+        row.setdefault("id", ref)
+        return row
+    return _unique_by_name(_items(client.list_configurations(org_id=org_id, search=ref, limit=100)), ref, "configuration")
+
+
+def _ref(row: dict[str, Any]) -> dict[str, Any]:
+    return {"id": row.get("id"), "name": row.get("name")}
+
+
+def _latest_of(row: dict[str, Any]) -> int | None:
+    value = row.get("latest_version") or row.get("latestVersion")
+    return int(value) if value else None
+
+
+def _safe(fn: Any, warnings: list[str], label: str) -> Any:
+    try:
+        return fn()
+    except Exception as exc:  # a failing side lookup must not hide the main answer
+        warnings.append(f"{label}: {exc}")
+        return None
+
+
+def _fleet_usage(fleets: list[dict[str, Any]], config_id: str) -> dict[str, list[dict[str, Any]]]:
+    """Fleets assigned to config_id, split into 'follow latest' and 'pinned'."""
+    follow, pinned = [], []
+    for fleet in fleets:
+        if str(fleet.get("configuration_id") or "").lower() != str(config_id).lower():
+            continue
+        entry = {"id": fleet.get("id"), "name": fleet.get("name"), "devices": fleet.get("devices"), "online": fleet.get("online")}
+        if fleet.get("config_version"):
+            pinned.append({**entry, "pinned_version": fleet.get("config_version")})
+        else:
+            follow.append(entry)
+    return {"follow_latest": follow, "pinned": pinned}
+
+
+def _usage_by_config(fleets: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    out: dict[str, list[dict[str, Any]]] = {}
+    for fleet in fleets:
+        cid = str(fleet.get("configuration_id") or "").lower()
+        if cid:
+            out.setdefault(cid, []).append(
+                {"id": fleet.get("id"), "name": fleet.get("name"), "version": fleet.get("config_version") or "latest"}
+            )
+    return out
+
+
+def _assignment(payload: Any) -> dict[str, Any]:
+    """Compact fleet configuration state from GET /fleets/{id}/configuration."""
+    payload = payload if isinstance(payload, dict) else {}
+    cid = payload.get("configuration_id")
+    if not cid:
+        return {"configuration": None, "assignment": None, "resolved_version": None}
+    cfg = payload.get("configuration") or {}
+    resolved = payload.get("config_version")
+    return {
+        "configuration": {"id": cid, "name": cfg.get("name"), "status": cfg.get("status"), "latest_version": cfg.get("latest_version")},
+        "assignment": resolved if payload.get("is_pinned") else "latest",
+        "resolved_version": resolved,
+    }
+
+
+def _fleet_assignment(client: AdmiralClient, org_id: str, fleet_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
+    payload = client.get(f"fleets/{fleet_id}/configuration", org_id=org_id)
+    payload = payload if isinstance(payload, dict) else {}
+    return _assignment(payload), _norm_or_empty(payload.get("configuration_spec"))
+
+
+def _norm_or_empty(spec: Any) -> dict[str, Any]:
+    return ops.norm_spec(spec) if isinstance(spec, dict) and spec else {}
+
+
+def _rollout_row(r: dict[str, Any]) -> dict[str, Any]:
+    names = r.get("fleet_names") if isinstance(r.get("fleet_names"), dict) else {}
+    fleets = [names.get(str(fid)) or fid for fid in (r.get("fleet_ids") or [])]
+    row = {
+        "id": r.get("id"),
+        "name": r.get("name"),
+        "type": r.get("type"),
+        "status": r.get("status"),
+        "progress_pct": r.get("progress_pct"),
+        "fleets": fleets,
+        "configuration": r.get("config_name") or r.get("config"),
+        "version": r.get("version"),
+        "disruptive": r.get("is_disruptive"),
+        "paused_reason": r.get("pausedReason"),
+        "counts": r.get("counts"),
+        "created_at": r.get("created_at"),
+    }
+    return {k: v for k, v in row.items() if v not in (None, "", [], {})}
+
+
+def _active_rollouts(client: AdmiralClient, org_id: str, fleet_ids: list[str]) -> list[dict[str, Any]]:
+    payload = client.get(
+        "rollouts",
+        org_id=org_id,
+        params={"status": _ACTIVE_ROLLOUT_STATUSES, "fleet_id": ",".join(fleet_ids), "limit": 50},
+    )
+    return [_rollout_row(r) for r in _items(payload)]
+
+
+def _version_info(row: dict[str, Any]) -> dict[str, Any]:
+    out = {
+        "version": row.get("version_number"),
+        "changed_by": row.get("changed_by"),
+        "change_reason": row.get("change_reason"),
+        "created_at": row.get("created_at"),
+    }
+    if row.get("is_rollback"):
+        out["rollback"] = {"from": row.get("rolled_back_from"), "to": row.get("rolled_back_to")}
+    return {k: v for k, v in out.items() if v not in (None, "")}
+
+
+def _config_next(config: dict[str, Any], version: int | None, usage: dict[str, list[dict[str, Any]]]) -> list[dict[str, Any]]:
+    fleets = [f["id"] for f in usage["follow_latest"] + usage["pinned"]]
+    if fleets:
+        return [
+            {
+                "tool": "preview_rollout",
+                "why": "Check the impact and warnings, then roll the new version out under a canary.",
+                "arguments": {"fleets": fleets, "configuration": config.get("id"), "version": version or "latest"},
+            }
+        ]
+    return [
+        {
+            "tool": "assign_fleet_configuration",
+            "why": "No fleet uses this configuration yet.",
+            "arguments": {"fleet": "<fleet name or UUID>", "configuration": config.get("id"), "version": version or "latest"},
+        }
+    ]
+
+
+def _delivery_warnings(usage: dict[str, list[dict[str, Any]]], new_version: int | None) -> list[str]:
+    warnings = []
+    if usage["follow_latest"]:
+        names = ", ".join(f["name"] or f["id"] for f in usage["follow_latest"][:5])
+        warnings.append(
+            f"Fleets following 'latest' ({names}) resolve v{new_version} as soon as the version exists, without a canary. "
+            "Devices pick it up when they reconnect or next receive a push."
+        )
+    return warnings
+
+
+# ------------------------------------------------------- configurations ---
+
+
+@mcp.tool(
+    description=(
+        "List configurations (GET /configurations): id, name, status (draft, active, testing, deprecated, archived; matched case-insensitively), "
+        "latest_version and which fleets use each one (fleet name + 'latest' or the pinned version). Filter by search "
+        "(name/description) and status. Read-only. Next: get_configuration for the spec, edit_configuration to change it."
+    ),
+    annotations=_READ_ONLY,
+)
+def list_configurations(
+    search: str | None = None,
+    status: str | None = None,
+    limit: int = 50,
+    page: int = 1,
+    include_fleets: bool = True,
+    organization_id: str | None = None,
+) -> str:
+    try:
+        client, org_id = _ctx(organization_id)
+        if status:
+            match = [s for s in _CONFIG_STATUSES if s.lower() == status.strip().lower()]
+            if not match:
+                return _dumps({"error": f"Unknown status {status!r}", "choices": list(_CONFIG_STATUSES)})
+            status = match[0]
+        payload = client.get(
+            "configurations",
+            org_id=org_id,
+            params={"search": search, "status": status, "limit": max(1, min(int(limit), 200)), "page": max(1, int(page))},
+        )
+        pagination = payload.get("pagination") if isinstance(payload, dict) else None
+        usage = _usage_by_config(_paged_items(client, "fleets", org_id)) if include_fleets else {}
+        rows = []
+        for cfg in _items(payload):
+            row = {
+                "id": cfg.get("id"),
+                "name": cfg.get("name"),
+                "status": cfg.get("status"),
+                "latest_version": cfg.get("latest_version"),
+                "description": cfg.get("description"),
+                "tags": cfg.get("tags"),
+                "updated_at": cfg.get("updated_at"),
+            }
+            if include_fleets:
+                row["fleets"] = usage.get(str(cfg.get("id")).lower(), [])
+            fleets_col = row.pop("fleets", None)
+            row = {k: v for k, v in row.items() if v not in (None, "", [])}
+            if include_fleets:
+                row["fleets"] = fleets_col
+            rows.append(row)
+        total = (pagination or {}).get("total", len(rows))
+        return _dumps(
+            {
+                "summary": f"{len(rows)} of {total} configuration(s)" + (f" matching {search!r}" if search else ""),
+                "organization_id": org_id,
+                "configurations": rows,
+                "pagination": pagination,
+                "next": [{"tool": "get_configuration", "why": "Read the spec and version history of one configuration."}],
+            }
+        )
+    except Exception as exc:
+        return _err(exc)
+
+
+@mcp.tool(
+    description=(
+        "One configuration in full: metadata, the spec of the latest (or the requested) version, recent version history "
+        "and the fleets assigned to it (GET /configurations/{id}/details, /versions, /versions/{n}). configuration = name "
+        "or UUID (ambiguous names return candidates). Environment values whose names look like credentials are masked "
+        "unless show_secret_env=true. Read-only."
+    ),
+    annotations=_READ_ONLY,
+)
+def get_configuration(
+    configuration: str,
+    version: int | None = None,
+    include_spec: bool = True,
+    show_secret_env: bool = False,
+    history_limit: int = 10,
+    organization_id: str | None = None,
+) -> str:
+    try:
+        client, org_id = _ctx(organization_id)
+        cfg = _find_config(client, org_id, configuration)
+        cid = cfg["id"]
+        warnings: list[str] = []
+        if version is not None:
+            if int(version) < 1:
+                return _dumps({"error": "version must be 1 or greater (omit for the latest)"})
+            main = lambda: client.get(f"configurations/{cid}/versions/{int(version)}", org_id=org_id)  # noqa: E731
+        else:
+            main = lambda: client.get(f"configurations/{cid}/details", org_id=org_id)  # noqa: E731
+        detail, versions, fleets = _parallel_map(
+            lambda fn: fn(),
+            [
+                main,
+                lambda: _safe(lambda: client.get(f"configurations/{cid}/versions", org_id=org_id), warnings, "version history"),
+                lambda: _safe(lambda: _paged_items(client, "fleets", org_id), warnings, "fleets"),
+            ],
+        )
+        detail = detail if isinstance(detail, dict) else {}
+        if version is not None:
+            meta, spec, info = cfg, detail.get("spec"), detail
+        else:
+            meta = detail.get("configuration") or cfg
+            spec, info = detail.get("latest_spec"), detail.get("version_info") or {}
+        latest = _latest_of(meta) or _latest_of(cfg)
+        shown = int(version) if version is not None else latest
+        history = sorted(
+            [_version_info(v) for v in (versions or []) if isinstance(v, dict)], key=lambda v: v.get("version", 0), reverse=True
+        )[: max(1, int(history_limit))]
+        usage = _fleet_usage(fleets or [], cid)
+        out: dict[str, Any] = {
+            "summary": (
+                f"{meta.get('name')} ({meta.get('status')}): latest v{latest}, showing v{shown}; "
+                f"{len(usage['follow_latest'])} fleet(s) follow latest, {len(usage['pinned'])} pinned."
+            ),
+            "configuration": {
+                "id": cid,
+                "name": meta.get("name"),
+                "description": meta.get("description"),
+                "tags": meta.get("tags"),
+                "status": meta.get("status"),
+                "latest_version": latest,
+                "updated_at": meta.get("updated_at"),
+            },
+            "version": shown,
+            "is_latest": shown == latest,
+            "version_info": _version_info(info) if info else None,
+            "history": history,
+            "fleets": usage,
+        }
+        if include_spec:
+            norm = ops.norm_spec(spec)
+            out["spec"] = norm if show_secret_env else ops.mask_spec(norm)
+            if not show_secret_env and ops.mask_spec(norm) != norm:
+                out["note"] = "Credential-looking environment values are masked; pass show_secret_env=true to reveal them."
+        else:
+            out["spec_summary"] = ops.spec_summary(spec)
+        if warnings:
+            out["warnings"] = warnings
+        out["next"] = [
+            {"tool": "diff_configuration_versions", "why": "See what changed between versions."},
+            {"tool": "edit_configuration", "why": "Change the image, environment or any spec field (creates a new version)."},
+        ]
+        return _dumps(out)
+    except Exception as exc:
+        return _err(exc)
+
+
+@mcp.tool(
+    description=(
+        "Structured diff between two versions of a configuration spec (GET /configurations/{id}/versions/{n}). Defaults: "
+        "to_version = latest, from_version = the one before. Returns one row per changed field (image, environment.NAME, "
+        "ports[tcp/80], volumes.NAME, options.*, mounts[...], command, ...) with old/new values; credential-looking "
+        "environment values are masked. Read-only."
+    ),
+    annotations=_READ_ONLY,
+)
+def diff_configuration_versions(
+    configuration: str,
+    from_version: int | None = None,
+    to_version: int | None = None,
+    organization_id: str | None = None,
+) -> str:
+    try:
+        client, org_id = _ctx(organization_id)
+        cfg = _find_config(client, org_id, configuration)
+        latest = _latest_of(cfg)
+        target = int(to_version) if to_version is not None else latest
+        if not target or target < 1:
+            return _dumps({"error": "Could not determine the version to compare; pass to_version.", "configuration": _ref(cfg)})
+        source = int(from_version) if from_version is not None else target - 1
+        if source < 1:
+            return _dumps({"error": f"{cfg.get('name')} only has version {target}; there is nothing earlier to compare with.", "configuration": _ref(cfg)})
+        if source == target:
+            return _dumps({"error": "from_version and to_version are the same.", "configuration": _ref(cfg)})
+        old, new = _parallel_map(
+            lambda v: client.get(f"configurations/{cfg['id']}/versions/{v}", org_id=org_id), [source, target]
+        )
+        old, new = (old if isinstance(old, dict) else {}), (new if isinstance(new, dict) else {})
+        rows = ops.spec_diff(old.get("spec"), new.get("spec"))
+        return _dumps(
+            {
+                "summary": f"{cfg.get('name')} v{source} → v{target}: {ops.diff_summary(rows)}",
+                "configuration": _ref(cfg),
+                "from": _version_info(old) or {"version": source},
+                "to": _version_info(new) or {"version": target},
+                "identical": not rows,
+                "changes": rows,
+            }
+        )
+    except Exception as exc:
+        return _err(exc)
+
+
+def _spec_from_args(
+    image: str | None,
+    env: dict[str, Any] | None,
+    ports: list[Any] | None,
+    command: list[str] | None,
+    desired_state: str | None,
+    spec: dict[str, Any] | None,
+) -> dict[str, Any]:
+    if spec is not None:
+        if any((image, env, ports, command, desired_state)):
+            raise ValueError("Pass either spec (a full spec) or the individual fields, not both.")
+        if not isinstance(spec, dict):
+            raise ValueError("spec must be a JSON object.")
+        built = dict(spec)
+    else:
+        built = {}
+        if image:
+            built["image"] = image
+        if env:
+            built["environment"] = {str(k): "" if v is None else str(v) for k, v in env.items()}
+        if command:
+            built["command"] = list(command)
+        if desired_state:
+            built["desiredState"] = desired_state
+        if ports:
+            parsed = []
+            for p in ports:
+                if isinstance(p, dict):
+                    parsed.append({"port": int(p["port"]), "protocol": p.get("protocol", "tcp")})
+                    continue
+                num, _, proto = str(p).partition("/")
+                parsed.append({"port": int(num), "protocol": (proto or "tcp").lower()})
+            built["ports"] = parsed
+    built = ops.norm_spec(built)
+    if not built.get("image"):
+        raise ValueError("A configuration needs an image (pass image=... or spec={'image': ...}).")
+    if built["desiredState"] not in ("RUNNING", "STOPPED"):
+        raise ValueError("desired_state must be RUNNING or STOPPED.")
+    return built
+
+
+@mcp.tool(
+    description=(
+        "Create a configuration (POST /configurations) at version 1. Give a name plus either image (with optional env "
+        "{NAME: value}, ports ['8080/tcp', 80], command [...], desired_state RUNNING|STOPPED) or a full spec object. "
+        "Does not assign it to any fleet: use assign_fleet_configuration afterwards. 409 means the name already exists. "
+        "Creates a resource, explicit request only. Do not put real secrets in env: use the dashboard's secret files."
+    ),
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False),
+)
+def create_configuration(
+    name: str,
+    image: str | None = None,
+    description: str | None = None,
+    tags: list[str] | None = None,
+    env: dict[str, Any] | None = None,
+    ports: list[Any] | None = None,
+    command: list[str] | None = None,
+    desired_state: str | None = None,
+    spec: dict[str, Any] | None = None,
+    organization_id: str | None = None,
+) -> str:
+    try:
+        if not name or not name.strip():
+            return _dumps({"error": "name is required"})
+        built = _spec_from_args(image, env, ports, command, desired_state, spec)
+        client, org_id = _ctx(organization_id)
+        body: dict[str, Any] = {"name": name.strip(), "spec": built}
+        if description:
+            body["description"] = description
+        if tags:
+            body["tags"] = list(tags)
+        created = client.post("configurations", org_id=org_id, json=body)
+        created = created if isinstance(created, dict) else {}
+        cid = created.get("id")
+        back = client.get(f"configurations/{cid}/details", org_id=org_id) if cid else {}
+        back = back if isinstance(back, dict) else {}
+        meta = back.get("configuration") or created
+        return _dumps(
+            {
+                "summary": f"Created configuration {meta.get('name')} (v{_latest_of(meta) or 1}, {meta.get('status')}) with image {built['image']}.",
+                "configuration": {**_ref(meta), "status": meta.get("status"), "latest_version": _latest_of(meta)},
+                "spec": ops.mask_spec(ops.norm_spec(back.get("latest_spec") or built)),
+                "confirmed": bool(back),
+                "next": [
+                    {
+                        "tool": "assign_fleet_configuration",
+                        "why": "Nothing runs this configuration until a fleet is assigned to it.",
+                        "arguments": {"fleet": "<fleet name or UUID>", "configuration": cid, "version": "latest"},
+                    }
+                ],
+            }
+        )
+    except Exception as exc:
+        return _err(exc)
+
+
+@mcp.tool(
+    description=(
+        "Edit a configuration: starts from the latest spec, applies the edits and saves a NEW version (PUT "
+        "/configurations/{id}/spec). Edits: image (full reference) or image_tag (swap the tag only), env_set {NAME: value}, "
+        "env_unset [NAME], merge_patch (RFC 7386 JSON merge patch over the spec, null deletes a key, lists replace), or spec "
+        "(whole replacement, exclusive with the others). change_reason is required to write. base_version refuses the edit "
+        "if the latest version is no longer that number (someone else edited). dry_run=true returns the diff and the "
+        "effect without writing. No-op edits are refused. The result lists old → new version, the diff, which fleets follow "
+        "'latest' (they resolve the new version immediately but devices only receive it when they reconnect or get a push; "
+        "no canary) versus pinned (unaffected until a rollout or assignment), and the next step. A 402 means the "
+        "organisation lacks an entitlement used by the spec (for example an image signature policy). Changes what "
+        "devices will run — explicit request only; prefer dry_run first."
+    ),
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False),
+)
+def edit_configuration(
+    configuration: str,
+    change_reason: str | None = None,
+    image: str | None = None,
+    image_tag: str | None = None,
+    env_set: dict[str, Any] | None = None,
+    env_unset: list[str] | None = None,
+    merge_patch: dict[str, Any] | None = None,
+    spec: dict[str, Any] | None = None,
+    base_version: int | None = None,
+    dry_run: bool = False,
+    organization_id: str | None = None,
+) -> str:
+    try:
+        reason = (change_reason or "").strip()
+        if not dry_run and not reason:
+            return _dumps({"error": "change_reason is required (it is recorded in the version history). Use dry_run=true to preview without one."})
+        client, org_id = _ctx(organization_id)
+        cfg = _find_config(client, org_id, configuration)
+        cid = cfg["id"]
+        detail = client.get(f"configurations/{cid}/details", org_id=org_id)
+        detail = detail if isinstance(detail, dict) else {}
+        meta = detail.get("configuration") or cfg
+        latest = _latest_of(meta)
+        if base_version is not None and int(base_version) != latest:
+            raise ToolRefusal(
+                f"{meta.get('name')} is at v{latest}, not v{int(base_version)}: someone changed it since you read it. "
+                "Nothing was written. Re-read with get_configuration (or diff_configuration_versions) and retry.",
+                latest_version=latest,
+                base_version=int(base_version),
+            )
+        current = ops.norm_spec(detail.get("latest_spec"))
+        new_spec, notes = ops.apply_spec_edits(
+            current, image=image, image_tag=image_tag, env_set=env_set, env_unset=env_unset, patch=merge_patch, replace=spec
+        )
+        rows = ops.spec_diff(current, new_spec)
+        if not rows:
+            raise ToolRefusal(
+                "No change: the edit produces the same spec as the latest version, so no version was created.",
+                latest_version=latest,
+                notes=notes,
+            )
+        usage = _fleet_usage(_paged_items(client, "fleets", org_id), cid)
+        new_version = (latest or 0) + 1
+        warnings = _delivery_warnings(usage, new_version)
+        if dry_run and usage["follow_latest"]:
+            warnings.append(
+                "To stage this safely, pin those fleets to the current version first (assign_fleet_configuration with "
+                f"version={latest}), save, then apply with create_rollout."
+            )
+        result: dict[str, Any] = {
+            "configuration": {**_ref(meta), "status": meta.get("status")},
+            "old_version": latest,
+            "diff": rows,
+            "fleets": usage,
+            "notes": notes,
+            "warnings": warnings,
+        }
+        if dry_run:
+            result.update(
+                {
+                    "summary": f"DRY RUN {meta.get('name')} v{latest} → v{new_version}: {ops.diff_summary(rows)}. Nothing was written.",
+                    "dry_run": True,
+                    "new_version": new_version,
+                    "next": [{"tool": "edit_configuration", "why": "Repeat without dry_run to save it.", "arguments": {"configuration": cid, "base_version": latest}}],
+                }
+            )
+            return _dumps({k: v for k, v in result.items() if v not in ([], None)} | {"dry_run": True})
+        client.put(f"configurations/{cid}/spec", org_id=org_id, json={"spec": new_spec, "change_reason": reason})
+        back = client.get(f"configurations/{cid}/details", org_id=org_id)
+        back = back if isinstance(back, dict) else {}
+        back_meta = back.get("configuration") or {}
+        saved_version = _latest_of(back_meta)
+        drift = ops.spec_diff(new_spec, back.get("latest_spec"), mask=True)
+        confirmed = saved_version == new_version and not drift
+        if saved_version is not None and saved_version != new_version:
+            warnings.append(
+                f"Expected v{new_version} but the configuration is now at v{saved_version}: another edit landed at the same time. Check diff_configuration_versions."
+            )
+        if drift:
+            warnings.append("The stored spec differs from what was sent (server-side normalisation or a concurrent edit): " + ops.diff_summary(drift))
+        result.update(
+            {
+                "summary": f"{meta.get('name')} v{latest} → v{saved_version}: {ops.diff_summary(rows)}.",
+                "new_version": saved_version,
+                "change_reason": reason,
+                "read_back": {"latest_version": saved_version, "confirmed": confirmed},
+                "delivery": _DELIVERY_NOTE if (usage["follow_latest"] or usage["pinned"]) else None,
+                "warnings": warnings,
+                "next": _config_next(meta, saved_version, usage),
+            }
+        )
+        return _dumps({k: v for k, v in result.items() if v not in ([], None, "")})
+    except ToolRefusal as refusal:
+        return _dumps(refusal.payload)
+    except Exception as exc:
+        return _err(exc)
+
+
+@mcp.tool(
+    description=(
+        "Change a configuration's metadata and/or lifecycle status: name, description, tags (replaces the list; [] clears) "
+        "via PUT /configurations/{id}, status (draft, active, testing, deprecated, archived; matched case-insensitively) via PUT "
+        "/configurations/{id}/status. Does not touch the spec or any device. The backend ignores empty name/description, "
+        "so those cannot be cleared. Returns before/after read back from the API. Explicit request only."
+    ),
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True),
+)
+def update_configuration_metadata(
+    configuration: str,
+    name: str | None = None,
+    description: str | None = None,
+    tags: list[str] | None = None,
+    status: str | None = None,
+    organization_id: str | None = None,
+) -> str:
+    try:
+        for label, value in (("name", name), ("description", description)):
+            if value is not None and not value.strip():
+                return _dumps({"error": f"{label} cannot be empty (the backend ignores empty values)."})
+        canonical = None
+        if status is not None:
+            canonical = next((s for s in _CONFIG_STATUSES if s.lower() == status.strip().lower()), None)
+            if canonical is None:
+                return _dumps({"error": f"Unknown status {status!r}", "choices": list(_CONFIG_STATUSES)})
+        if name is None and description is None and tags is None and canonical is None:
+            return _dumps({"error": "Nothing to change: pass name, description, tags or status."})
+        client, org_id = _ctx(organization_id)
+        cfg = _find_config(client, org_id, configuration)
+        cid = cfg["id"]
+        before = client.get(f"configurations/{cid}", org_id=org_id)
+        before = before if isinstance(before, dict) else {}
+        body: dict[str, Any] = {}
+        if name is not None and name.strip() != before.get("name"):
+            body["name"] = name.strip()
+        if description is not None and description.strip() != (before.get("description") or ""):
+            body["description"] = description.strip()
+        if tags is not None and list(tags) != list(before.get("tags") or []):
+            body["tags"] = list(tags)
+        status_change = canonical is not None and canonical != before.get("status")
+        if not body and not status_change:
+            raise ToolRefusal("No change: the configuration already has these values.", configuration=_ref(before))
+        if body:
+            client.put(f"configurations/{cid}", org_id=org_id, json=body)
+        if status_change:
+            client.put(f"configurations/{cid}/status", org_id=org_id, json={"status": canonical})
+        after = client.get(f"configurations/{cid}", org_id=org_id)
+        after = after if isinstance(after, dict) else {}
+        fields = [k for k in ("name", "description", "tags", "status") if before.get(k) != after.get(k)]
+        return _dumps(
+            {
+                "summary": f"Updated {after.get('name')}: " + (", ".join(f"{k} {before.get(k)!r} → {after.get(k)!r}" for k in fields) or "no visible change"),
+                "configuration": _ref(after),
+                "before": {k: before.get(k) for k in ("name", "description", "tags", "status")},
+                "after": {k: after.get(k) for k in ("name", "description", "tags", "status")},
+                "confirmed": all(
+                    (list(after.get(k) or []) if k == "tags" else after.get(k)) == v
+                    for k, v in {**body, **({"status": canonical} if status_change else {})}.items()
+                ),
+            }
+        )
+    except ToolRefusal as refusal:
+        return _dumps(refusal.payload)
+    except Exception as exc:
+        return _err(exc)
+
+
+@mcp.tool(
+    description=(
+        "Roll a configuration back to an earlier version (POST /configurations/{id}/rollback). This does not rewrite "
+        "history: it creates a NEW latest version that is a copy of target_version, so fleets following 'latest' resolve "
+        "it immediately (devices receive it when they reconnect or get a push) and pinned fleets are unaffected until a "
+        "rollout. reason is recorded. dry_run=true shows the diff only. Returns old → new version and the diff, read back. "
+        "Changes what devices will run — explicit request only."
+    ),
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False),
+)
+def rollback_configuration(
+    configuration: str,
+    target_version: int,
+    reason: str | None = None,
+    dry_run: bool = False,
+    organization_id: str | None = None,
+) -> str:
+    try:
+        client, org_id = _ctx(organization_id)
+        cfg = _find_config(client, org_id, configuration)
+        cid = cfg["id"]
+        latest = _latest_of(cfg)
+        target = int(target_version)
+        if target < 1 or (latest and target > latest):
+            return _dumps({"error": f"target_version must be between 1 and {latest}.", "configuration": _ref(cfg)})
+        if target == latest:
+            raise ToolRefusal(f"v{target} is already the latest version of {cfg.get('name')}; there is nothing to roll back.", latest_version=latest)
+        current, wanted = _parallel_map(lambda v: client.get(f"configurations/{cid}/versions/{v}", org_id=org_id), [latest, target])
+        current, wanted = (current if isinstance(current, dict) else {}), (wanted if isinstance(wanted, dict) else {})
+        rows = ops.spec_diff(current.get("spec"), wanted.get("spec"))
+        usage = _fleet_usage(_paged_items(client, "fleets", org_id), cid)
+        new_version = (latest or 0) + 1
+        warnings = _delivery_warnings(usage, new_version)
+        if not rows:
+            warnings.append(f"v{target} has the same spec as v{latest}; the rollback creates an identical version.")
+        base = {"configuration": _ref(cfg), "old_version": latest, "target_version": target, "diff": rows, "fleets": usage, "warnings": warnings}
+        if dry_run:
+            return _dumps(
+                {
+                    "summary": f"DRY RUN {cfg.get('name')}: v{latest} → copy of v{target} as v{new_version}: {ops.diff_summary(rows)}. Nothing was written.",
+                    "dry_run": True,
+                    **base,
+                }
+            )
+        body: dict[str, Any] = {"target_version": target}
+        if reason and reason.strip():
+            body["reason"] = reason.strip()
+        client.post(f"configurations/{cid}/rollback", org_id=org_id, json=body)
+        back = client.get(f"configurations/{cid}/details", org_id=org_id)
+        back = back if isinstance(back, dict) else {}
+        saved = _latest_of(back.get("configuration") or {})
+        drift = ops.spec_diff(wanted.get("spec"), back.get("latest_spec"))
+        return _dumps(
+            {
+                "summary": f"{cfg.get('name')} rolled back: v{latest} → v{saved} (a copy of v{target}): {ops.diff_summary(rows)}.",
+                **base,
+                "new_version": saved,
+                "read_back": {"latest_version": saved, "matches_target": not drift, "confirmed": saved == new_version and not drift},
+                "delivery": _DELIVERY_NOTE if (usage["follow_latest"] or usage["pinned"]) else None,
+                "next": _config_next(cfg, saved, usage),
+            }
+        )
+    except ToolRefusal as refusal:
+        return _dumps(refusal.payload)
+    except Exception as exc:
+        return _err(exc)
+
+
+@mcp.tool(
+    description=(
+        "Delete a configuration and all its versions (DELETE /configurations/{id}). Irreversible. The backend would "
+        "silently detach fleets that still use it, so this tool refuses while any fleet is assigned to the configuration or "
+        "an unfinished rollout references it, and lists them; reassign those first (assign_fleet_configuration). Reads "
+        "back that it is gone. Destructive — explicit request for a named configuration only."
+    ),
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False),
+)
+def delete_configuration(configuration: str, organization_id: str | None = None) -> str:
+    try:
+        client, org_id = _ctx(organization_id)
+        cfg = _find_config(client, org_id, configuration)
+        cid = cfg["id"]
+        fleets, rollouts = _parallel_map(
+            lambda fn: fn(),
+            [
+                lambda: _paged_items(client, "fleets", org_id),
+                lambda: _items(client.get("rollouts", org_id=org_id, params={"status": _ACTIVE_ROLLOUT_STATUSES, "limit": 200})),
+            ],
+        )
+        usage = _fleet_usage(fleets, cid)
+        using = usage["follow_latest"] + usage["pinned"]
+        busy = [_rollout_row(r) for r in rollouts if str(r.get("config") or "").lower() == str(cid).lower()]
+        if using or busy:
+            raise ToolRefusal(
+                f"{cfg.get('name')} is still in use ({len(using)} fleet(s), {len(busy)} unfinished rollout(s)); nothing was deleted.",
+                configuration=_ref(cfg),
+                fleets=using,
+                rollouts=busy,
+                next=[{"tool": "assign_fleet_configuration", "why": "Move each fleet to another configuration first."}],
+            )
+        client.delete(f"configurations/{cid}", org_id=org_id)
+        gone = False
+        try:
+            client.get(f"configurations/{cid}", org_id=org_id)
+        except AdmiralAPIError as exc:
+            gone = exc.status == 404
+        return _dumps(
+            {
+                "summary": f"Deleted configuration {cfg.get('name')}." if gone else f"Delete sent for {cfg.get('name')} but it still reads back; check list_configurations.",
+                "configuration": _ref(cfg),
+                "deleted": gone,
+                "read_back": {"confirmed": gone},
+            }
+        )
+    except ToolRefusal as refusal:
+        return _dumps(refusal.payload)
+    except Exception as exc:
+        return _err(exc)
+
+
+# ---------------------------------------------------------------- fleets ---
+
+
+def _tag_rows(tags: Any) -> list[dict[str, str]]:
+    return [{"key": t.get("key"), "value": t.get("value", "")} for t in (tags or []) if isinstance(t, dict)]
+
+
+def _tags_arg(tags: dict[str, Any] | list[Any] | None) -> list[dict[str, str]]:
+    """Tags given as {key: value} or [{key, value}] -> API rows. Values are strings."""
+    if not tags:
+        return []
+    if isinstance(tags, dict):
+        return [{"key": str(k).strip(), "value": "" if v is None else str(v)} for k, v in tags.items()]
+    rows = []
+    for t in tags:
+        if isinstance(t, dict) and t.get("key"):
+            rows.append({"key": str(t["key"]).strip(), "value": str(t.get("value", ""))})
+        elif isinstance(t, str) and t.strip():
+            key, _, value = t.partition("=")
+            rows.append({"key": key.strip(), "value": value.strip()})
+        else:
+            raise ValueError(f"Cannot read tag {t!r}: use {{key: value}} or 'key=value'.")
+    return rows
+
+
+@mcp.tool(
+    description=(
+        "One fleet in full (GET /fleets/{id}, /configuration, /update-policy, /configuration/history, /rollouts): device "
+        "counts and online, tags, the assigned configuration with how it is assigned ('latest' = follows the newest "
+        "version, or a pinned version number) and the version that resolves to now, the OS update policy and update "
+        "window, recent configuration assignments and any unfinished rollouts. fleet = name or UUID (ambiguous names "
+        "return candidates). Read-only."
+    ),
+    annotations=_READ_ONLY,
+)
+def get_fleet(fleet: str, organization_id: str | None = None) -> str:
+    try:
+        client, org_id = _ctx(organization_id)
+        found = _find_fleet(client, org_id, fleet)
+        fid = found["id"]
+        warnings: list[str] = []
+        detail, assignment, policy, history, active = _parallel_map(
+            lambda fn: fn(),
+            [
+                lambda: client.get(f"fleets/{fid}", org_id=org_id) if not is_uuid(fleet.strip()) else found,
+                lambda: _safe(lambda: _fleet_assignment(client, org_id, fid)[0], warnings, "configuration"),
+                lambda: _safe(lambda: client.get(f"fleets/{fid}/update-policy", org_id=org_id), warnings, "update policy"),
+                lambda: _safe(lambda: client.get(f"fleets/{fid}/configuration/history", org_id=org_id), warnings, "configuration history"),
+                lambda: _safe(lambda: _active_rollouts(client, org_id, [fid]), warnings, "rollouts"),
+            ],
+        )
+        detail = detail if isinstance(detail, dict) else found
+        assignment = assignment or {"configuration": None, "assignment": None, "resolved_version": None}
+        cfg = assignment["configuration"]
+        if cfg:
+            how = "follows latest" if assignment["assignment"] == "latest" else f"pinned to v{assignment['assignment']}"
+            cfg_text = f"{cfg.get('name')} {how} (v{assignment['resolved_version']})"
+        else:
+            cfg_text = "no configuration"
+        history_rows = sorted(
+            [h for h in (history or []) if isinstance(h, dict)], key=lambda h: str(h.get("assigned_at") or ""), reverse=True
+        )[:5]
+        out = {
+            "summary": f"{detail.get('name')}: {detail.get('devices', 0)} device(s), {detail.get('online', 0)} online; {cfg_text}.",
+            "fleet": {
+                "id": fid,
+                "name": detail.get("name"),
+                "description": detail.get("description"),
+                "location": detail.get("location"),
+                "tags": _tag_rows(detail.get("tags")),
+                "created_at": detail.get("createdAt"),
+                "last_update": detail.get("lastUpdate"),
+                "ssh_enabled": detail.get("sshEnabled"),
+                "signature_policy": detail.get("signaturePolicy"),
+            },
+            "devices": {
+                k: v
+                for k, v in (
+                    ("total", detail.get("devices")),
+                    ("online", detail.get("online")),
+                    ("offline", detail.get("offline")),
+                    ("compliance", detail.get("compliance")),
+                )
+                if v is not None
+            },
+            "configuration": assignment,
+            "update_policy": policy,
+            "update_window": detail.get("update_window"),
+            "recent_assignments": [
+                {k: h.get(k) for k in ("configuration_id", "config_version", "assigned_by", "assigned_at", "reason") if h.get(k) is not None}
+                for h in history_rows
+            ],
+            "active_rollouts": active or [],
+            "warnings": warnings,
+            "next": [
+                {"tool": "list_devices", "why": "List the devices in this fleet.", "arguments": {"fleet_id": fid}},
+                {"tool": "assign_fleet_configuration", "why": "Change which configuration the fleet runs (applied directly)."},
+                {"tool": "preview_rollout", "why": "Plan a controlled change for this fleet."},
+            ],
+        }
+        return _dumps({k: v for k, v in out.items() if v not in (None, [], {})})
+    except Exception as exc:
+        return _err(exc)
+
+
+@mcp.tool(
+    description=(
+        "Assign a configuration to a fleet (POST /fleets/{id}/configuration). version = an integer (pin that version) or "
+        "'latest' (follow the newest version; default). THIS IS APPLIED DIRECTLY: it changes the fleet's desired state at "
+        "once, with no canary, no failure budget and no convergence check. Nothing is pushed to connected devices; each "
+        "device picks the new desired state up when it reconnects or next receives a push, so a running fleet changes "
+        "unevenly. For a fleet with live devices use create_rollout (preview_rollout first) instead. Returns before/after "
+        "read back from the API. Refuses no-ops and unknown versions. Changes what devices run — explicit request only."
+    ),
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False),
+)
+def assign_fleet_configuration(
+    fleet: str,
+    configuration: str,
+    version: int | str = "latest",
+    organization_id: str | None = None,
+) -> str:
+    try:
+        client, org_id = _ctx(organization_id)
+        fl = _find_fleet(client, org_id, fleet)
+        cfg = _find_config(client, org_id, configuration)
+        fid, cid = fl["id"], cfg["id"]
+        latest = _latest_of(cfg)
+        wants_latest = str(version).strip().lower() == "latest"
+        pin = None if wants_latest else int(version)
+        if pin is not None and (pin < 1 or (latest and pin > latest)):
+            return _dumps({"error": f"version must be between 1 and {latest} (or 'latest').", "configuration": _ref(cfg)})
+        before, before_spec = _fleet_assignment(client, org_id, fid)
+        before_cfg = before["configuration"]
+        same = bool(before_cfg) and str(before_cfg["id"]).lower() == str(cid).lower() and (
+            before["assignment"] == "latest" if wants_latest else before["assignment"] == pin
+        )
+        if same:
+            raise ToolRefusal(
+                f"No change: {fl.get('name')} is already assigned {cfg.get('name')} ({'latest' if wants_latest else 'v' + str(pin)}).",
+                before=before,
+            )
+        warnings = [
+            "Applied directly with no canary or health gate; connected devices pick it up when they reconnect or receive a push.",
+        ]
+        active = _safe(lambda: _active_rollouts(client, org_id, [fid]), warnings, "rollouts") or []
+        if active:
+            warnings.append(f"{len(active)} unfinished rollout(s) target this fleet; they may override or conflict with this assignment.")
+        if fl.get("online"):
+            warnings.append(f"{fl.get('online')} device(s) online now: use create_rollout for a staged change.")
+        body: dict[str, Any] = {"configuration_id": cid}
+        if pin is not None:
+            body["version"] = pin
+        client.post(f"fleets/{fid}/configuration", org_id=org_id, json=body)
+        after, after_spec = _fleet_assignment(client, org_id, fid)
+        after_cfg = after["configuration"] or {}
+        confirmed = str(after_cfg.get("id", "")).lower() == str(cid).lower() and (
+            after["assignment"] == "latest" if wants_latest else after["assignment"] == pin
+        )
+        rows = ops.spec_diff(before_spec, after_spec)
+        text = lambda a: f"{(a['configuration'] or {}).get('name')} @ {a['assignment']}" if a["configuration"] else "none"  # noqa: E731
+        return _dumps(
+            {
+                "summary": f"{fl.get('name')}: {text(before)} → {text(after)}" + (" (confirmed)." if confirmed else " (NOT confirmed by read-back)."),
+                "fleet": _ref(fl),
+                "before": before,
+                "after": after,
+                "diff": rows,
+                "read_back": {"confirmed": confirmed},
+                "warnings": warnings,
+                "delivery": _DELIVERY_NOTE,
+                "next": [{"tool": "get_fleet", "why": "Check the fleet's state."}],
+            }
+        )
+    except ToolRefusal as refusal:
+        return _dumps(refusal.payload)
+    except Exception as exc:
+        return _err(exc)
+
+
+@mcp.tool(
+    description=(
+        "History of configuration assignments for a fleet (GET /fleets/{id}/configuration/history): newest first, with the "
+        "configuration name, version (blank = followed latest), who assigned it, when and why. Includes assignments made "
+        "by completed rollouts. Read-only."
+    ),
+    annotations=_READ_ONLY,
+)
+def get_fleet_configuration_history(fleet: str, limit: int = 20, organization_id: str | None = None) -> str:
+    try:
+        client, org_id = _ctx(organization_id)
+        fl = _find_fleet(client, org_id, fleet)
+        history = client.get(f"fleets/{fl['id']}/configuration/history", org_id=org_id)
+        rows = sorted(_items(history), key=lambda h: str(h.get("assigned_at") or ""), reverse=True)
+        rows = rows[: max(1, int(limit))]
+        names: dict[str, str] = {}
+        wanted = {str(h.get("configuration_id")) for h in rows if h.get("configuration_id")}
+        if wanted:
+            try:
+                for c in _paged_items(client, "configurations", org_id, limit=100, max_pages=10):
+                    names[str(c.get("id"))] = c.get("name")
+            except AdmiralAPIError:
+                pass
+        out = [
+            {
+                "configuration": {"id": h.get("configuration_id"), "name": names.get(str(h.get("configuration_id")))},
+                "version": h.get("config_version") or "latest",
+                "assigned_by": h.get("assigned_by"),
+                "assigned_at": h.get("assigned_at"),
+                "reason": h.get("reason"),
+            }
+            for h in rows
+        ]
+        return _dumps(
+            {
+                "summary": f"{fl.get('name')}: {len(out)} assignment(s)" + (f", latest: {out[0]['configuration']['name']} @ {out[0]['version']}" if out else ""),
+                "fleet": _ref(fl),
+                "history": out,
+            }
+        )
+    except Exception as exc:
+        return _err(exc)
+
+
+@mcp.tool(
+    description=(
+        "Create a fleet (POST /fleets). name required; description, location, tags ({key: value} or ['key=value']) and an "
+        "optional configuration (name or UUID; follows its latest version, applied directly with no rollout) are optional. "
+        "Read back from the API. A new fleet has no devices: move devices in with move_device_to_fleet. Creates a "
+        "resource — explicit request only."
+    ),
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False),
+)
+def create_fleet(
+    name: str,
+    description: str | None = None,
+    location: str | None = None,
+    tags: dict[str, Any] | list[Any] | None = None,
+    configuration: str | None = None,
+    organization_id: str | None = None,
+) -> str:
+    try:
+        if not name or not name.strip():
+            return _dumps({"error": "name is required"})
+        client, org_id = _ctx(organization_id)
+        warnings: list[str] = []
+        body: dict[str, Any] = {"name": name.strip()}
+        if description:
+            body["description"] = description
+        if location:
+            body["location"] = location
+        rows = _tags_arg(tags)
+        if rows:
+            body["tags"] = rows
+        cfg = _find_config(client, org_id, configuration) if configuration else None
+        if cfg:
+            body["configuration_id"] = cfg["id"]
+        same = [r for r in _items(client.list_fleets(org_id=org_id, search=name.strip(), limit=200)) if str(r.get("name") or "").lower() == name.strip().lower()]
+        if same:
+            warnings.append(f"{len(same)} fleet(s) already use this name; by-name lookups will need a UUID.")
+        created = client.post("fleets", org_id=org_id, json=body)
+        created = created if isinstance(created, dict) else {}
+        fid = created.get("id")
+        back = client.get(f"fleets/{fid}", org_id=org_id) if fid else {}
+        back = back if isinstance(back, dict) else {}
+        return _dumps(
+            {
+                "summary": f"Created fleet {back.get('name') or name.strip()}" + (f" with configuration {cfg.get('name')}" if cfg else " (no configuration)") + ".",
+                "fleet": {
+                    "id": fid,
+                    "name": back.get("name"),
+                    "description": back.get("description"),
+                    "location": back.get("location"),
+                    "tags": _tag_rows(back.get("tags")),
+                    "configuration_id": back.get("configuration_id"),
+                },
+                "read_back": {"confirmed": bool(back)},
+                "warnings": warnings,
+                "next": [{"tool": "move_device_to_fleet", "why": "Add devices to the new fleet."}],
+            }
+        )
+    except Exception as exc:
+        return _err(exc)
+
+
+@mcp.tool(
+    description=(
+        "Update a fleet's name, description, location and tags. name/description/location go to PUT /fleets/{id} (empty "
+        "values are ignored by the backend, so they cannot be cleared). Tags: tags_add {key: value} adds or updates keys "
+        "(POST /fleets/{id}/tags), tags_remove [key] removes keys (DELETE), tags_replace {key: value} replaces the whole "
+        "set (PUT; exclusive with add/remove; {} is refused, use tags_remove). Returns before/after read back. Fleet tags "
+        "become effective tags on its devices. Explicit request only."
+    ),
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False),
+)
+def update_fleet(
+    fleet: str,
+    name: str | None = None,
+    description: str | None = None,
+    location: str | None = None,
+    tags_add: dict[str, Any] | list[Any] | None = None,
+    tags_remove: list[str] | None = None,
+    tags_replace: dict[str, Any] | list[Any] | None = None,
+    organization_id: str | None = None,
+) -> str:
+    try:
+        for label, value in (("name", name), ("description", description), ("location", location)):
+            if value is not None and not value.strip():
+                return _dumps({"error": f"{label} cannot be empty (the backend ignores empty values)."})
+        add_rows, replace_rows = _tags_arg(tags_add), _tags_arg(tags_replace)
+        if tags_replace is not None and not replace_rows:
+            return _dumps({"error": "tags_replace is empty; to remove tags pass tags_remove=[...]."})
+        if tags_replace is not None and (add_rows or tags_remove):
+            return _dumps({"error": "tags_replace cannot be combined with tags_add or tags_remove."})
+        if name is None and description is None and location is None and not add_rows and not tags_remove and not replace_rows:
+            return _dumps({"error": "Nothing to change: pass name, description, location or a tag edit."})
+        client, org_id = _ctx(organization_id)
+        fl = _find_fleet(client, org_id, fleet)
+        fid = fl["id"]
+        before = client.get(f"fleets/{fid}", org_id=org_id)
+        before = before if isinstance(before, dict) else {}
+        body = {
+            k: v.strip()
+            for k, v in (("name", name), ("description", description), ("location", location))
+            if v is not None and v.strip() != (before.get(k) or "")
+        }
+        old_tags = {t["key"]: t["value"] for t in _tag_rows(before.get("tags"))}
+        add_rows = [t for t in add_rows if old_tags.get(t["key"]) != t["value"]]
+        remove = [k for k in (tags_remove or []) if k in old_tags]
+        missing = [k for k in (tags_remove or []) if k not in old_tags]
+        if replace_rows and {t["key"]: t["value"] for t in replace_rows} == old_tags:
+            replace_rows = []
+        if not body and not add_rows and not remove and not replace_rows:
+            raise ToolRefusal("No change: the fleet already has these values.", fleet=_ref(before), ignored_tag_removals=missing)
+        if body:
+            client.put(f"fleets/{fid}", org_id=org_id, json=body)
+        if replace_rows:
+            client.put(f"fleets/{fid}/tags", org_id=org_id, json={"tags": replace_rows})
+        if add_rows:
+            client.post(f"fleets/{fid}/tags", org_id=org_id, json={"tags": add_rows})
+        if remove:
+            client.request("DELETE", f"fleets/{fid}/tags", org_id=org_id, params={"key": remove})
+        after = client.get(f"fleets/{fid}", org_id=org_id)
+        after = after if isinstance(after, dict) else {}
+        new_tags = {t["key"]: t["value"] for t in _tag_rows(after.get("tags"))}
+        confirmed = all(after.get(k) == v for k, v in body.items())
+        confirmed = confirmed and all(new_tags.get(t["key"]) == t["value"] for t in add_rows + replace_rows)
+        confirmed = confirmed and not any(k in new_tags for k in remove)
+        if replace_rows:
+            confirmed = confirmed and new_tags == {t["key"]: t["value"] for t in replace_rows}
+        return _dumps(
+            {
+                "summary": f"Updated fleet {after.get('name')}: " + ", ".join(
+                    [f"{k} → {v!r}" for k, v in body.items()]
+                    + ([f"tags +{[t['key'] for t in add_rows]}"] if add_rows else [])
+                    + ([f"tags -{remove}"] if remove else [])
+                    + (["tags replaced"] if replace_rows else [])
+                ),
+                "fleet": _ref(after),
+                "before": {"name": before.get("name"), "description": before.get("description"), "location": before.get("location"), "tags": old_tags},
+                "after": {"name": after.get("name"), "description": after.get("description"), "location": after.get("location"), "tags": new_tags},
+                "ignored_tag_removals": missing,
+                "read_back": {"confirmed": confirmed},
+            }
+        )
+    except ToolRefusal as refusal:
+        return _dumps(refusal.payload)
+    except Exception as exc:
+        return _err(exc)
+
+
+def _clean_window(window: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(window, dict):
+        raise ValueError("update_window must be an object {enabled, days, start_time, end_time, timezone}.")
+    unknown = set(window) - {"enabled", "days", "start_time", "end_time", "timezone"}
+    if unknown:
+        raise ValueError(f"Unknown update_window field(s) {sorted(unknown)}; use enabled, days, start_time, end_time, timezone.")
+    out = {
+        "enabled": bool(window.get("enabled", True)),
+        "days": [str(d).strip().capitalize() for d in window.get("days") or []],
+        "start_time": str(window.get("start_time") or ""),
+        "end_time": str(window.get("end_time") or ""),
+        "timezone": str(window.get("timezone") or ""),
+    }
+    if out["enabled"]:
+        if not out["days"] or any(d not in _WINDOW_DAYS for d in out["days"]):
+            raise ValueError(f"days must be a non-empty list of {', '.join(_WINDOW_DAYS)}.")
+        for key in ("start_time", "end_time"):
+            if not re.fullmatch(r"([01]\d|2[0-3]):[0-5]\d", out[key]):
+                raise ValueError(f"{key} must be HH:MM (24-hour).")
+        if not out["timezone"]:
+            raise ValueError("timezone is required (IANA name, e.g. Australia/Sydney or UTC).")
+    return out
+
+
+def _policy_view(payload: Any) -> dict[str, Any]:
+    payload = payload if isinstance(payload, dict) else {}
+    return {"mode": payload.get("mode"), "targets": payload.get("targets") or [], "update_window": payload.get("update_window")}
+
+
+@mcp.tool(
+    description=(
+        "Set a fleet's OS update policy and/or update window. This governs Admiral system/OS image updates, not the "
+        "workload configuration. mode 'latest' tracks the current release; 'pinned' uses targets "
+        "[{architecture, board?, system_version_id?, initram_version_id?}] (a missing version id follows latest for that "
+        "hardware). update_window {enabled, days:[Monday..], start_time:'02:00', end_time:'06:00', timezone:'Australia/Sydney'} "
+        "limits when devices apply updates; disable_update_window=true turns it off. Policy via PUT "
+        "/fleets/{id}/update-policy (replaces the whole policy; the existing targets are kept when you only change the "
+        "window), window alone via PUT /fleets/{id}/update-window. Returns before/after read back. Changes what OS "
+        "versions devices install — explicit request only."
+    ),
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True),
+)
+def set_fleet_update_policy(
+    fleet: str,
+    mode: str | None = None,
+    targets: list[dict[str, Any]] | None = None,
+    update_window: dict[str, Any] | None = None,
+    disable_update_window: bool = False,
+    organization_id: str | None = None,
+) -> str:
+    try:
+        if update_window is not None and disable_update_window:
+            return _dumps({"error": "Pass update_window or disable_update_window, not both."})
+        if mode is None and targets is None and update_window is None and not disable_update_window:
+            return _dumps({"error": "Nothing to change: pass mode, targets, update_window or disable_update_window."})
+        want_mode = None
+        if mode is not None:
+            want_mode = mode.strip().lower()
+            if want_mode not in ("latest", "pinned"):
+                return _dumps({"error": f"Unknown mode {mode!r}", "choices": ["latest", "pinned"]})
+        if want_mode == "latest" and targets:
+            return _dumps({"error": "targets only apply to mode 'pinned'."})
+        window = _clean_window(update_window) if update_window is not None else None
+        client, org_id = _ctx(organization_id)
+        fl = _find_fleet(client, org_id, fleet)
+        fid = fl["id"]
+        before = _policy_view(client.get(f"fleets/{fid}/update-policy", org_id=org_id))
+        if disable_update_window:
+            old = before["update_window"] or {}
+            window = {
+                "enabled": False,
+                "days": old.get("days") or [],
+                "start_time": old.get("start_time") or "",
+                "end_time": old.get("end_time") or "",
+                "timezone": old.get("timezone") or "",
+            }
+        policy_change = want_mode is not None or targets is not None
+        if policy_change:
+            new_mode = want_mode or ("pinned" if targets is not None else before["mode"] or "latest")
+            new_targets = targets if targets is not None else (before["targets"] if new_mode == "pinned" else [])
+            if new_mode == "pinned" and not new_targets:
+                return _dumps({"error": "mode 'pinned' needs targets [{architecture, board?, system_version_id?, initram_version_id?}]."})
+            for i, t in enumerate(new_targets):
+                if not isinstance(t, dict) or not t.get("architecture"):
+                    return _dumps({"error": f"targets[{i}] needs an architecture."})
+            if new_mode == before["mode"] and new_targets == before["targets"] and window in (None, before["update_window"]):
+                raise ToolRefusal("No change: the fleet already has this update policy.", before=before)
+            body: dict[str, Any] = {"mode": new_mode}
+            if new_targets:
+                body["targets"] = new_targets
+            if window is not None:
+                body["update_window"] = window
+            client.put(f"fleets/{fid}/update-policy", org_id=org_id, json=body)
+        else:
+            if window == before["update_window"]:
+                raise ToolRefusal("No change: the fleet already has this update window.", before=before)
+            client.put(f"fleets/{fid}/update-window", org_id=org_id, json=window)
+        after = _policy_view(client.get(f"fleets/{fid}/update-policy", org_id=org_id))
+        confirmed = (not policy_change or (after["mode"] == body["mode"])) and (window is None or after["update_window"] == window)
+        return _dumps(
+            {
+                "summary": f"{fl.get('name')} update policy: mode {before['mode']} → {after['mode']}"
+                + (f"; window {'on' if (after['update_window'] or {}).get('enabled') else 'off'}" if window is not None else "")
+                + ("" if confirmed else " (NOT confirmed by read-back)")
+                + ".",
+                "fleet": _ref(fl),
+                "before": before,
+                "after": after,
+                "read_back": {"confirmed": confirmed},
+            }
+        )
+    except ToolRefusal as refusal:
+        return _dumps(refusal.payload)
+    except Exception as exc:
+        return _err(exc)
+
+
+# --------------------------------------------------------------- devices ---
+
+
+def _device_detail(client: AdmiralClient, device_id: str, org_id: str) -> dict[str, Any]:
+    detail = client.get_device(device_id, org_id=org_id)
+    return detail if isinstance(detail, dict) else {}
+
+
+def _device_tags(detail: dict[str, Any]) -> dict[str, str]:
+    return {t["key"]: t["value"] for t in _tag_rows(detail.get("tags"))}
+
+
+@mcp.tool(
+    description=(
+        "Update a device's display name, notes, location (latitude + longitude) and tags (PUT /devices/{id}). tags "
+        "replaces the whole device tag set; tags_add {key: value} and tags_remove [key] edit it incrementally (cannot be "
+        "combined with tags). device = name, UUID, tag or other query (ambiguous matches return candidates and send "
+        "nothing). Returns before/after read back. Does not change what the device runs. Explicit request only."
+    ),
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True),
+)
+def update_device(
+    device: str,
+    name: str | None = None,
+    notes: str | None = None,
+    latitude: float | None = None,
+    longitude: float | None = None,
+    tags: dict[str, Any] | list[Any] | None = None,
+    tags_add: dict[str, Any] | list[Any] | None = None,
+    tags_remove: list[str] | None = None,
+    screenshots_disabled: bool | None = None,
+    organization_id: str | None = None,
+) -> str:
+    try:
+        if name is not None and not name.strip():
+            return _dumps({"error": "name cannot be empty."})
+        if (latitude is None) != (longitude is None):
+            return _dumps({"error": "Pass latitude and longitude together."})
+        if tags is not None and (tags_add or tags_remove):
+            return _dumps({"error": "tags cannot be combined with tags_add or tags_remove."})
+        if latitude is not None and not (-90 <= latitude <= 90 and -180 <= longitude <= 180):  # type: ignore[operator]
+            return _dumps({"error": "latitude must be -90..90 and longitude -180..180."})
+        found = _resolve_device(device, organization_id)
+        if not found.get("match"):
+            return _dumps(found)
+        client, did, org_id = get_client(), found["match"]["id"], found["organization_id"]
+        before = _device_detail(client, did, org_id)
+        old_tags = _device_tags(before)
+        new_tags: dict[str, str] | None = None
+        if tags is not None:
+            new_tags = {t["key"]: t["value"] for t in _tags_arg(tags)}
+        elif tags_add or tags_remove:
+            new_tags = {**old_tags, **{t["key"]: t["value"] for t in _tags_arg(tags_add)}}
+            for key in tags_remove or []:
+                new_tags.pop(key, None)
+        body: dict[str, Any] = {}
+        if name is not None and name.strip() != before.get("name"):
+            body["name"] = name.strip()
+        if notes is not None and notes != (before.get("notes") or ""):
+            body["notes"] = notes
+        if new_tags is not None and new_tags != old_tags:
+            body["tags"] = [{"key": k, "value": v} for k, v in new_tags.items()]
+        if latitude is not None:
+            body["location"] = {"latitude": latitude, "longitude": longitude}
+        if screenshots_disabled is not None:
+            body["screenshots_disabled"] = bool(screenshots_disabled)
+        if not body:
+            raise ToolRefusal("Nothing to change: the device already has these values (or no field was given).", device=found["match"])
+        client.put(f"devices/{did}", org_id=org_id, json=body)
+        after = _device_detail(client, did, org_id)
+        ok = True
+        if "name" in body:
+            ok = ok and after.get("name") == body["name"]
+        if "notes" in body:
+            ok = ok and (after.get("notes") or "") == body["notes"]
+        if "tags" in body:
+            ok = ok and _device_tags(after) == new_tags
+        changed = [k for k in body if k != "location"] + (["location"] if "location" in body else [])
+        return _dumps(
+            {
+                "summary": f"Updated {after.get('name') or found['match'].get('name')}: {', '.join(changed)}" + ("" if ok else " (NOT fully confirmed by read-back)") + ".",
+                "device": {"id": did, "name": after.get("name")},
+                "before": {"name": before.get("name"), "notes": before.get("notes"), "tags": old_tags},
+                "after": {"name": after.get("name"), "notes": after.get("notes"), "tags": _device_tags(after), "location": after.get("location")},
+                "read_back": {"confirmed": ok},
+            }
+        )
+    except ToolRefusal as refusal:
+        return _dumps(refusal.payload)
+    except Exception as exc:
+        return _err(exc)
+
+
+@mcp.tool(
+    description=(
+        "Move a device to another fleet (PUT /devices/{id}/fleet). The device takes the new fleet's configuration, which is "
+        "pushed to it immediately (the workload changes now, without a rollout), and its fleet-level tags, update window "
+        "and policies change. device = name/UUID/tag (ambiguous matches return candidates); fleet = name or UUID. The "
+        "result shows the device's old and new fleet and the configuration it now resolves to, read back. Data wipe is not "
+        "offered here. Destructive: changes what the device runs — explicit request only."
+    ),
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True),
+)
+def move_device_to_fleet(device: str, fleet: str, organization_id: str | None = None) -> str:
+    try:
+        found = _resolve_device(device, organization_id)
+        if not found.get("match"):
+            return _dumps(found)
+        client, did, org_id = get_client(), found["match"]["id"], found["organization_id"]
+        target = _find_fleet(client, org_id, fleet)
+        before = _device_detail(client, did, org_id)
+        old_fleet = before.get("fleet") or {}
+        if str(old_fleet.get("id") or "").lower() == str(target["id"]).lower():
+            raise ToolRefusal(f"No change: {found['match'].get('name')} is already in {target.get('name')}.", device=found["match"])
+        new_cfg = _safe(lambda: _fleet_assignment(client, org_id, target["id"])[0], [], "target configuration")
+        client.put(f"devices/{did}/fleet", org_id=org_id, json={"flotilla_id": target["id"]})
+        after = _device_detail(client, did, org_id)
+        new_fleet = after.get("fleet") or {}
+        confirmed = str(new_fleet.get("id") or "").lower() == str(target["id"]).lower()
+        cfg = (new_cfg or {}).get("configuration")
+        return _dumps(
+            {
+                "summary": f"{found['match'].get('name')}: {old_fleet.get('name')} → {new_fleet.get('name') or target.get('name')}"
+                + ("" if confirmed else " (NOT confirmed by read-back)")
+                + (f"; now runs {cfg.get('name')} @ {new_cfg['assignment']}" if cfg else "; the new fleet has no configuration")
+                + ".",
+                "device": {"id": did, "name": found["match"].get("name")},
+                "from_fleet": {"id": old_fleet.get("id"), "name": old_fleet.get("name")},
+                "to_fleet": {"id": new_fleet.get("id") or target["id"], "name": new_fleet.get("name") or target.get("name")},
+                "configuration": new_cfg,
+                "read_back": {"confirmed": confirmed},
+                "next": [{"tool": "get_device_workload", "why": "Confirm the workload that is running after the move.", "arguments": {"device": did}}],
+            }
+        )
+    except ToolRefusal as refusal:
+        return _dumps(refusal.payload)
+    except Exception as exc:
+        return _err(exc)
+
+
+def _device_config_view(payload: Any) -> dict[str, Any]:
+    payload = payload if isinstance(payload, dict) else {}
+    base, merged = ops.norm_spec(payload.get("base_config")), ops.norm_spec(payload.get("merged_config"))
+    info = payload.get("configuration_info") or {}
+    return {
+        "fleet_id": payload.get("fleet_id"),
+        "configuration": {"id": payload.get("configuration_id"), "name": info.get("name")} if payload.get("configuration_id") else None,
+        "assignment": payload.get("config_version") if payload.get("is_pinned") else ("latest" if payload.get("configuration_id") else None),
+        "resolved_version": payload.get("config_version"),
+        "has_override": bool(payload.get("has_override")),
+        "override": payload.get("host_override"),
+        "overridden_fields": ops.spec_diff(base, merged),
+        "merged": ops.mask_spec(merged),
+    }
+
+
+@mcp.tool(
+    description=(
+        "A device's effective configuration (GET /devices/{id}/configuration): which fleet and configuration it inherits "
+        "(version, and whether the fleet follows 'latest' or is pinned), the per-device override if any, exactly which "
+        "fields the override changes, and the merged spec the device should run. Credential-looking environment values "
+        "are masked. This is the desired configuration; get_device_workload shows what is actually running. Read-only."
+    ),
+    annotations=_READ_ONLY,
+)
+def get_device_configuration(device: str, organization_id: str | None = None) -> str:
+    try:
+        found = _resolve_device(device, organization_id)
+        if not found.get("match"):
+            return _dumps(found)
+        payload = get_client().get(f"devices/{found['match']['id']}/configuration", org_id=found["organization_id"])
+        view = _device_config_view(payload)
+        cfg = view["configuration"]
+        text = (
+            f"{cfg.get('name')} @ {view['assignment']}" + (f" with an override on {len(view['overridden_fields'])} field(s)" if view["has_override"] else ", no override")
+            if cfg
+            else "no configuration (its fleet has none)"
+        )
+        return _dumps({"summary": f"{found['match'].get('name')}: {text}.", "device": found["match"], **view})
+    except Exception as exc:
+        return _err(exc)
+
+
+def _check_override(override: Any) -> dict[str, Any]:
+    if not isinstance(override, dict) or not override:
+        raise ValueError("override must be a non-empty JSON object.")
+    unknown = sorted(set(override) - set(_OVERRIDE_KEYS))
+    if unknown:
+        raise ValueError(f"Unknown override field(s) {unknown}; the backend would ignore them. Allowed: {list(_OVERRIDE_KEYS)}.")
+    state = override.get("desiredState")
+    if state is not None and str(state).strip().upper() not in ("RUNNING", "STOPPED", ""):
+        raise ValueError("desiredState must be RUNNING or STOPPED.")
+    return override
+
+
+@mcp.tool(
+    description=(
+        "Set a per-device configuration override (PUT /devices/{id}/configuration): fields layered over the fleet's "
+        "configuration for this one device. override keys: image, command, environment {NAME: value}, mounts, options, "
+        "volumes, ports, image_cleaning, registry_credential_id, desiredState (RUNNING|STOPPED; STOPPED stops only this "
+        "device's workload). By default the override is merged into the existing one (merge patch: null removes a field); "
+        "replace=true replaces it entirely. Unknown keys are rejected. Stores the override; it reaches the device when it "
+        "reconnects or receives a push (render_device_document with push=true pushes this one device now). Returns the effective changes, read back. Changes what the device runs — explicit request only."
+    ),
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True),
+)
+def set_device_configuration_override(
+    device: str,
+    override: dict[str, Any],
+    reason: str | None = None,
+    replace: bool = False,
+    organization_id: str | None = None,
+) -> str:
+    try:
+        override = _check_override(override)
+        found = _resolve_device(device, organization_id)
+        if not found.get("match"):
+            return _dumps(found)
+        client, did, org_id = get_client(), found["match"]["id"], found["organization_id"]
+        current = client.get(f"devices/{did}/configuration", org_id=org_id)
+        before = _device_config_view(current)
+        if not before["configuration"]:
+            return _dumps({"error": "The device's fleet has no configuration to override. Assign one first (assign_fleet_configuration).", "device": found["match"]})
+        existing = (current or {}).get("host_override") or {}
+        wanted = override if replace else ops.merge_patch(existing, override)
+        if not wanted:
+            return _dumps({"error": "The resulting override is empty; use clear_device_configuration_override to remove it."})
+        if wanted == existing:
+            raise ToolRefusal("No change: the device already has this override.", device=found["match"])
+        body: dict[str, Any] = {"override": wanted}
+        if reason and reason.strip():
+            body["reason"] = reason.strip()
+        client.put(f"devices/{did}/configuration", org_id=org_id, json=body)
+        after = _device_config_view(client.get(f"devices/{did}/configuration", org_id=org_id))
+        confirmed = after["has_override"] and not ops.spec_diff(after["override"], wanted, mask=False)
+        return _dumps(
+            {
+                "summary": f"{found['match'].get('name')}: override set; changes vs fleet configuration: {ops.diff_summary(after['overridden_fields'])}.",
+                "device": found["match"],
+                "before": {"has_override": before["has_override"], "override": before["override"]},
+                "after": {"has_override": after["has_override"], "override": after["override"], "overridden_fields": after["overridden_fields"]},
+                "read_back": {"confirmed": confirmed},
+                "delivery": "The override is stored now and reaches the device when it reconnects or next receives a push.",
+                "next": [{"tool": "get_device_configuration", "why": "Review the effective configuration."}],
+            }
+        )
+    except ToolRefusal as refusal:
+        return _dumps(refusal.payload)
+    except Exception as exc:
+        return _err(exc)
+
+
+@mcp.tool(
+    description=(
+        "Remove a device's configuration override (DELETE /devices/{id}/configuration/override) so it follows its fleet's "
+        "configuration again. Refuses when there is no override. reason is recorded. Returns the read-back state. "
+        "Changes what the device will run (it reconnects/pushes to apply) — explicit request only."
+    ),
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True),
+)
+def clear_device_configuration_override(device: str, reason: str | None = None, organization_id: str | None = None) -> str:
+    try:
+        found = _resolve_device(device, organization_id)
+        if not found.get("match"):
+            return _dumps(found)
+        client, did, org_id = get_client(), found["match"]["id"], found["organization_id"]
+        before = _device_config_view(client.get(f"devices/{did}/configuration", org_id=org_id))
+        if not before["has_override"]:
+            raise ToolRefusal(f"No change: {found['match'].get('name')} has no configuration override.", device=found["match"])
+        client.delete(f"devices/{did}/configuration/override", org_id=org_id, params={"reason": (reason or "").strip() or None})
+        after = _device_config_view(client.get(f"devices/{did}/configuration", org_id=org_id))
+        confirmed = not after["has_override"]
+        return _dumps(
+            {
+                "summary": f"{found['match'].get('name')}: override " + ("cleared; follows the fleet configuration again." if confirmed else "still present after the request (NOT confirmed)."),
+                "device": found["match"],
+                "removed_override": before["override"],
+                "read_back": {"confirmed": confirmed, "has_override": after["has_override"]},
+            }
+        )
+    except ToolRefusal as refusal:
+        return _dumps(refusal.payload)
+    except Exception as exc:
+        return _err(exc)
+
+
+# -------------------------------------------------------------- rollouts ---
+
+
+def _as_list(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, (list, tuple)):
+        return [str(v).strip() for v in value if str(v).strip()]
+    return [s.strip() for s in str(value).split(",") if s.strip()]
+
+
+def _resolve_fleets(client: AdmiralClient, org_id: str, fleets: Any) -> list[dict[str, Any]]:
+    refs = _as_list(fleets)
+    if not refs:
+        raise ValueError("fleet is required (one name/UUID or a list)")
+    out: list[dict[str, Any]] = []
+    for ref in refs:
+        if is_uuid(ref):
+            out.append({"id": ref, "name": None})
+        else:
+            out.append(_unique_by_name(_items(client.list_fleets(org_id=org_id, search=ref, limit=100)), ref, "fleet"))
+    ids = [str(f["id"]).lower() for f in out]
+    if len(set(ids)) != len(ids):
+        raise ValueError("The same fleet was listed twice.")
+    return out
+
+
+def _rollout_type(value: str | None) -> str:
+    kind = (value or "config").strip().lower()
+    if kind not in _ROLLOUT_TYPES:
+        raise ValueError(f"Unsupported rollout type {value!r}; use one of {list(_ROLLOUT_TYPES)}.")
+    return kind
+
+
+def _type_spec(
+    kind: str,
+    force: bool,
+    container_target: str | None,
+    use_current_versions: bool,
+    version_ids: list[str] | None,
+    final_action: str | None,
+) -> dict[str, Any]:
+    """Body fragment carrying the type-specific spec of a non-config rollout."""
+    if kind == "reboot":
+        return {"reboot_spec": {"force": True}} if force else {}
+    if kind == "restart_workload":
+        return {"restart_workload_spec": {"container_target": container_target}} if container_target else {}
+    if kind == "system_update":
+        ids = _as_list(version_ids)
+        if not use_current_versions and not ids:
+            raise ValueError("system_update needs version_ids [UUID] or use_current_versions=true.")
+        if use_current_versions and ids:
+            raise ValueError("Pass version_ids or use_current_versions, not both.")
+        action = (final_action or "reboot").strip().lower()
+        if action not in ("reboot", "none", "restart"):
+            raise ValueError("final_action must be reboot, none or restart.")
+        for vid in ids:
+            if not is_uuid(vid):
+                raise ValueError(f"version_ids must be UUIDs; got {vid!r}.")
+        spec: dict[str, Any] = {"final_action": action}
+        if ids:
+            spec["version_ids"] = ids
+        else:
+            spec["use_current_versions"] = True
+        return {"system_update_spec": spec}
+    return {}
+
+
+def _effective_strategy(strategy: dict[str, Any] | None) -> dict[str, Any]:
+    return {**_STRATEGY_DEFAULTS, **(_normalise_strategy(strategy) or {})}
+
+
+@mcp.tool(
+    description=(
+        "List rollouts (GET /rollouts), newest first, as compact rows: id, name, type (config, reboot, restart_workload, "
+        "system_update), status (pending, scheduled, in_progress, paused, completed, failed, cancelled, rolled_back), "
+        "progress, fleets, configuration + version, counts, paused reason. Filters: fleet (name/UUID or list), status "
+        "(one or comma-separated), type, search, active_only. Read-only. Next: get_rollout / list_rollout_devices / "
+        "watch_rollout for one rollout."
+    ),
+    annotations=_READ_ONLY,
+)
+def list_rollouts(
+    fleet: str | list[str] | None = None,
+    status: str | None = None,
+    type: str | None = None,
+    search: str | None = None,
+    active_only: bool = False,
+    limit: int = 20,
+    page: int = 1,
+    organization_id: str | None = None,
+) -> str:
+    try:
+        client, org_id = _ctx(organization_id)
+        kind = _rollout_type(type) if type else None
+        fleet_ids = [f["id"] for f in _resolve_fleets(client, org_id, fleet)] if fleet else []
+        statuses = _as_list(status)
+        if active_only:
+            statuses = _ACTIVE_ROLLOUT_STATUSES.split(",")
+        payload = client.get(
+            "rollouts",
+            org_id=org_id,
+            params={
+                "status": ",".join(s.lower() for s in statuses),
+                "fleet_id": ",".join(fleet_ids),
+                "search": search,
+                "limit": max(1, min(int(limit), 200)),
+                "page": max(1, int(page)),
+            },
+        )
+        pagination = payload.get("pagination") if isinstance(payload, dict) else None
+        rows = [_rollout_row(r) for r in _items(payload) if not kind or r.get("type") == kind]
+        total = (pagination or {}).get("total", len(rows))
+        return _dumps(
+            {
+                "summary": f"{len(rows)} rollout(s) shown ({total} match the server-side filters)" + (f", type {kind}" if kind else "") + ".",
+                "rollouts": rows,
+                "pagination": pagination,
+                "next": [{"tool": "get_rollout", "why": "Detail, strategy and counts for one rollout."}],
+            }
+        )
+    except Exception as exc:
+        return _err(exc)
+
+
+@mcp.tool(
+    description=(
+        "READ-ONLY rollout planner: shows what create_rollout would do without creating anything. Resolves the fleet(s) "
+        "(name/UUID or list) and, for type=config, the configuration and version ('latest' or an integer); shows per fleet "
+        "the current vs target configuration/version, the spec diff, device counts (total/online/offline) and the "
+        "POST /rollouts/impact result, the effective strategy (your overrides over the server defaults canary 1, "
+        "maxInFlight 50, maxUnavailable 2, failureThreshold 0.1, progressDeadline 30m), and warnings: target equals what "
+        "the fleet already runs (such a rollout never converges), offline devices (only admitted while online), unfinished "
+        "rollouts on the same fleets, a deprecated/archived configuration, a signature policy in the spec, disruptive types. "
+        "Ends with the exact create_rollout arguments. type: config (default), reboot, restart_workload, system_update "
+        "(use_current_versions or version_ids)."
+    ),
+    annotations=_READ_ONLY,
+)
+def preview_rollout(
+    fleets: str | list[str],
+    configuration: str | None = None,
+    version: int | str = "latest",
+    type: str = "config",
+    strategy: dict[str, Any] | None = None,
+    force: bool = False,
+    container_target: str | None = None,
+    use_current_versions: bool = False,
+    version_ids: list[str] | None = None,
+    final_action: str | None = None,
+    organization_id: str | None = None,
+) -> str:
+    try:
+        client, org_id = _ctx(organization_id)
+        kind = _rollout_type(type)
+        strat = _effective_strategy(strategy)
+        fleet_rows = _resolve_fleets(client, org_id, fleets)
+        fleet_ids = [str(f["id"]) for f in fleet_rows]
+        spec_fragment = _type_spec(kind, force, container_target, use_current_versions, version_ids, final_action)
+        warnings: list[str] = []
+        cfg: dict[str, Any] | None = None
+        target_version: int | None = None
+        target_spec: dict[str, Any] = {}
+        if kind == "config":
+            if not configuration:
+                return _dumps({"error": "configuration is required for type=config."})
+            cfg = _find_config(client, org_id, configuration)
+            latest = _latest_of(cfg)
+            target_version = latest if str(version).strip().lower() == "latest" else int(version)
+            if not target_version or target_version < 1 or (latest and target_version > latest):
+                return _dumps({"error": f"version must be between 1 and {latest} (or 'latest').", "configuration": _ref(cfg)})
+            got = client.get(f"configurations/{cfg['id']}/versions/{target_version}", org_id=org_id)
+            target_spec = ops.norm_spec((got or {}).get("spec") if isinstance(got, dict) else {})
+            if str(cfg.get("status") or "").lower() in ("deprecated", "archived"):
+                warnings.append(f"The configuration is {cfg.get('status')}.")
+            if target_spec.get("signaturePolicy"):
+                warnings.append(
+                    "The spec sets an image signature policy; creating a version with it needs the organisation's signature-policy entitlement (a 402 means it is not enabled)."
+                )
+
+        def per_fleet(row: dict[str, Any]) -> dict[str, Any]:
+            fid = str(row["id"])
+            detail = _safe(lambda: client.get(f"fleets/{fid}", org_id=org_id), warnings, f"fleet {row.get('name') or fid}") or row
+            item: dict[str, Any] = {
+                "fleet": {"id": fid, "name": detail.get("name") or row.get("name")},
+                "devices": {"total": detail.get("devices"), "online": detail.get("online"), "offline": detail.get("offline")},
+            }
+            if kind == "config":
+                current, current_spec = _fleet_assignment(client, org_id, fid)
+                cur_cfg = current["configuration"]
+                item["current"] = {"configuration": cur_cfg and {"id": cur_cfg["id"], "name": cur_cfg["name"]}, "assignment": current["assignment"], "version": current["resolved_version"]}
+                item["target"] = {"configuration": _ref(cfg or {}), "version": target_version}
+                item["same_version_noop"] = bool(
+                    cur_cfg and str(cur_cfg["id"]).lower() == str((cfg or {})["id"]).lower() and current["resolved_version"] == target_version
+                )
+                item["diff"] = ops.spec_diff(current_spec, target_spec)
+            return item
+
+        plans = _parallel_map(per_fleet, fleet_rows)
+        impact = _safe(lambda: client.post("rollouts/impact", org_id=org_id, json={"fleet_ids": fleet_ids, "type": kind}), warnings, "impact")
+        active = _safe(lambda: _active_rollouts(client, org_id, fleet_ids), warnings, "rollouts") or []
+        total = sum(int(p["devices"]["total"] or 0) for p in plans)
+        online = sum(int(p["devices"]["online"] or 0) for p in plans)
+        if isinstance(impact, dict):
+            total, online = impact.get("total_devices", total), impact.get("online_count", online)
+        for p in plans:
+            name = p["fleet"]["name"] or p["fleet"]["id"]
+            if p.get("same_version_noop"):
+                warnings.append(
+                    f"{name} already runs {(cfg or {}).get('name')} v{target_version}: devices will not change, and a config rollout to the version they already run never converges (it sits 'assigned' until the progress deadline). Pick a different version or skip this fleet."
+                )
+            if p["devices"]["total"] == 0:
+                warnings.append(f"{name} has no devices.")
+            elif p["devices"]["offline"]:
+                warnings.append(f"{name}: {p['devices']['offline']} device(s) offline; they are only admitted when online, so the rollout stays in_progress until they return.")
+        if total and online < strat["canary"]:
+            warnings.append(f"Only {online} device(s) online but canary is {strat['canary']}.")
+        if active:
+            warnings.append(f"{len(active)} unfinished rollout(s) already target these fleets (see active_rollouts); a newer rollout takes over device pins.")
+        if isinstance(impact, dict) and impact.get("is_disruptive"):
+            warnings.append(f"A {kind} rollout is disruptive: devices restart or reboot.")
+        if kind == "system_update" and isinstance(impact, dict) and impact.get("incompatible_count"):
+            warnings.append(f"{impact['incompatible_count']} device(s) have no compatible version.")
+        args: dict[str, Any] = {"fleet": fleet_ids if len(fleet_ids) > 1 else fleet_ids[0], "type": kind}
+        if kind == "config":
+            args.update({"configuration": (cfg or {})["id"], "version": target_version})
+        elif kind == "reboot" and force:
+            args["force"] = True
+        elif kind == "restart_workload" and container_target:
+            args["container_target"] = container_target
+        elif kind == "system_update":
+            args.update({"final_action": spec_fragment["system_update_spec"]["final_action"]})
+            args.update({k: v for k, v in spec_fragment["system_update_spec"].items() if k in ("version_ids", "use_current_versions")})
+        if strategy:
+            args["strategy"] = strategy
+        blocking = [p for p in plans if p.get("same_version_noop")]
+        label = f"{(cfg or {}).get('name')} v{target_version}" if kind == "config" else kind
+        return _dumps(
+            {
+                "summary": f"Preview {label} → {len(plans)} fleet(s), {total} device(s) ({online} online)"
+                + (f"; {len(warnings)} warning(s)" if warnings else "; no warnings")
+                + ". Nothing was created.",
+                "read_only": True,
+                "type": kind,
+                "configuration": ({**_ref(cfg or {}), "status": (cfg or {}).get("status"), "latest_version": _latest_of(cfg or {})} if cfg else None),
+                "fleets": plans,
+                "impact": impact,
+                "strategy": strat,
+                "active_rollouts": active,
+                "warnings": warnings,
+                "ready": not blocking and bool(total),
+                "create_rollout": {"tool": "create_rollout", "arguments": args},
+            }
+        )
     except Exception as exc:
         return _err(exc)
 

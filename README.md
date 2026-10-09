@@ -69,6 +69,40 @@ This server uses the historical query. Live tail cannot be opened with a PAT —
 | `get_memory_test` | Status, coverage %, errors, verdict, retired pages, memory fault, capabilities; flags a fault or an interrupted last test |
 | `list_memory_test_results` | Stored results, newest first (`limit` 1-100); works offline |
 
+### Operations: configurations, fleets, devices, rollouts
+
+Mutating tools resolve names (ambiguous names return candidates and change nothing), refuse no-ops, and read the
+state back from the API after writing. They run only on an explicit request.
+
+| Tool | Use |
+|---|---|
+| `list_configurations` | Configurations with status, latest version and the fleets using each |
+| `get_configuration` | Metadata, spec of the latest (or a given) version, version history, fleets (credential-looking env values masked) |
+| `diff_configuration_versions` | Structured spec diff between two versions (default: previous → latest) |
+| `create_configuration` | New configuration (image/env/ports/command or a full spec) at version 1 |
+| `edit_configuration` | Edit the latest spec into a **new version**: `image`/`image_tag`, `env_set`/`env_unset`, `merge_patch`, or full `spec`. Needs `change_reason`; `base_version` guards concurrent edits; `dry_run` previews; shows which fleets follow `latest` vs pinned |
+| `update_configuration_metadata` | Name, description, tags and lifecycle status |
+| `rollback_configuration` | New latest version copied from an earlier one |
+| `delete_configuration` | Refuses while a fleet or unfinished rollout still uses it |
+| `get_fleet` | Devices, tags, assigned configuration (`latest` or pinned, resolved version), update policy/window, history, unfinished rollouts |
+| `assign_fleet_configuration` | Assign a configuration/version to a fleet **directly** (no canary; use a rollout for running fleets) |
+| `get_fleet_configuration_history` | Who assigned which configuration/version, when and why |
+| `create_fleet`, `update_fleet` | Create a fleet; rename/describe/relocate and add/remove/replace tags |
+| `set_fleet_update_policy` | OS update policy (`latest`/`pinned` targets) and update window |
+| `update_device` | Name, notes, location, tags |
+| `move_device_to_fleet` | Move a device; it takes the new fleet's configuration immediately |
+| `get_device_configuration` | Inherited configuration, per-device override and the merged result |
+| `set_device_configuration_override`, `clear_device_configuration_override` | Per-device override layered over the fleet configuration |
+| `list_rollouts` | Compact rollout rows, filter by fleet/status/type |
+| `preview_rollout` | Read-only plan: current vs target per fleet, spec diff, device impact, strategy, warnings, and the exact `create_rollout` call |
+| `create_rollout` | `config` (default), `reboot`, `restart_workload` or `system_update` over one or more fleets |
+| `get_rollout`, `list_rollout_devices`, `rollout_control`, `watch_rollout` | Inspect, pause/resume/cancel/rollback, and follow a rollout |
+
+**Applying a configuration change.** Saving a new version or assigning a configuration to a fleet pushes nothing: a
+device reads its desired state when it (re)connects and when a rollout, fleet move or document push reaches it. A
+fleet that follows `latest` therefore picks a new version up unevenly and without a canary. For fleets with running
+devices use `edit_configuration` → `preview_rollout` → `create_rollout`.
+
 ## Run locally
 
 ```bash
