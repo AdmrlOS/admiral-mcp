@@ -64,7 +64,7 @@ How to answer naturally:
   A fleet that follows 'latest' resolves a new version as soon as it exists. For running fleets the safe path is
   edit_configuration -> preview_rollout -> create_rollout, then follow it with get_rollout. Fleet/device management: create_fleet,
   update_fleet, set_fleet_update_policy (OS update policy/window), update_device, move_device_to_fleet,
-  get_device_configuration, set_device_configuration_override, clear_device_configuration_override.
+  get_device_configuration, set_device_configuration_override, reset_device_configuration_override, clear_device_configuration_override.
 - For how-to / what-is questions about Admiral itself (concepts, setup, provisioning, configuration), use
   search_docs then read_docs_page, answer from them, and always cite the docs URL.
 - "What is wrong with my device?" -> troubleshoot_device (one call: state, backend diagnosis, fresh probe, logs, events,
@@ -3917,7 +3917,8 @@ def _device_config_view(payload: Any) -> dict[str, Any]:
         "assignment": payload.get("config_version") if payload.get("is_pinned") else ("latest" if payload.get("configuration_id") else None),
         "resolved_version": payload.get("config_version"),
         "has_override": bool(payload.get("has_override")),
-        "override": payload.get("host_override"),
+        "override": payload.get("configuration_override", payload.get("host_override")),
+        "overridden_paths": payload.get("overridden_paths") or [],
         "overridden_fields": ops.spec_diff(base, merged),
         "merged": ops.mask_spec(merged),
     }
@@ -3927,7 +3928,9 @@ def _device_config_view(payload: Any) -> dict[str, Any]:
     description=(
         "A device's effective configuration (GET /devices/{id}/configuration): which fleet and configuration it inherits "
         "(version, and whether the fleet follows 'latest' or is pinned), the per-device override if any, exactly which "
-        "fields the override changes, and the merged spec the device should run. Credential-looking environment values "
+        "fields the override changes, overridden_paths (stored explicit overrides, even if equal to base), and the merged spec "
+        "the device should run. Only overridden fields are stored; resetting inherits the configuration value. "
+        "A blank environment value empties the variable. Credential-looking environment values "
         "are masked. This is the desired configuration; get_device_workload shows what is actually running. Read-only."
     ),
     annotations=_READ_ONLY,
@@ -3964,11 +3967,13 @@ def _check_override(override: Any) -> dict[str, Any]:
 
 @mcp.tool(
     description=(
-        "Set a per-device configuration override (PUT /devices/{id}/configuration): fields layered over the fleet's "
+        "Set a sparse per-device configuration override (PATCH /devices/{id}/configuration/override): fields layered over the fleet's "
         "configuration for this one device. override keys: image, command, environment {NAME: value}, mounts, options, "
         "volumes, ports, image_cleaning, registry_credential_id, desiredState (RUNNING|STOPPED; STOPPED stops only this "
         "device's workload). By default the override is merged into the existing one (merge patch: null removes a field); "
-        "replace=true replaces it entirely. Unknown keys are rejected. Stores the override; it reaches the device when it "
+        "Only given fields are sent and stored, including options per field; absent fields inherit. A blank environment value "
+        "empties that variable. reset_device_configuration_override returns a field to its configuration value. "
+        "replace=true explicitly replaces the whole stored override via PUT. Unknown keys are rejected. It reaches the device when it "
         "reconnects or receives a push (render_device_document with push=true pushes this one device now). Returns the effective changes, read back. Changes what the device runs: without confirm=true it only previews the effective changes."
     ),
     annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True),
@@ -3991,7 +3996,7 @@ def set_device_configuration_override(
         before = _device_config_view(current)
         if not before["configuration"]:
             return _dumps({"error": "The device's fleet has no configuration to override. Assign one first (assign_fleet_configuration).", "device": found["match"]})
-        existing = (current or {}).get("host_override") or {}
+        existing = before["override"] or {}
         wanted = override if replace else ops.merge_patch(existing, override)
         if not wanted:
             return _dumps({"error": "The resulting override is empty; use clear_device_configuration_override to remove it."})
@@ -4012,7 +4017,14 @@ def set_device_configuration_override(
                 org_id=org_id,
                 preview={"override_before": existing or None, "override_after": wanted, "effective_changes": ops.spec_diff(base_cfg, merged_after)},
             ) or ""
-        client.put(f"devices/{did}/configuration", org_id=org_id, json=body)
+        if replace:
+            client.put(f"devices/{did}/configuration", org_id=org_id, json=body)
+        else:
+            client.raw_request(
+                "PATCH", f"devices/{did}/configuration/override", org_id=org_id, json=override,
+                headers={"Content-Type": "application/merge-patch+json"},
+                params={"reason": (reason or "").strip() or None},
+            )
         after = _device_config_view(client.get(f"devices/{did}/configuration", org_id=org_id))
         confirmed = after["has_override"] and not ops.spec_diff(after["override"], wanted, mask=False)
         return _dumps(
@@ -4073,6 +4085,114 @@ def clear_device_configuration_override(
                 "read_back": {"confirmed": confirmed, "has_override": after["has_override"]},
             }
         )
+    except ToolRefusal as refusal:
+        return _dumps(refusal.payload)
+    except Exception as exc:
+        return _err(exc)
+
+
+_OVERRIDE_OPTION_FIELDS = frozenset(
+    "tty host_namespaces host_resolvconf host_hosts_file new_privileges privileged parent_cgroup_devices "
+    "cgroup masked_paths readonly_paths all_devices_allowed capabilities devices read_only_root "
+    "ephemeral_root exposeDBus disableHostBluetooth".split()
+)
+_OVERRIDE_CLEANING_FIELDS = frozenset(
+    "enabled retention_count max_age_days prune_on_update prune_dangling interval_hours".split()
+)
+
+
+def _override_path_is_set(stored: dict[str, Any], path: str) -> bool:
+    top, sep, rest = path.partition(".")
+    parts = [top, rest] if top in ("environment", "volumes") and sep else path.split(".")
+    node: Any = stored
+    for part in parts[:-1]:
+        node = node.get(part, {}) if isinstance(node, dict) else {}
+    return isinstance(node, dict) and parts[-1] in node
+
+
+def _override_reset_patch(paths: list[str]) -> dict[str, Any]:
+    if not isinstance(paths, list) or not paths:
+        raise ValueError("paths must be a non-empty list of override paths.")
+    patch: dict[str, Any] = {}
+    for path in paths:
+        if not isinstance(path, str):
+            raise ValueError("Each override path must be a string.")
+        top, sep, rest = path.partition(".")
+        if top not in _OVERRIDE_KEYS or top == "image_cleaning":
+            raise ValueError(f"Unknown override path {path!r}; use canonical override field names.")
+        if top in ("environment", "volumes") and sep and rest:
+            parts = [top, rest]  # names can contain dots; these maps are keyed by name
+        elif top == "options" and sep:
+            parts = path.split(".")
+            if not ((len(parts) == 2 and rest in _OVERRIDE_OPTION_FIELDS) or
+                    (len(parts) == 3 and parts[1] == "image_cleaning" and parts[2] in _OVERRIDE_CLEANING_FIELDS)):
+                raise ValueError(f"Unknown override path {path!r}.")
+        elif not sep and top not in ("environment", "volumes", "options"):
+            parts = [top]
+        else:
+            raise ValueError(f"Invalid override path {path!r}; reset individual map keys/options fields.")
+        node = patch
+        for part in parts[:-1]:
+            node = node.setdefault(part, {})
+        node[parts[-1]] = None
+    return patch
+
+
+@mcp.tool(
+    description=(
+        "Reset individual sparse device configuration override paths to their configuration's values "
+        "(PATCH /devices/{id}/configuration/override with nulls). paths: image, desiredState, command, "
+        "registry_credential_id, ports, mounts, environment.KEY, volumes.NAME, options.exposeDBus (or another "
+        "option JSON field), options.image_cleaning.enabled (or another cleaning field). Only overridden "
+        "fields are stored; reset removes that explicit override, not the inherited value. To empty an "
+        "environment variable instead, set its override to a blank string. Unknown paths are rejected. "
+        "Resetting the last field clears the override. Without confirm=true only previews; confirmed writes "
+        "are read back. reason is recorded."
+    ),
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True),
+)
+def reset_device_configuration_override(
+    device: str,
+    paths: list[str],
+    reason: str | None = None,
+    organization_id: str | None = None,
+    confirm: bool = False,
+) -> str:
+    try:
+        patch = _override_reset_patch(paths)
+        found = _resolve_device(device, organization_id)
+        if not found.get("match"):
+            return _dumps(found)
+        client, did, org_id = get_client(), found["match"]["id"], found["organization_id"]
+        before = _device_config_view(client.get(f"devices/{did}/configuration", org_id=org_id))
+        existing = before["override"] or {}
+        wanted = ops.merge_patch(existing, patch)
+        # RFC 7386 can create empty parents for absent paths; that is not a real reset.
+        if not any(_override_path_is_set(existing, path) for path in paths):
+            raise ToolRefusal("No change: none of the requested paths are overridden.", device=found["match"])
+        gate = _gate(
+            confirm, "reset_device_configuration_override",
+            f"reset override paths on {found['match'].get('name') or did}: {', '.join(paths)}; inherit configuration values.",
+            action={"device": found["match"], "paths": paths, "changes": "what this one device runs"},
+            args={"device": did, "paths": paths, "reason": reason}, org_id=org_id,
+            preview={"override_before": existing, "override_after": wanted, "merge_patch": patch},
+        )
+        if gate:
+            return gate
+        client.raw_request(
+            "PATCH", f"devices/{did}/configuration/override", org_id=org_id, json=patch,
+            headers={"Content-Type": "application/merge-patch+json"},
+            params={"reason": (reason or "").strip() or None},
+        )
+        after = _device_config_view(client.get(f"devices/{did}/configuration", org_id=org_id))
+        stored = after["override"] or {}
+        # A missing leaf is reset even when the server prunes its now-empty parent map.
+        confirmed = not any(_override_path_is_set(stored, path) for path in paths)
+        return _dumps({
+            "summary": f"{found['match'].get('name')}: override paths " + ("reset; inherit configuration values." if confirmed else "NOT confirmed reset."),
+            "device": found["match"], "paths": paths, "before": before, "after": after,
+            "read_back": {"confirmed": confirmed},
+        })
     except ToolRefusal as refusal:
         return _dumps(refusal.payload)
     except Exception as exc:

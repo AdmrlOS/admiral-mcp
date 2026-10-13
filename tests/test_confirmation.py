@@ -187,6 +187,7 @@ def _cases(tmp_path) -> dict[str, dict[str, Any]]:
         "set_fleet_update_policy": {"fleet": FLEET, "mode": "pinned", "targets": [{"architecture": "arm64"}]},
         "move_device_to_fleet": {"device": "dan-qemu-3", "fleet": FLEET2},
         "set_device_configuration_override": {"device": "dan-qemu-3", "override": {"image": "registry.example.com/kiosk:3"}},
+        "reset_device_configuration_override": {"device": "dan-qemu-3", "paths": ["image"]},
         "clear_device_configuration_override": {"device": "dan-qemu-3"},
         "set_network_configuration": {"device": "dan-qemu-3", "configuration": {"nameservers": ["192.0.2.54"]}},
         "clear_network_configuration": {"fleet": FLEET},
@@ -208,7 +209,7 @@ CASE_NAMES = sorted(
     """reboot_device change_workload_status patch_device_document render_device_document adopt_local_override
     discard_local_override start_memory_test cancel_memory_test create_rollout rollout_control edit_configuration
     rollback_configuration delete_configuration assign_fleet_configuration set_fleet_update_policy move_device_to_fleet
-    set_device_configuration_override clear_device_configuration_override set_network_configuration
+    set_device_configuration_override reset_device_configuration_override clear_device_configuration_override set_network_configuration
     clear_network_configuration set_fleet_ssh_access set_fleet_image_proxy set_fleet_custom_metrics
     set_fleet_security_policy set_usb_policy clear_usb_policy delete_alert_rule update_registry_credential
     delete_registry_credential delete_secret_file upload_secret_file""".split()
