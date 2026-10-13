@@ -893,11 +893,14 @@ def test_get_device_configuration_without_fleet_configuration(api):
 def test_set_device_configuration_override_merges_by_default(api):
     existing = {"image": "kiosk:debug", "environment": {"A": "1", "B": "2"}}
     api.on("GET", f"/devices/{DEV}/configuration", Seq(dev_cfg(existing), dev_cfg({"image": "kiosk:debug", "environment": {"A": "9"}})))
-    api.on("PUT", f"/devices/{DEV}/configuration", ok({"id": DEV, "has_override": True}))
+    api.on("PATCH", f"/devices/{DEV}/configuration/override", ok({"id": DEV, "has_override": True}))
 
     out = j(server.set_device_configuration_override("x", {"environment": {"A": "9", "B": None}}, reason=" test ", confirm=True))
 
-    assert bodies(api, "PUT", f"/devices/{DEV}/configuration") == [{"override": {"image": "kiosk:debug", "environment": {"A": "9"}}, "reason": "test"}]
+    assert bodies(api, "PATCH", f"/devices/{DEV}/configuration/override") == [{"environment": {"A": "9", "B": None}}]
+    patch = next(r for r in api.seen if r.method == "PATCH")
+    assert dict(patch.url.params) == {"reason": "test"}
+    assert patch.headers["Content-Type"] == "application/merge-patch+json"
     assert out["after"]["has_override"] is True and out["read_back"]["confirmed"] is True
     assert "reaches the device when it reconnects" in out["delivery"]
 
@@ -939,6 +942,64 @@ def test_clear_device_configuration_override_refuses_when_none_and_flags_leftove
     out = j(server.clear_device_configuration_override("x", confirm=True))
     assert out["read_back"]["confirmed"] is False and "NOT confirmed" in out["summary"]
     assert "reason" not in dict(next(r for r in api.seen if r.method == "DELETE").url.params)
+
+
+@pytest.mark.parametrize("paths,patch", [
+    (["environment.LOG_LEVEL"], {"environment": {"LOG_LEVEL": None}}),
+    (["options.exposeDBus", "options.image_cleaning.enabled"], {"options": {"exposeDBus": None, "image_cleaning": {"enabled": None}}}),
+    (["image"], {"image": None}),
+])
+def test_reset_device_configuration_override_sparse(api, paths, patch):
+    existing = {"image": "a", "environment": {"LOG_LEVEL": "debug"}, "options": {"exposeDBus": True, "image_cleaning": {"enabled": True}}}
+    wanted = server.ops.merge_patch(existing, patch)
+    api.on("GET", f"/devices/{DEV}/configuration", Seq(dev_cfg(existing), dev_cfg(wanted)))
+    api.on("PATCH", f"/devices/{DEV}/configuration/override", ok({}))
+    out = j(server.reset_device_configuration_override("x", paths, reason=" reset ", confirm=True))
+    assert bodies(api, "PATCH", f"/devices/{DEV}/configuration/override") == [patch]
+    assert out["read_back"]["confirmed"] is True
+
+
+def test_reset_last_override_clears_and_verifies(api):
+    api.on("GET", f"/devices/{DEV}/configuration", Seq(dev_cfg({"image": "a"}), dev_cfg(None)))
+    api.on("PATCH", f"/devices/{DEV}/configuration/override", ok({}))
+    out = j(server.reset_device_configuration_override("x", ["image"], confirm=True))
+    assert out["read_back"]["confirmed"] is True and not out["after"]["has_override"]
+
+
+@pytest.mark.parametrize("paths", [[], ["signature_policy"], ["image.bad"], ["options.unknown"], ["environment."], ["options.image_cleaning.unknown"]])
+def test_reset_override_rejects_invalid_paths(api, paths):
+    assert "error" in j(server.reset_device_configuration_override("x", paths, confirm=True))
+    assert api.seen == []
+
+
+def test_reset_override_absent_path_refuses_without_write(api):
+    api.on("GET", f"/devices/{DEV}/configuration", dev_cfg({"image": "a"}))
+    out = j(server.reset_device_configuration_override("x", ["environment.MISSING"], confirm=True))
+    assert out["error"].startswith("No change")
+    assert not [r for r in api.seen if r.method != "GET"]
+
+
+@pytest.mark.parametrize("override", [{"environment": {"LOG_LEVEL": "debug"}}, {"environment": {"LOG_LEVEL": ""}}, {"options": {"exposeDBus": True}}])
+def test_set_override_sends_only_supplied_fields(api, override):
+    existing = {"image": "a", "options": {"tty": True}}
+    api.on("GET", f"/devices/{DEV}/configuration", Seq(dev_cfg(existing), dev_cfg(server.ops.merge_patch(existing, override))))
+    api.on("PATCH", f"/devices/{DEV}/configuration/override", ok({}))
+    out = j(server.set_device_configuration_override("x", override, confirm=True))
+    assert bodies(api, "PATCH", f"/devices/{DEV}/configuration/override") == [override]
+    assert out["read_back"]["confirmed"] is True
+
+
+def test_reset_readback_flags_remaining_field(api):
+    api.on("GET", f"/devices/{DEV}/configuration", dev_cfg({"image": "a"}))
+    api.on("PATCH", f"/devices/{DEV}/configuration/override", ok({}))
+    out = j(server.reset_device_configuration_override("x", ["image"], confirm=True))
+    assert out["read_back"]["confirmed"] is False
+
+
+def test_device_configuration_surfaces_stored_paths(api):
+    api.on("GET", f"/devices/{DEV}/configuration", ok({"configuration_override": {"image": "same"}, "overridden_paths": ["image"]}))
+    out = j(server.get_device_configuration("x"))
+    assert out["overridden_paths"] == ["image"] and out["override"] == {"image": "same"}
 
 
 # ============================================================== rollouts ===
