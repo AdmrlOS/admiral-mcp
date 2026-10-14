@@ -1852,8 +1852,8 @@ def discard_local_override(
         "timeout_ms caps the device side (max 20000). Live round-trip: device must be online (503/504 "
         "otherwise). Items marked sensitive come back as [redacted] for non-staff callers. Audited. The network "
         "section reports packet loss and path quality on newer device agents (loss to the gateway, DNS server and "
-        "cloud with rtt/jitter, per-hop loss, interface errors); network_path then lists those items (sensitive "
-        "per-hop rows excluded) with the backend's verdict {code, cause, evidence, confidence}: local link, "
+        "cloud with rtt/jitter, per-hop loss, interface errors); network_path then lists those items (rows "
+        "flagged sensitive excluded) with the backend's verdict {code, cause, evidence, confidence}: local link, "
         "NIC/cable errors, upstream ISP/WAN, lossy DNS server path or resolver misconfigured. Omitted on older agents."
     ),
     annotations=ToolAnnotations(readOnlyHint=True, idempotentHint=True),

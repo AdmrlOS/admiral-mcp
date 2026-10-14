@@ -87,6 +87,23 @@ def test_network_path_lists_loss_items_and_verdict_without_sensitive_rows():
     assert "verdict" not in only and only["worst"] == "error"
 
 
+def test_network_path_includes_non_sensitive_hops():
+    """Current agents send hop rows without the sensitive flag (customer's own path): they are listed.
+    Older agents still flag them sensitive and those stay dropped."""
+    rep = probe_report(
+        {"key": "network.loss_gateway", "label": "Loss to gateway", "value": CLEAN, "level": "ok"},
+        {"key": "network.hop_1", "label": "Hop 1", "value": "192.0.2.1 sent 5 recv 5 loss 0% avg 1 ms", "level": "ok"},
+        {"key": "network.hop_2", "label": "Hop 2", "value": "198.51.100.1 sent 5 recv 4 loss 20% avg 9 ms", "level": "warn"},
+        {"key": "network.hop_3", "label": "Hop 3", "value": "[redacted]", "level": "ok", "sensitive": True},
+    )
+    path = ts.network_path(rep)
+    assert path is not None
+    keys = [i["key"] for i in path["items"]]
+    assert keys == ["network.loss_gateway", "network.hop_1", "network.hop_2"]
+    assert path["items"][2]["value"] == "198.51.100.1 sent 5 recv 4 loss 20% avg 9 ms"
+    assert path["worst"] == "warn"
+
+
 def test_path_items_are_not_misread_as_dns_failures():
     for key in ("network.loss_dns", "loss_gateway", "network.hop_2", "network.path_verdict", "network.iface_errors_eth0", "network.iface_errors"):
         assert ts.classify_item({"key": key, "label": "DNS gateway link"}) == "path", key
