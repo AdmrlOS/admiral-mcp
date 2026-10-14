@@ -1053,6 +1053,38 @@ def _diagnose_one(client: AdmiralClient, target: dict[str, Any], org_id: str, st
     return report
 
 
+#: How old a probe this process already ran may be before diagnose_device stops reusing it.
+_DIAGNOSE_PROBE_REUSE_S = 300
+
+
+def _attach_network_path(client: AdmiralClient, report: dict[str, Any], target: dict[str, Any], org_id: str, *, live: bool) -> None:
+    """Add network_path (loss items + backend verdict) to a diagnose report, additively.
+
+    live=True runs a network-only probe when the device is online; otherwise a probe this process ran in the
+    last _DIAGNOSE_PROBE_REUSE_S seconds is reused. Nothing is added when neither yields loss items or a verdict.
+    """
+    device_id = target.get("id")
+    if not device_id:
+        return
+    probe: dict[str, Any] | None = None
+    source = ""
+    if live:
+        if str(target.get("status") or "").lower() != "online":
+            report["probe_note"] = "include_probe: the device is not online, so no live probe was run"
+        else:
+            probe, source = ts.run_probe(client, device_id, org_id, ["network"])
+            if probe is None:
+                report["probe_note"] = source
+    if probe is None:
+        cached = ts.cached_probe(device_id, _DIAGNOSE_PROBE_REUSE_S)
+        if cached is not None:
+            probe, source = cached[0], f"probe from {cached[1]}s ago"
+    path = ts.network_path(probe)
+    if path is not None:
+        path["source"] = source
+        report["network_path"] = path
+
+
 @mcp.tool(
     description=(
         "Diagnose a device (or the offline/error set). Uses the backend's one-call verdict "
@@ -1061,7 +1093,12 @@ def _diagnose_one(client: AdmiralClient, target: dict[str, Any], org_id: str, st
         "evidence, lastReboot, and signals, plus schedule (heartbeat interval, last/next check-in, overdue, and when "
         "the device restarts if it stays offline: restart.at/reason/basis/thenEveryMs, limits) copied to report.schedule. When the backend has no diagnose route it falls back to a "
         "client-side distillation of workload, health stats, events and historical logs (source=local_fallback; "
-        "lookback_hours applies only there). If device is omitted, inspects currently offline and error devices."
+        "lookback_hours applies only there). If device is omitted, inspects currently offline and error devices. "
+        "Packet loss and path quality: network_path (loss to gateway/DNS/cloud, interface errors, and the backend's "
+        "likely-cause verdict {code, cause, evidence, confidence}: local link, NIC/cable, upstream ISP/WAN, DNS path or "
+        "resolver) is added from a probe this session ran in the last 5 minutes, or from a fresh network probe when "
+        "include_probe=true (one device, online only; one probe per 5 s per device). Omitted on device agents that do not "
+        "report loss."
     ),
     annotations=_READ_ONLY,
 )
@@ -1070,6 +1107,7 @@ def diagnose_device(
     lookback_hours: float = 24,
     organization_id: str | None = None,
     fleet_id: str | None = None,
+    include_probe: bool = False,
 ) -> str:
     try:
         client = get_client()
@@ -1098,9 +1136,12 @@ def diagnose_device(
         reports = []
         for target in targets[:15]:
             try:
-                reports.append(_diagnose_one(client, target, org_id, start, end))
+                report = _diagnose_one(client, target, org_id, start, end)
             except AdmiralAPIError as exc:
                 reports.append({"device": target, "error": str(exc)})
+                continue
+            _attach_network_path(client, report, target, org_id, live=include_probe and bool(device))
+            reports.append(report)
 
         return _dumps(
             {
@@ -1809,7 +1850,11 @@ def discard_local_override(
         "Run the structured on-device diagnostics probe now (POST /devices/{id}/diagnostics/probe): sections "
         "such as network, time, identity, wireless, storage, boot, thermal, workload, services (default all). "
         "timeout_ms caps the device side (max 20000). Live round-trip: device must be online (503/504 "
-        "otherwise). Items marked sensitive come back as [redacted] for non-staff callers. Audited."
+        "otherwise). Items marked sensitive come back as [redacted] for non-staff callers. Audited. The network "
+        "section reports packet loss and path quality on newer device agents (loss to the gateway, DNS server and "
+        "cloud with rtt/jitter, per-hop loss, interface errors); network_path then lists those items (sensitive "
+        "per-hop rows excluded) with the backend's verdict {code, cause, evidence, confidence}: local link, "
+        "NIC/cable errors, upstream ISP/WAN, lossy DNS server path or resolver misconfigured. Omitted on older agents."
     ),
     annotations=ToolAnnotations(readOnlyHint=True, idempotentHint=True),
 )
@@ -1826,7 +1871,11 @@ def probe_device(
         report = get_client().probe_device(
             found["match"]["id"], org_id=found["organization_id"], sections=sections, timeout_ms=timeout_ms
         )
-        return _dumps({"device": found["match"], "report": report})
+        out: dict[str, Any] = {"device": found["match"], "report": report}
+        path = ts.network_path(report)
+        if path is not None:
+            out["network_path"] = path
+        return _dumps(out)
     except Exception as exc:
         return _err(exc)
 
@@ -4588,7 +4637,9 @@ _OFFLINE_READABLE = [
         "Answer 'what is wrong with this device right now?' in one call. Gathers, with the caller's own permissions: "
         "observed state (live when the device is online), the backend diagnosis, a fresh on-device probe (one per 5 s per "
         "device; on 429 the previous result is reused and the report says so), recent error logs (distilled to signatures), "
-        "notable events, workload state and progress operations, storage fullness, clock sync, transport/connectivity and "
+        "notable events, workload state and progress operations, storage fullness, clock sync, transport/connectivity, "
+        "packet loss and path quality (loss to gateway/DNS/cloud, per-hop loss, interface errors, with the backend's likely-cause "
+        "verdict: local link, NIC/cable, upstream ISP/WAN, DNS path or resolver; in network_path when the device reports it) and "
         "desired-vs-observed drift (assigned generation vs applied). Returns {summary, overall, findings[], support, checked}; "
         "each finding has severity, area, finding, short quoted evidence, likely_cause, what_you_can_do (concrete steps), a "
         "docs.admrl.co link and whether Admiral support is needed. symptom (optional free text, e.g. 'screen is black', "
@@ -4649,6 +4700,9 @@ def troubleshoot_device(
             },
             "checked": ts.checked_sources(ev),
         }
+        path = ts.network_path(ev.get("probe"))
+        if path is not None:
+            out["network_path"] = path
         if docs_note:
             out["docs_note"] = docs_note
         if not online:
@@ -4666,7 +4720,8 @@ def troubleshoot_device(
 @mcp.tool(
     description=(
         "Check whether a device can talk to Admiral: link (interfaces/IPs), DNS, TCP, NTP/clock, NATS/transport (kind, latency, "
-        "reconnects, last backend contact, telemetry stream) and probe results, as a pass/warn/error table plus ranked findings "
+        "reconnects, last backend contact, telemetry stream), packet loss and path quality (path_quality check and network_path "
+        "with the backend's likely-cause verdict, on agents that report loss) and probe results, as a pass/warn/error table plus ranked findings "
         "and the classic causes (captive portal, DNS, firewall to the backend, TLS inspection/proxy, clock skew, weak link). Runs a "
         "network+time probe when the device is online (rate limit one per 5 s per device; on 429 the previous result is reused and "
         "stated). Offline devices: shows last seen, last known transport/clock and what to check on site. Read-only."
@@ -4726,6 +4781,9 @@ def check_device_connectivity(
             suspected.append(ts._CONNECTIVITY_CAUSES[5])
         if "backend_unreachable" in codes or not online:
             suspected.append(ts._CONNECTIVITY_CAUSES[0])
+        path = ts.network_path(ev.get("probe"))
+        if path and path.get("verdict"):
+            suspected.insert(0, f"Measured on the device: {path['verdict']['cause']} ({path['verdict'].get('confidence') or 'unknown'} confidence).")
         out: dict[str, Any] = {
             "summary": summary,
             "device": ts.device_header(ev),
@@ -4739,6 +4797,8 @@ def check_device_connectivity(
             "support": ts.support_verdict(findings),
             "checked": ts.checked_sources(ev),
         }
+        if path is not None:
+            out["network_path"] = path
         if docs_note:
             out["docs_note"] = docs_note
         return _dumps(out)

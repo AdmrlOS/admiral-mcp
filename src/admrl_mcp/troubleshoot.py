@@ -223,6 +223,16 @@ KB: dict[str, dict[str, Any]] = {
         docs="device stalled or offline network",
         support=False,
     ),
+    "network_path_quality": dict(
+        area="connectivity",
+        cause="The device's own probe measured packet loss on the network path (gateway, DNS server, cloud, or per hop).",
+        steps=[
+            "Run the probe again (probe_device with sections=['network']) to see whether the loss persists.",
+            "Compare loss to the gateway with loss to the cloud: loss already at the gateway is the local link; loss only further out is the ISP/WAN.",
+        ],
+        docs="device network connectivity packet loss",
+        support=False,
+    ),
     "dns_failure": dict(
         area="connectivity",
         cause="The device cannot resolve names. Typical: the DHCP-supplied DNS server is down or blocks external names, or a captive portal intercepts DNS.",
@@ -609,6 +619,15 @@ def clear_probe_cache() -> None:
     _probe_cache.clear()
 
 
+def cached_probe(device_id: str, max_age_s: float = 300) -> tuple[dict[str, Any], int] | None:
+    """The last probe report this process saw for the device and its age in seconds, if younger than max_age_s."""
+    cached = _probe_cache.get(device_id)
+    if not cached:
+        return None
+    age = time.time() - cached[0]
+    return (cached[1], int(age)) if age <= max_age_s else None
+
+
 def run_probe(
     client: Any, device_id: str, org_id: str, sections: list[str] | None = None
 ) -> tuple[dict[str, Any] | None, str]:
@@ -657,8 +676,81 @@ def probe_items(report: dict[str, Any] | None) -> list[dict[str, Any]]:
     return out
 
 
+# Packet-loss / path-quality items (newer agents): network.loss_gateway, loss_dns, loss_cloud, loss_udp,
+# hop_<n> (sensitive, so dropped by probe_items for non-staff), path_verdict, iface_errors[_<ifname>].
+_PATH_KEY_RE = re.compile(r"^(?:network\.)?(?:loss_[a-z0-9_]+|hop_\d+|path_verdict|iface_errors(?:_\S+)?)$", re.I)
+
+#: What to do per backend networkVerdict.code (admiral src/services/networkverdict).
+_PATH_STEPS: dict[str, list[str]] = {
+    "local_link": [
+        "Check the local link first: reseat or swap the Ethernet cable, try another switch port, or improve the Wi-Fi signal (move the access point closer or use Ethernet).",
+        "If the device has a second interface, try it to confirm the link is at fault.",
+    ],
+    "nic_errors": [
+        "Interface error counters are growing: replace the cable and try another switch port; check the port for duplex/speed mismatch.",
+        "If errors continue on a known-good cable and port, the device's network interface may be faulty.",
+    ],
+    "upstream": [
+        "The local link is clean: the loss is upstream of the gateway. Check the site's router/WAN link and contact the ISP with the loss figures.",
+        "Compare with another device on the same site: the same loss confirms the WAN.",
+    ],
+    "dns_path_lossy": [
+        "Packets to the DNS server are being lost: check the DNS server's host and the path to it, or point the device at a closer resolver (static DNS).",
+    ],
+    "dns_resolver": [
+        "The DNS server is reachable but lookups fail (or it does not answer at all): check the DNS server address the device uses and that it answers DNS on port 53; set a static DNS if DHCP hands out a wrong one.",
+    ],
+    "udp_lossy": [
+        "Only UDP is lossy: a firewall, NAT or traffic shaper is dropping UDP. Allow the device's outbound UDP or accept the TCP path.",
+    ],
+}
+
+
+def is_path_item(item: dict[str, Any]) -> bool:
+    return bool(_PATH_KEY_RE.match(str(item.get("key") or "")))
+
+
+def _verdict(report: Any) -> dict[str, Any] | None:
+    """The backend-derived networkVerdict of a probe report (absent on older backends), scrubbed."""
+    v = report.get("networkVerdict") if isinstance(report, dict) else None
+    if not isinstance(v, dict) or not v.get("cause"):
+        return None
+    return {
+        "code": v.get("code"),
+        "cause": scrub(v.get("cause"), 240),
+        "confidence": v.get("confidence"),
+        "evidence": [scrub(e) for e in (v.get("evidence") or []) if e][:8],
+    }
+
+
+def network_path(report: Any) -> dict[str, Any] | None:
+    """Packet loss / path quality from a probe report: the loss, path and interface-error items (sensitive
+    per-hop rows excluded) plus the backend's networkVerdict {code, cause, evidence, confidence}.
+
+    None when the device's agent does not report these items and the backend sent no verdict.
+    """
+    if not isinstance(report, dict):
+        return None
+    items = [
+        {k: v for k, v in (("key", i["key"]), ("label", i["label"]), ("value", scrub(i["value"])), ("level", i["level"]), ("hint", i.get("hint"))) if v}
+        for i in probe_items(report)
+        if is_path_item(i)
+    ]
+    verdict = _verdict(report)
+    if not items and verdict is None:
+        return None
+    levels = [i.get("level") for i in items]
+    worst = next((lv for lv in ("error", "warn", "info", "ok") if lv in levels), None)
+    out: dict[str, Any] = {"worst": worst, "items": items}
+    if verdict is not None:
+        out["verdict"] = verdict
+    return out
+
+
 def classify_item(item: dict[str, Any]) -> str:
-    """dns | nats | ntp | tcp | gateway | link | other. Item keys are device-defined, so match loosely."""
+    """path | dns | nats | ntp | tcp | gateway | link | other. Item keys are device-defined, so match loosely."""
+    if is_path_item(item):
+        return "path"
     text = f"{item.get('key', '')} {item.get('label', '')}".lower()
     for name, needles in (
         ("dns", ("dns", "resolv")),
@@ -1226,6 +1318,7 @@ def _events(ev: dict[str, Any]) -> list[dict[str, Any]]:
 def _probe(ev: dict[str, Any]) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     generic: dict[str, list[dict[str, Any]]] = {}
+    path: list[dict[str, Any]] = []
     for item in probe_items(ev.get("probe")):
         if item["level"] not in ("warn", "error"):
             continue
@@ -1233,6 +1326,9 @@ def _probe(ev: dict[str, Any]) -> list[dict[str, Any]]:
         line = _item_line(item)
         steps = [item["hint"]] if item.get("hint") else None
         err = item["level"] == "error"
+        if cls == "path":
+            path.append(item)
+            continue
         if cls == "dns":
             f = finding("dns_failure", "critical" if err else "warning", "DNS lookups from the device are failing", [line])
         elif cls in ("nats", "tcp"):
@@ -1263,7 +1359,41 @@ def _probe(ev: dict[str, Any]) -> list[dict[str, Any]]:
         )
         f["_docs_query"] = f"{section} device diagnostics troubleshooting"
         out.append(f)
+    out.extend(_path_findings(ev.get("probe"), path, out))
     return out
+
+
+def _path_findings(report: Any, bad: list[dict[str, Any]], others: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """One network_path_quality finding from the warn/error loss items and the backend verdict. A DNS verdict
+    with clean loss items (resolver misconfigured) refines the dns_failure finding's likely cause instead."""
+    verdict = _verdict(report)
+    code = (verdict or {}).get("code")
+    if verdict and code in ("dns_path_lossy", "dns_resolver"):
+        for f in others:
+            if f["code"] == "dns_failure":
+                f["likely_cause"] = verdict["cause"]
+                f["what_you_can_do"] = _PATH_STEPS[code] + [s for s in f["what_you_can_do"] if s not in _PATH_STEPS[code]]
+    if not bad:
+        return []
+    err = any(i["level"] == "error" for i in bad)
+    text = "Packet loss or errors on the network path"
+    if verdict:
+        text += f"; likely cause: {verdict['cause'].split(':')[0]}"
+    hints = [i["hint"] for i in bad if i.get("hint")]
+    steps = list(dict.fromkeys(_PATH_STEPS.get(code or "", []) + hints + KB["network_path_quality"]["steps"]))
+    evidence = [_item_line(i) for i in bad[:3]]
+    if verdict:
+        evidence.append(f"verdict ({verdict.get('confidence') or 'unknown'} confidence): {verdict['cause']}")
+    return [
+        finding(
+            "network_path_quality",
+            "critical" if err else "warning",
+            text,
+            evidence,
+            cause=verdict["cause"] if verdict else None,
+            steps=steps[:4],
+        )
+    ]
 
 
 ANALYSERS: list[Callable[[dict[str, Any]], list[dict[str, Any]]]] = [
@@ -1368,8 +1498,12 @@ def connectivity_checks(ev: dict[str, Any]) -> list[dict[str, Any]]:
     else:
         s, d = from_probe("link")
         checks.append({"check": "link", "status": s, "detail": d})
-    for cls, name in (("dns", "dns"), ("tcp", "tcp"), ("ntp", "ntp"), ("nats", "backend_probe"), ("gateway", "gateway")):
+    for cls, name in (("dns", "dns"), ("tcp", "tcp"), ("ntp", "ntp"), ("nats", "backend_probe"), ("gateway", "gateway"), ("path", "path_quality")):
         s, d = from_probe(cls)
+        if cls == "path":
+            verdict = _verdict(ev.get("probe"))
+            if verdict:
+                d = f"likely cause: {verdict['cause']} ({verdict.get('confidence') or 'unknown'} confidence); {d}"
         checks.append({"check": name, "status": s, "detail": d})
     if tr:
         bad = tr.get("kind") == "wss" or (tr.get("instability") or 0) > 0
