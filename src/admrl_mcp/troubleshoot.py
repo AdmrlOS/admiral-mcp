@@ -677,7 +677,8 @@ def probe_items(report: dict[str, Any] | None) -> list[dict[str, Any]]:
 
 
 # Packet-loss / path-quality items (newer agents): network.loss_gateway, loss_dns, loss_cloud, loss_udp,
-# hop_<n> (sensitive, so dropped by probe_items for non-staff), path_verdict, iface_errors[_<ifname>].
+# hop_<n> (customer-visible on current agents; older agents flag them sensitive and probe_items drops
+# them), path_verdict, iface_errors[_<ifname>].
 _PATH_KEY_RE = re.compile(r"^(?:network\.)?(?:loss_[a-z0-9_]+|hop_\d+|path_verdict|iface_errors(?:_\S+)?)$", re.I)
 
 #: What to do per backend networkVerdict.code (admiral src/services/networkverdict).
@@ -724,8 +725,9 @@ def _verdict(report: Any) -> dict[str, Any] | None:
 
 
 def network_path(report: Any) -> dict[str, Any] | None:
-    """Packet loss / path quality from a probe report: the loss, path and interface-error items (sensitive
-    per-hop rows excluded) plus the backend's networkVerdict {code, cause, evidence, confidence}.
+    """Packet loss / path quality from a probe report: the loss, path, per-hop and interface-error items
+    (rows flagged sensitive, e.g. hops from older agents, excluded) plus the backend's networkVerdict
+    {code, cause, evidence, confidence}.
 
     None when the device's agent does not report these items and the backend sent no verdict.
     """
