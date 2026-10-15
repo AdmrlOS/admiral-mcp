@@ -438,6 +438,7 @@ _SYMPTOM_AREAS = [
     (("update", "upgrade", "stuck", "version", "rollout", "deploy", "config", "pull", "download", "image"), {"update", "drift", "workload"}),
     (("clock", "time", "date", "ntp"), {"time"}),
     (("slow", "cpu", "hot", "temperature", "lag"), {"resources", "workload"}),
+    (("gpu", "nvidia", "cuda", "vram"), {"probe", "hardware", "resources"}),
 ]
 
 # ------------------------------------------------------------------ helpers ---

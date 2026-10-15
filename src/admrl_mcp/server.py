@@ -430,7 +430,13 @@ def get_device_network(device: str, organization_id: str | None = None) -> str:
         return _err(exc)
 
 
-@mcp.tool(description="Hardware / OS specification: product, CPUs, disks, network NICs, versions, boot slot.", annotations=_READ_ONLY)
+@mcp.tool(
+    description=(
+        "Hardware / OS specification: product, CPUs, GPUs, disks, network NICs, versions, boot slot. gpus[] lists model, vendor, "
+        "pci, integrated; NVIDIA GPUs also carry driverVersion and cudaVersion (use these for driver/CUDA version questions)."
+    ),
+    annotations=_READ_ONLY,
+)
 def get_device_specs(device: str, organization_id: str | None = None) -> str:
     try:
         found = _resolve_device(device, organization_id)
@@ -502,14 +508,19 @@ def get_device_stats(device: str, organization_id: str | None = None) -> str:
         return _err(exc)
 
 
-_METRIC_CHOICES = ("cpu", "memory", "disk", "network_rx", "network_tx")
+# GPU metrics exist only for devices with a discrete NVIDIA GPU; names follow the backend metric types.
+_GPU_METRIC_CHOICES = ("gpu_temperature", "gpu_power", "gpu_memory", "gpu_utilization")
+_METRIC_CHOICES = ("cpu", "memory", "disk", "network_rx", "network_tx") + _GPU_METRIC_CHOICES
 
 
 @mcp.tool(
     description=(
         "Historical metric timeseries for a device (VictoriaMetrics), for questions about trends "
         "over time — use get_device_stats for the current snapshot. metric is one of cpu, memory, "
-        "disk, network_rx, network_tx (percentage gauges except network, which is bytes/second rate). "
+        "disk, network_rx, network_tx (percentage gauges except network, which is bytes/second rate), or for "
+        "devices with an NVIDIA GPU gpu_temperature (Celsius), gpu_power (watts), gpu_memory (used bytes, "
+        "with the total) and gpu_utilization (percent); GPU series are returned per GPU, identified by the "
+        "series labels, and are null on devices without an NVIDIA GPU. "
         "lookback_hours defaults to 24; the server picks the bucket interval (5m under 24h, 30m to 7d, "
         "1h beyond). Returns meta (metric, unit, start, end, interval) and series with labels and "
         "[unix_ts, value] points. series is null when the window has no data — not an error; "
@@ -1848,7 +1859,9 @@ def discard_local_override(
 @mcp.tool(
     description=(
         "Run the structured on-device diagnostics probe now (POST /devices/{id}/diagnostics/probe): sections "
-        "such as network, time, identity, wireless, storage, boot, thermal, workload, services (default all). "
+        "such as network, time, identity, wireless, storage, boot, thermal, workload, services, gpu (default all). "
+        "The gpu section (NVIDIA GPUs) has gpu.power_<n> (draw vs limit, e.g. '42 W of 215 W limit'), "
+        "gpu.memory_<n> (VRAM used vs total) and gpu.probe; read it for GPU power and memory questions. "
         "timeout_ms caps the device side (max 20000). Live round-trip: device must be online (503/504 "
         "otherwise). Items marked sensitive come back as [redacted] for non-staff callers. Audited. The network "
         "section reports packet loss and path quality on newer device agents (loss to the gateway, DNS server and "
