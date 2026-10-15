@@ -84,7 +84,7 @@ def test_gpu_symptom_maps_to_probe_area():
     assert "probe" in areas
 
 
-@pytest.mark.parametrize("metric", ["gpu_temperature", "gpu_power", "gpu_memory", "gpu_utilization"])
+@pytest.mark.parametrize("metric", ["gpu_temperature", "gpu_power", "gpu_power_limit", "gpu_memory", "gpu_memory_total", "gpu_utilization"])
 def test_get_device_metrics_accepts_gpu_metrics(monkeypatch, metric):
     api = FakeAPI()
     series = [{"labels": {"gpu": "0"}, "points": [[1, 2]]}, {"labels": {"gpu": "1"}, "points": [[1, 3]]}]
@@ -114,5 +114,9 @@ def test_get_device_metrics_still_rejects_unknown_and_lists_gpu_choices():
 
 def test_get_device_metrics_description_documents_gpu_units():
     desc = server.mcp._tool_manager.get_tool("get_device_metrics").description
-    for word in ("gpu_temperature", "Celsius", "gpu_power", "watts", "gpu_memory", "gpu_utilization"):
+    for word in ("gpu_temperature", "Celsius", "gpu_power", "watts", "gpu_power_limit", "gpu_memory", "gpu_memory_total", "total VRAM", "gpu_utilization"):
         assert word in desc
+    assert "with the total" not in desc
+    assert tuple(server._GPU_METRIC_CHOICES) == (
+        "gpu_temperature", "gpu_power", "gpu_power_limit", "gpu_memory", "gpu_memory_total", "gpu_utilization"
+    )

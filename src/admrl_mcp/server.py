@@ -509,7 +509,7 @@ def get_device_stats(device: str, organization_id: str | None = None) -> str:
 
 
 # GPU metrics exist only for devices with a discrete NVIDIA GPU; names follow the backend metric types.
-_GPU_METRIC_CHOICES = ("gpu_temperature", "gpu_power", "gpu_memory", "gpu_utilization")
+_GPU_METRIC_CHOICES = ("gpu_temperature", "gpu_power", "gpu_power_limit", "gpu_memory", "gpu_memory_total", "gpu_utilization")
 _METRIC_CHOICES = ("cpu", "memory", "disk", "network_rx", "network_tx") + _GPU_METRIC_CHOICES
 
 
@@ -518,8 +518,9 @@ _METRIC_CHOICES = ("cpu", "memory", "disk", "network_rx", "network_tx") + _GPU_M
         "Historical metric timeseries for a device (VictoriaMetrics), for questions about trends "
         "over time — use get_device_stats for the current snapshot. metric is one of cpu, memory, "
         "disk, network_rx, network_tx (percentage gauges except network, which is bytes/second rate), or for "
-        "devices with an NVIDIA GPU gpu_temperature (Celsius), gpu_power (watts), gpu_memory (used bytes, "
-        "with the total) and gpu_utilization (percent); GPU series are returned per GPU, identified by the "
+        "devices with an NVIDIA GPU gpu_temperature (Celsius), gpu_power (watts), gpu_power_limit (enforced "
+        "board power limit, watts), gpu_memory (used bytes), gpu_memory_total (total VRAM bytes) and "
+        "gpu_utilization (percent); GPU series are returned per GPU, identified by the "
         "series labels, and are null on devices without an NVIDIA GPU. "
         "lookback_hours defaults to 24; the server picks the bucket interval (5m under 24h, 30m to 7d, "
         "1h beyond). Returns meta (metric, unit, start, end, interval) and series with labels and "
