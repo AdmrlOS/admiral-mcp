@@ -154,6 +154,14 @@ def _dumps(payload: Any) -> str:
     return json.dumps(payload, default=str, indent=2)
 
 
+_NEEDS_CONFIGS_VIEW = "Configuration details require the View configurations permission (configs.view)."
+_PERMISSION_HINT = (
+    "Your role is not permitted to do this. Reading configurations or rollouts (and their contents) needs the View "
+    "configurations permission (configs.view); rollouts also accept the manage-rollouts permission. Ask an organisation "
+    "admin for access."
+)
+
+
 def _err(exc: Exception) -> str:
     if isinstance(exc, NeedsChoice):
         return _dumps(
@@ -175,6 +183,9 @@ def _err(exc: Exception) -> str:
                 "The organisation lacks a feature this request needs (a billing/entitlement gate, not a fault). "
                 "Enable it in the dashboard, or remove the setting that needs it."
             )
+        elif exc.status == 403:
+            out["permission_denied"] = True
+            out["hint"] = _PERMISSION_HINT
         elif exc.status == 409:
             out["conflict"] = True
             out["hint"] = "The resource changed or already exists. Re-read it and retry."
@@ -484,14 +495,17 @@ def get_device_system_services(
         return _err(exc)
 
 
-@mcp.tool(description="Current workload container state on a device (running/stopped/exited/unknown), plus live configuration identity in running (configurationName, image, version). Offline devices often report state=unknown.", annotations=_READ_ONLY)
+@mcp.tool(description="Current workload container state on a device (running/stopped/exited/unknown), plus live configuration identity in running (configurationName, image, version). Offline devices often report state=unknown. running and latestReport.configuration are withheld (null) without the View configurations permission.", annotations=_READ_ONLY)
 def get_device_workload(device: str, organization_id: str | None = None) -> str:
     try:
         found = _resolve_device(device, organization_id)
         if not found.get("match"):
             return _dumps(found)
         workload = get_client().get_device_workload(found["match"]["id"], org_id=found["organization_id"])
-        return _dumps({"device": found["match"], "workload": workload})
+        out: dict[str, Any] = {"device": found["match"], "workload": workload}
+        if isinstance(workload, dict) and workload.get("running") is None and (workload.get("state") or workload.get("latestReport")):
+            out["note"] = f"The running configuration (image, command, environment) is withheld if you lack access to it. {_NEEDS_CONFIGS_VIEW}"
+        return _dumps(out)
     except Exception as exc:
         return _err(exc)
 
@@ -1567,6 +1581,20 @@ def _etag(response: Any) -> str | None:
     return tag.removeprefix("W/").strip('"')
 
 
+def _redact_render(result: Any) -> Any:
+    """Show secret file content as "[redacted]" (the API sends it base64-encoded); never surface or decode it."""
+    if not isinstance(result, dict) or not isinstance(result.get("bundle"), dict):
+        return result
+    bundle = result["bundle"]
+    workload = bundle.get("workload")
+    groups = [bundle.get("secrets"), workload.get("secretFiles") if isinstance(workload, dict) else None]
+    for files in groups:
+        for f in files if isinstance(files, list) else []:
+            if isinstance(f, dict) and f.get("content") is not None:
+                f["content"] = "[redacted]"
+    return result
+
+
 def _json_or_text(response: Any) -> Any:
     try:
         return response.json()
@@ -1672,16 +1700,44 @@ def get_device_document(device: str, format: str = "json", organization_id: str 
             return _dumps(found)
         response = get_client().get_device_document(found["match"]["id"], org_id=found["organization_id"], fmt=fmt)
         body = response.text if fmt == "yaml" else _json_or_text(response)
-        return _dumps(
-            {
-                "device": found["match"],
-                "resource_version": _etag(response),
-                "content_type": response.headers.get("content-type"),
-                "document": body,
-            }
-        )
+        out = {
+            "device": found["match"],
+            "resource_version": _etag(response),
+            "content_type": response.headers.get("content-type"),
+            "document": body,
+        }
+        if _workload_override_missing(body):
+            out["note"] = f"spec.workload.override is absent: either there is none or it is withheld. {_NEEDS_CONFIGS_VIEW}"
+        return _dumps(out)
     except Exception as exc:
         return _err(exc)
+
+
+def _workload_override_missing(doc: Any) -> bool:
+    spec = doc.get("spec") if isinstance(doc, dict) else None
+    workload = spec.get("workload") if isinstance(spec, dict) else None
+    return isinstance(workload, dict) and not workload.get("override")
+
+
+def _patch_touches_override(patch: dict[str, Any]) -> bool:
+    spec = patch.get("spec")
+    workload = spec.get("workload") if isinstance(spec, dict) else None
+    if isinstance(spec, dict) and "workload" in spec and workload is None:
+        return True
+    return isinstance(workload, dict) and "override" in workload
+
+
+def _check_override_patch(client: Any, device: dict[str, Any], org_id: str, patch: dict[str, Any]) -> None:
+    """Refuse an override edit when the stored override is withheld from this caller (it would be written blind)."""
+    if not _patch_touches_override(patch):
+        return
+    try:
+        current = client.get(f"devices/{device['id']}/configuration", org_id=org_id)
+    except AdmiralAPIError as exc:
+        if exc.status != 403:
+            raise
+        current = {"has_override": True}
+    _refuse_hidden_override(current, device)
 
 
 @mcp.tool(
@@ -1690,7 +1746,8 @@ def get_device_document(device: str, format: str = "json", organization_id: str 
         "application/merge-patch+json), e.g. {\"spec\": {\"system\": {\"screenshots\": \"disabled\"}}} or "
         "{\"spec\": {\"fleet\": \"<fleetId>\"}} (fleet move). Writes go through the platform services, bump "
         "metadata.generation and push desired state to the device. spec.workload.from, spec.system.updates and "
-        "spec.secrets are read-only. if_match = resource_version from get_device_document (409 on mismatch). "
+        "spec.secrets are read-only. Edits to spec.workload.override are refused when the stored override is withheld from you "
+        "(needs View configurations). if_match = resource_version from get_device_document (409 on mismatch). "
         "Returns push outcome (X-Admrl-Push: sent|failed|skipped|unavailable), changed paths and the new document. "
         "Destructive: without confirm=true it only shows the diff; confirm after the user explicitly agrees."
     ),
@@ -1711,6 +1768,7 @@ def patch_device_document(
         found = _resolve_device(device, organization_id)
         if not found.get("match"):
             return _dumps(found)
+        _check_override_patch(get_client(), found["match"], found["organization_id"], patch)
         if confirm is not True:
             current = get_client().get_device_document(found["match"]["id"], org_id=found["organization_id"])
             doc = _json_or_text(current)
@@ -1750,7 +1808,7 @@ def patch_device_document(
 @mcp.tool(
     description=(
         "Render the desired-state bundle a device would receive (POST /devices/{id}/document:render): bundle "
-        "(secrets stripped, credentials redacted), revision, diff [{path, from, to}] against what the device "
+        "(secret file content shown as [redacted], credentials redacted; workload section withheld without View configurations), revision, diff [{path, from, to}] against what the device "
         "last reported, converged, pushed. Dry run by default (nothing is sent). push=true also pushes the "
         "bundle to the device: that needs confirm=true (without it the dry-run diff is returned as a preview)."
     ),
@@ -1776,7 +1834,11 @@ def render_device_document(device: str, push: bool = False, organization_id: str
         result = get_client().render_device_document(
             found["match"]["id"], org_id=found["organization_id"], dry_run=not push
         )
-        return _dumps({"device": found["match"], "dry_run": not push, "render": result})
+        out = {"device": found["match"], "dry_run": not push, "render": _redact_render(result)}
+        bundle = result.get("bundle") if isinstance(result, dict) else None
+        if isinstance(bundle, dict) and not bundle.get("workload"):
+            out["note"] = f"The bundle has no workload section and workload.* diff entries are omitted when withheld. {_NEEDS_CONFIGS_VIEW}"
+        return _dumps(out)
     except Exception as exc:
         return _err(exc)
 
@@ -2259,7 +2321,7 @@ def create_rollout(
 
 @mcp.tool(
     description=(
-        "Rollout detail (GET /rollouts/{id}): status (pending, scheduled, in_progress, paused, completed, failed, "
+        "Rollout detail (GET /rollouts/{id}; needs View configurations or manage-rollouts, 403 otherwise): status (pending, scheduled, in_progress, paused, completed, failed, "
         "cancelled, rolled_back), pausedReason, strategy, counts {targets, admitted, inFlight, converged, failed, "
         "stuck, pendingReconnect}, legacy stats, config/version and timings."
     ),
@@ -2502,7 +2564,8 @@ def _safe(fn: Any, warnings: list[str], label: str) -> Any:
     try:
         return fn()
     except Exception as exc:  # a failing side lookup must not hide the main answer
-        warnings.append(f"{label}: {exc}")
+        denied = isinstance(exc, AdmiralAPIError) and exc.status == 403
+        warnings.append(f"{label}: not permitted (403). {_NEEDS_CONFIGS_VIEW}" if denied else f"{label}: {exc}")
         return None
 
 
@@ -2539,17 +2602,26 @@ def _assignment(payload: Any) -> dict[str, Any]:
         return {"configuration": None, "assignment": None, "resolved_version": None}
     cfg = payload.get("configuration") or {}
     resolved = payload.get("config_version")
-    return {
+    out = {
         "configuration": {"id": cid, "name": cfg.get("name"), "status": cfg.get("status"), "latest_version": cfg.get("latest_version")},
         "assignment": resolved if payload.get("is_pinned") else "latest",
         "resolved_version": resolved,
     }
+    if not payload.get("configuration") and not payload.get("configuration_spec"):
+        out["details_withheld"] = _NEEDS_CONFIGS_VIEW  # name and spec are withheld; ids and versions are not
+    return out
 
 
 def _fleet_assignment(client: AdmiralClient, org_id: str, fleet_id: str) -> tuple[dict[str, Any], dict[str, Any]]:
     payload = client.get(f"fleets/{fleet_id}/configuration", org_id=org_id)
     payload = payload if isinstance(payload, dict) else {}
-    return _assignment(payload), _norm_or_empty(payload.get("configuration_spec"))
+    assignment = _assignment(payload)
+    # None (not {}) when withheld, so callers never diff against an empty spec as if it were the real one.
+    return assignment, (None if "details_withheld" in assignment else _norm_or_empty(payload.get("configuration_spec")))
+
+
+def _diff_or_none(before: dict[str, Any] | None, after: dict[str, Any] | None) -> list[dict[str, Any]] | None:
+    return None if before is None or after is None else ops.spec_diff(before, after)
 
 
 def _norm_or_empty(spec: Any) -> dict[str, Any]:
@@ -2634,7 +2706,7 @@ def _delivery_warnings(usage: dict[str, list[dict[str, Any]]], new_version: int 
     description=(
         "List configurations (GET /configurations): id, name, status (draft, active, testing, deprecated, archived; matched case-insensitively), "
         "latest_version and which fleets use each one (fleet name + 'latest' or the pinned version). Filter by search "
-        "(name/description) and status. Read-only. Next: get_configuration for the spec, edit_configuration to change it."
+        "(name/description) and status. Needs the View configurations permission (the list is empty without it). Read-only. Next: get_configuration for the spec, edit_configuration to change it."
     ),
     annotations=_READ_ONLY,
 )
@@ -2684,6 +2756,7 @@ def list_configurations(
                 "summary": f"{len(rows)} of {total} configuration(s)" + (f" matching {search!r}" if search else ""),
                 "organization_id": org_id,
                 "configurations": rows,
+                **({"note": "An empty list can also mean your role lacks the View configurations permission (configs.view)."} if not rows else {}),
                 "pagination": pagination,
                 "next": [{"tool": "get_configuration", "why": "Read the spec and version history of one configuration."}],
             }
@@ -2697,7 +2770,7 @@ def list_configurations(
         "One configuration in full: metadata, the spec of the latest (or the requested) version, recent version history "
         "and the fleets assigned to it (GET /configurations/{id}/details, /versions, /versions/{n}). configuration = name "
         "or UUID (ambiguous names return candidates). Environment values whose names look like credentials are masked "
-        "unless show_secret_env=true. Read-only."
+        "unless show_secret_env=true. Needs the View configurations permission (403 otherwise). Read-only."
     ),
     annotations=_READ_ONLY,
 )
@@ -3411,7 +3484,7 @@ def assign_fleet_configuration(
             body["version"] = pin
         if confirm is not True:
             target_spec = _safe(lambda: client.get(f"configurations/{cid}/versions/{pin or latest}", org_id=org_id), [], "target spec")
-            target_rows = ops.spec_diff(before_spec, (target_spec or {}).get("spec") if isinstance(target_spec, dict) else {})
+            target_rows = _diff_or_none(before_spec, (target_spec or {}).get("spec") if isinstance(target_spec, dict) else {})
             return _gate(
                 confirm,
                 "assign_fleet_configuration",
@@ -3428,7 +3501,7 @@ def assign_fleet_configuration(
         confirmed = str(after_cfg.get("id", "")).lower() == str(cid).lower() and (
             after["assignment"] == "latest" if wants_latest else after["assignment"] == pin
         )
-        rows = ops.spec_diff(before_spec, after_spec)
+        rows = _diff_or_none(before_spec, after_spec)
         text = lambda a: f"{(a['configuration'] or {}).get('name')} @ {a['assignment']}" if a["configuration"] else "none"  # noqa: E731
         return _dumps(
             {
@@ -3970,6 +4043,25 @@ def move_device_to_fleet(
         return _err(exc)
 
 
+def _config_withheld(payload: Any) -> bool:
+    """True when GET /devices/{id}/configuration returned identity only (contents need configs.view)."""
+    return isinstance(payload, dict) and bool(payload.get("configuration_id")) and "merged_config" not in payload and "base_config" not in payload
+
+
+def _override_hidden(payload: Any) -> bool:
+    """True when the device has an override but its content was not returned."""
+    return isinstance(payload, dict) and bool(payload.get("has_override")) and not (payload.get("configuration_override") or payload.get("host_override"))
+
+
+def _refuse_hidden_override(payload: Any, device: dict[str, Any]) -> None:
+    if _override_hidden(payload):
+        raise ToolRefusal(
+            f"Refused: {device.get('name') or device.get('id')} has a configuration override whose content is withheld from you, "
+            f"so editing it could overwrite it blindly. {_NEEDS_CONFIGS_VIEW} Nothing was changed.",
+            device=device,
+        )
+
+
 def _device_config_view(payload: Any) -> dict[str, Any]:
     payload = payload if isinstance(payload, dict) else {}
     base, merged = ops.norm_spec(payload.get("base_config")), ops.norm_spec(payload.get("merged_config"))
@@ -3981,6 +4073,7 @@ def _device_config_view(payload: Any) -> dict[str, Any]:
         "resolved_version": payload.get("config_version"),
         "has_override": bool(payload.get("has_override")),
         "override": payload.get("configuration_override", payload.get("host_override")),
+        "details_withheld": _NEEDS_CONFIGS_VIEW if _config_withheld(payload) else None,
         "overridden_paths": payload.get("overridden_paths") or [],
         "overridden_fields": ops.spec_diff(base, merged),
         "merged": ops.mask_spec(merged),
@@ -4006,11 +4099,16 @@ def get_device_configuration(device: str, organization_id: str | None = None) ->
         payload = get_client().get(f"devices/{found['match']['id']}/configuration", org_id=found["organization_id"])
         view = _device_config_view(payload)
         cfg = view["configuration"]
-        text = (
-            f"{cfg.get('name')} @ {view['assignment']}" + (f" with an override on {len(view['overridden_fields'])} field(s)" if view["has_override"] else ", no override")
-            if cfg
-            else "no configuration (its fleet has none)"
-        )
+        if view["details_withheld"]:
+            view = {k: v for k, v in view.items() if k not in ("override", "overridden_fields", "overridden_paths", "merged")}
+            text = f"configuration {cfg['id']} @ {view['assignment']}, " + ("has an override (content withheld)" if view["has_override"] else "no override")
+        else:
+            view.pop("details_withheld")
+            text = (
+                f"{cfg.get('name')} @ {view['assignment']}" + (f" with an override on {len(view['overridden_fields'])} field(s)" if view["has_override"] else ", no override")
+                if cfg
+                else "no configuration (its fleet has none)"
+            )
         return _dumps({"summary": f"{found['match'].get('name')}: {text}.", "device": found["match"], **view})
     except Exception as exc:
         return _err(exc)
@@ -4057,6 +4155,7 @@ def set_device_configuration_override(
         client, did, org_id = get_client(), found["match"]["id"], found["organization_id"]
         current = client.get(f"devices/{did}/configuration", org_id=org_id)
         before = _device_config_view(current)
+        _refuse_hidden_override(current, found["match"])
         if not before["configuration"]:
             return _dumps({"error": "The device's fleet has no configuration to override. Assign one first (assign_fleet_configuration).", "device": found["match"]})
         existing = before["override"] or {}
@@ -4227,7 +4326,9 @@ def reset_device_configuration_override(
         if not found.get("match"):
             return _dumps(found)
         client, did, org_id = get_client(), found["match"]["id"], found["organization_id"]
-        before = _device_config_view(client.get(f"devices/{did}/configuration", org_id=org_id))
+        current = client.get(f"devices/{did}/configuration", org_id=org_id)
+        _refuse_hidden_override(current, found["match"])
+        before = _device_config_view(current)
         existing = before["override"] or {}
         wanted = ops.merge_patch(existing, patch)
         # RFC 7386 can create empty parents for absent paths; that is not a real reset.
@@ -4379,6 +4480,7 @@ def list_rollouts(
             {
                 "summary": f"{len(rows)} rollout(s) shown ({total} match the server-side filters)" + (f", type {kind}" if kind else "") + ".",
                 "rollouts": rows,
+                **({"note": "An empty list can also mean your role lacks the View configurations or manage-rollouts permission."} if not rows else {}),
                 "pagination": pagination,
                 "next": [{"tool": "get_rollout", "why": "Detail, strategy and counts for one rollout."}],
             }
@@ -4457,7 +4559,9 @@ def preview_rollout(
                 item["same_version_noop"] = bool(
                     cur_cfg and str(cur_cfg["id"]).lower() == str((cfg or {})["id"]).lower() and current["resolved_version"] == target_version
                 )
-                item["diff"] = ops.spec_diff(current_spec, target_spec)
+                item["diff"] = _diff_or_none(current_spec, target_spec)
+                if item["diff"] is None:
+                    item["diff_note"] = _NEEDS_CONFIGS_VIEW
             return item
 
         plans = _parallel_map(per_fleet, fleet_rows)
