@@ -5576,7 +5576,7 @@ def get_fleet_policies(fleet: str, organization_id: str | None = None) -> str:
         bits = [
             f"ssh {'on' if ssh_on else 'off'}" if ssh_on is not None else None,
             f"usb {usb_v['mode']}" + ("" if usb_v.get("set", True) else " (not set)") if usb_v else None,
-            f"registry proxy {'on' if proxy_on else 'off'}" if proxy_on is not None else None,
+            f"registry proxy {(proxy.get('mode') or 'auto') if proxy_on else 'off'}" if proxy_on is not None else None,
             ("security " + ("enforced" if sec_d.get("enforced") else "not enforced")) if sec_d else None,
             f"custom metrics {'on' if metrics_on else 'off'}" if metrics_on is not None else None,
         ]
@@ -5585,7 +5585,7 @@ def get_fleet_policies(fleet: str, organization_id: str | None = None) -> str:
             "fleet": _ref(fl),
             "ssh": {"enabled": ssh_on} if ssh_on is not None else None,
             "usb": usb_v,
-            "image_proxy": {"enabled": proxy_on, "enabled_at": proxy.get("enabled_at")} if isinstance(proxy, dict) else None,
+            "image_proxy": {"enabled": proxy_on, "mode": proxy.get("mode") or ("auto" if proxy_on else "off"), "enabled_at": proxy.get("enabled_at")} if isinstance(proxy, dict) else None,
             "security": (
                 {
                     **{k: sec_d.get(k) for k in ("require_tpm", "require_secure_boot", "require_disk_encryption", "require_recovery_key_escrow", "enforced")},
@@ -5622,36 +5622,56 @@ def _set_fleet_toggle(
     on_effect: str,
     off_effect: str,
     warnings: list[str] | None = None,
+    mode: str | None = None,
+    modes: tuple[str, ...] = (),
 ) -> str:
+    if mode is not None:
+        if not modes:
+            raise ToolRefusal(f"{what} has no mode.")
+        if mode not in modes:
+            raise ToolRefusal(f"Invalid mode {mode!r}: use one of {', '.join(modes)}.")
+        if not enabled:
+            raise ToolRefusal("mode only applies when enabled=true; omit it when disabling.")
     client, org_id = _ctx(organization_id)
     fl = _find_fleet(client, org_id, fleet)
     fid = fl["id"]
     before = client.get(f"fleets/{fid}/{leaf}", org_id=org_id)
     current = bool(before.get("enabled")) if isinstance(before, dict) else None
-    if current is enabled:
-        raise ToolRefusal(f"No change: {what} is already {'enabled' if enabled else 'disabled'} for {fl.get('name')}.", fleet=_ref(fl))
+    current_mode = (before.get("mode") or modes[0]) if modes and current and isinstance(before, dict) else None
+    # With modes, enabled=true and no mode keeps the current mode when already enabled; auto (the first mode) when newly enabling.
+    target_mode = (mode or current_mode or modes[0]) if modes and enabled else None
+    if current is enabled and current_mode == target_mode:
+        raise ToolRefusal(
+            f"No change: {what} is already {'enabled' if enabled else 'disabled'}"
+            + (f" in {current_mode} mode" if current_mode else "")
+            + f" for {fl.get('name')}.",
+            fleet=_ref(fl),
+        )
+    mode_bit = {"mode": target_mode} if target_mode else {}
     gate = _gate(
         confirm,
         tool,
-        f"{'enable' if enabled else 'disable'} {what} for fleet {fl.get('name')}: {on_effect if enabled else off_effect}",
-        action={"fleet": _ref(fl), "enabled": enabled, "changes": what},
-        args={"fleet": fid, "enabled": enabled},
+        f"{'enable' if enabled else 'disable'} {what}{f' in {target_mode} mode' if target_mode else ''} for fleet {fl.get('name')}: {on_effect if enabled else off_effect}",
+        action={"fleet": _ref(fl), "enabled": enabled, **mode_bit, "changes": what},
+        args={"fleet": fid, "enabled": enabled, **({"mode": mode} if mode else {})},
         org_id=org_id,
-        preview={"before": {"enabled": current}, "after": {"enabled": enabled}, "devices": {"total": fl.get("devices"), "online": fl.get("online")}},
+        preview={"before": {"enabled": current, **({"mode": current_mode} if current_mode else {})}, "after": {"enabled": enabled, **mode_bit}, "devices": {"total": fl.get("devices"), "online": fl.get("online")}},
         warnings=warnings,
     )
     if gate:
         return gate
-    client.put(f"fleets/{fid}/{leaf}", org_id=org_id, json={"enabled": enabled})
+    client.put(f"fleets/{fid}/{leaf}", org_id=org_id, json={"enabled": enabled, **({"mode": mode} if mode else {})})
     after = client.get(f"fleets/{fid}/{leaf}", org_id=org_id)
     now = bool(after.get("enabled")) if isinstance(after, dict) else None
-    confirmed = now is enabled
+    now_mode = ((after.get("mode") or modes[0]) if modes and now and isinstance(after, dict) else None)
+    confirmed = now is enabled and now_mode == target_mode
+    now_bit = {"mode": now_mode} if now_mode else {}
     return _dumps(
         {
-            "summary": f"{fl.get('name')}: {what} {'enabled' if now else 'disabled'}" + ("" if confirmed else " (NOT confirmed by read-back)") + ".",
+            "summary": f"{fl.get('name')}: {what} {'enabled' if now else 'disabled'}" + (f" ({now_mode} mode)" if now_mode else "") + ("" if confirmed else " (NOT confirmed by read-back)") + ".",
             "fleet": _ref(fl),
-            "before": {"enabled": current},
-            "after": {"enabled": now},
+            "before": {"enabled": current, **({"mode": current_mode} if current_mode else {})},
+            "after": {"enabled": now, **now_bit},
             "read_back": {"confirmed": confirmed},
             "next": [{"tool": "get_fleet_policies", "why": "Review all fleet policies.", "arguments": {"fleet": fid}}],
         }
@@ -5695,13 +5715,15 @@ def set_fleet_ssh_access(fleet: str, enabled: bool, organization_id: str | None 
 @mcp.tool(
     description=(
         "Switch the registry proxy on or off for a fleet (PUT /fleets/{id}/image-proxy): image pulls then travel over the "
-        "Admiral control plane. It is a BILLED action (charged by data carried) and needs the billing-management permission; a 402/403 "
+        "Admiral control plane. Optional mode (only with enabled=true; omitted keeps the current mode, auto when enabling): auto = devices pull directly and use "
+        "the proxy when the registry is unreachable or a download stalls; always = devices pull through the proxy first "
+        "(direct only if the proxy cannot serve). It is a BILLED action (charged by data carried) and needs the billing-management permission; a 402/403 "
         "means the organisation or caller lacks that. Destructive: without confirm=true it only shows the change; confirm "
         "after the user explicitly agrees. See get_image_proxy_usage for the data carried."
     ),
     annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True),
 )
-def set_fleet_image_proxy(fleet: str, enabled: bool, organization_id: str | None = None, confirm: bool = False) -> str:
+def set_fleet_image_proxy(fleet: str, enabled: bool, mode: str | None = None, organization_id: str | None = None, confirm: bool = False) -> str:
     return _toggle_call(
         lambda: _set_fleet_toggle(
             tool="set_fleet_image_proxy",
@@ -5711,7 +5733,9 @@ def set_fleet_image_proxy(fleet: str, enabled: bool, organization_id: str | None
             enabled=enabled,
             organization_id=organization_id,
             confirm=confirm,
-            on_effect="devices pull container images through the control plane; data carried is billed.",
+            mode=mode,
+            modes=("auto", "always"),
+            on_effect="auto: devices pull directly and fall back to the control plane proxy when the registry is unreachable or a download stalls; always: devices pull through the proxy first. Data carried is billed.",
             off_effect="devices pull images directly from the registry again.",
             warnings=["Billed by data carried; needs the billing-management permission."] if enabled else ["Devices behind networks that only allow the control plane cannot pull images once the proxy is off."],
         )

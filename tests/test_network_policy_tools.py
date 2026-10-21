@@ -254,9 +254,36 @@ def test_fleet_toggles_write_and_read_back(api, tool, leaf, args, before, body):
     assert preview["next"]["arguments"] == {"fleet": FLEET, **args, "organization_id": "org-1", "confirm": True}
     done = j(fn(**preview["next"]["arguments"]))
     assert json.loads(writes(api, "PUT")[0].content) == body
-    assert done["read_back"]["confirmed"] is True and done["after"] == {"enabled": args["enabled"]}
+    assert done["read_back"]["confirmed"] is True and done["after"] == {"enabled": args["enabled"], **({"mode": "auto"} if tool == "set_fleet_image_proxy" else {})}
     again = j(fn(fleet=FLEET, confirm=True, **args))
     assert again["error"].startswith("No change")
+
+
+def test_image_proxy_mode(api):
+    state = {"enabled": True, "mode": "auto"}
+    api.on("PUT", f"/fleets/{FLEET}/image-proxy", lambda r: (state.update(enabled=json.loads(r.content)["enabled"], mode=json.loads(r.content).get("mode", "auto")), ok(state))[1])
+    api.on("GET", f"/fleets/{FLEET}/image-proxy", lambda r: ok(dict(state)))
+    assert "mode" in j(server.set_fleet_image_proxy(fleet="shop", enabled=False, mode="always"))["error"]
+    assert "Invalid mode" in j(server.set_fleet_image_proxy(fleet="shop", enabled=True, mode="sometimes"))["error"]
+    assert j(server.set_fleet_image_proxy(fleet="shop", enabled=True, mode="auto"))["error"].startswith("No change")
+    preview = j(server.set_fleet_image_proxy(fleet="shop", enabled=True, mode="always"))
+    assert preview["confirmation_required"] is True and preview["next"]["arguments"]["mode"] == "always"
+    done = j(server.set_fleet_image_proxy(**preview["next"]["arguments"]))
+    assert json.loads(writes(api, "PUT")[0].content) == {"enabled": True, "mode": "always"}
+    assert done["after"] == {"enabled": True, "mode": "always"} and done["read_back"]["confirmed"] is True
+    assert j(server.get_fleet_policies("shop"))["image_proxy"]["mode"] == "always"
+
+
+def test_image_proxy_omitted_mode_keeps_current_or_defaults_auto(api):
+    state = {"enabled": True, "mode": "always"}
+    api.on("PUT", f"/fleets/{FLEET}/image-proxy", lambda r: (state.update(enabled=json.loads(r.content)["enabled"], mode=json.loads(r.content).get("mode", state["mode"] if state["enabled"] else "auto")), ok(state))[1])
+    api.on("GET", f"/fleets/{FLEET}/image-proxy", lambda r: ok(dict(state)))
+    assert j(server.set_fleet_image_proxy(fleet="shop", enabled=True))["error"].startswith("No change")
+    state.update(enabled=False, mode="auto")
+    preview = j(server.set_fleet_image_proxy(fleet="shop", enabled=True))
+    assert preview["confirmation_required"] is True and preview["preview"]["after"] == {"enabled": True, "mode": "auto"}
+    done = j(server.set_fleet_image_proxy(**preview["next"]["arguments"]))
+    assert done["after"] == {"enabled": True, "mode": "auto"} and done["read_back"]["confirmed"] is True
 
 
 def test_image_proxy_surfaces_billing_gate_and_permission(api):
