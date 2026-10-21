@@ -129,7 +129,7 @@ Tests enforce the rule for every registered tool, and `register_extension` rejec
 | `clear_network_configuration` | Remove the device override (back to the fleet's) or the fleet default |
 | `get_fleet_policies` | SSH, USB, registry proxy, security and custom-metrics policy of a fleet in one call; unentitled features show as a 402 note |
 | `set_fleet_ssh_access`, `set_fleet_custom_metrics` | On/off toggles |
-| `set_fleet_image_proxy`, `get_image_proxy_usage` | Registry proxy (billed by data carried, needs the billing permission) and its usage |
+| `set_fleet_image_proxy`, `get_image_proxy_usage` | Registry proxy (mode auto or always; billed by data carried, needs the billing permission) and its usage |
 | `set_fleet_security_policy` | TPM / secure boot / disk encryption / recovery-key escrow requirements; unchanged flags are re-sent |
 | `get_usb_policy`, `set_usb_policy`, `clear_usb_policy` | Fleet policy or per-device override (`off`, `block_storage_hid`, `allowlist` + rules); enterprise feature |
 | `list_alert_rules`, `get_alert_rule`, `list_alerts` | Rules, one rule with its evaluation health, alert history |
