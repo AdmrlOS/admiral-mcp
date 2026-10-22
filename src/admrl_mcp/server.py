@@ -80,9 +80,13 @@ How to answer naturally:
   A test boot is not available here: the user starts it from the dashboard or the device console.
 - Network: get_network_configuration / set_network_configuration / clear_network_configuration for a device (override,
   replaces the fleet's) or a fleet (default). A wrong network config can strand devices: read the preview's diff and risks.
-- Fleet policies: get_fleet_policies (SSH, USB, registry proxy, security, custom metrics in one call), set_fleet_ssh_access,
+- Fleet policies: get_fleet_policies (SSH, USB, registry proxy, security, custom metrics, developer sessions in one call), set_fleet_ssh_access,
+  set_fleet_dev_sessions (allow `admrl dev` sessions and cap their life),
   get_usb_policy / set_usb_policy / clear_usb_policy (fleet or device), set_fleet_image_proxy (billed) with
   get_image_proxy_usage, set_fleet_security_policy, set_fleet_custom_metrics. A 402 is a billing entitlement, not a fault.
+- Developer sessions and HTTP proxy: get_device / list_devices(dev_session=true) show who holds a device in a developer session.\
+  open_device_proxy opens a browser URL to a configured service of a device (needs the HTTP proxy enabled on the platform),\
+  list_proxies shows the caller's open proxies, close_proxy closes one. There is no tool to end a developer session.
 - Alerting: list_alert_rules, get_alert_rule, list_alerts (history), preview_alert_rule (evaluates, saves nothing),
   create_alert_rule, update_alert_rule, delete_alert_rule. Needs the Telemetry add-on for writes and previews.
 - Registry credentials: list_registry_credentials, get_registry_credential, delete_registry_credential. Secret files:
@@ -339,7 +343,8 @@ def list_fleets(
         "List devices. Filter by status (online, offline, error, provisioning, claimed, pending, unknown), "
         "fleet_id, or a free-text query (name, notes, tags). Returns compact summaries plus online/offline counts. "
         "status=offline returns every device that is not currently online — claimed, erroring, and stale devices "
-        "keep their provisioning status while the platform counts them in counts.offline."
+        "keep their provisioning status while the platform counts them in counts.offline. "
+        "dev_session=true keeps only devices that currently hold a developer session (admrl dev)."
     ),
     annotations=_READ_ONLY,
 )
@@ -349,20 +354,22 @@ def list_devices(
     fleet_id: str | None = None,
     organization_id: str | None = None,
     limit: int = 50,
+    dev_session: bool = False,
 ) -> str:
     try:
         client = get_client()
         resolver = DeviceResolver(client)
         org_id = resolver.resolve_org(organization_id)
         if status == "offline":
-            devices = resolver.list_not_online(org_id=org_id, fleet_id=fleet_id, limit=limit)
+            extra = {"dev_session": True} if dev_session else {}
+            devices = resolver.list_not_online(org_id=org_id, fleet_id=fleet_id, limit=limit, **extra)
             payload = {"counts": None}
         else:
             devices = resolver.list_devices(
-                org_id=org_id, query=query, status=status, fleet_id=fleet_id, limit=limit
+                org_id=org_id, query=query, status=status, fleet_id=fleet_id, limit=limit, dev_session=dev_session or None
             )
             payload = client.list_devices(
-                org_id=org_id, search=None, status=status, fleet_id=fleet_id, limit=limit
+                org_id=org_id, search=None, status=status, fleet_id=fleet_id, limit=limit, dev_session=dev_session or None
             )
         counts = payload.get("counts") if isinstance(payload, dict) else None
         return _dumps(
@@ -396,15 +403,45 @@ def find_device(
         return _err(inf)
 
 
-@mcp.tool(description="Full device detail: status, tags (device/fleet/effective), notes, last seen, hardware, location.", annotations=_READ_ONLY)
+def _device_dev_session(client: AdmiralClient, device_id: str, org_id: str) -> tuple[dict[str, Any] | None, str | None]:
+    """``status.devSession`` from the device document; a failed read only costs this field."""
+    try:
+        response = client.get_device_document(device_id, org_id=org_id)
+        doc = response.json() if response.content else None
+    except AdmiralAPIError as exc:
+        return None, f"developer session unavailable: {exc}"
+    except ValueError:
+        return None, None
+    status = doc.get("status") if isinstance(doc, dict) else None
+    session = status.get("devSession") if isinstance(status, dict) else None
+    return (session if isinstance(session, dict) and session else None), None
+
+
+@mcp.tool(
+    description=(
+        "Full device detail: status, tags (device/fleet/effective), notes, last seen, hardware, location. "
+        "dev_session in the summary is the developer session holding the device (id, user, since, expires, mounts, image) "
+        "from the device document's status.devSession; it is absent when no session is active."
+    ),
+    annotations=_READ_ONLY,
+)
 def get_device(device: str, organization_id: str | None = None) -> str:
     try:
         found = _resolve_device(device, organization_id)
         if not found.get("match"):
             return _dumps(found)
         client = get_client()
-        detail = client.get_device(found["match"]["id"], org_id=found["organization_id"])
-        return _dumps({"device": summarise_device(detail if isinstance(detail, dict) else found["raw"] or {}), "detail": detail})
+        org_id = found["organization_id"]
+        detail = client.get_device(found["match"]["id"], org_id=org_id)
+        summary = summarise_device(detail if isinstance(detail, dict) else found["raw"] or {})
+        out: dict[str, Any] = {"device": summary, "detail": detail}
+        session, doc_note = _device_dev_session(client, found["match"]["id"], org_id)
+        if session:
+            summary["dev_session"] = session
+            out["document"] = {"status": {"devSession": session}}
+        if doc_note:
+            out["notes"] = [doc_note]
+        return _dumps(out)
     except Exception as exc:
         return _err(exc)
 
@@ -5512,7 +5549,7 @@ def clear_network_configuration(
 
 # ------------------------------------------------------- fleet policies ---
 
-_POLICY_NAMES = ("ssh", "usb", "image_proxy", "security", "custom_metrics")
+_POLICY_NAMES = ("ssh", "usb", "image_proxy", "security", "custom_metrics", "dev_sessions")
 
 
 def _fleet_policy_reads(client: AdmiralClient, org_id: str, fid: str) -> tuple[dict[str, Any], list[str]]:
@@ -5522,6 +5559,7 @@ def _fleet_policy_reads(client: AdmiralClient, org_id: str, fid: str) -> tuple[d
         "image_proxy": f"fleets/{fid}/image-proxy",
         "security": f"fleets/{fid}/security-policy",
         "custom_metrics": f"fleets/{fid}/custom-metrics",
+        "dev_sessions": f"fleets/{fid}/dev-sessions",
     }
     notes: list[str] = []
 
@@ -5537,6 +5575,15 @@ def _fleet_policy_reads(client: AdmiralClient, org_id: str, fid: str) -> tuple[d
 
     values = _parallel_map(one, list(paths))
     return dict(zip(paths, values)), notes
+
+
+def _dev_sessions_view(payload: Any) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+    return {
+        "allowed": bool(payload.get("devSessionsAllowed")),
+        "max_life_seconds": int(payload.get("devSessionMaxLife") or 0),
+    }
 
 
 def _usb_view(payload: Any) -> dict[str, Any] | None:
@@ -5556,9 +5603,9 @@ def _usb_view(payload: Any) -> dict[str, Any] | None:
         "shells), USB policy (/usb-policy: off, block_storage_hid or allowlist with rules), registry proxy (/image-proxy: "
         "image pulls over the control plane, billed by data carried), security policy (/security-policy: required TPM, "
         "secure boot, disk encryption, recovery-key escrow, plus how many devices are non-compliant) and custom workload "
-        "metrics (/custom-metrics). A policy the organisation is not entitled to is reported as such (402), not as a "
+        "metrics (/custom-metrics) and developer sessions (/dev-sessions: whether admrl dev is allowed, max session life in seconds, 0 = unbounded). A policy the organisation is not entitled to is reported as such (402), not as a "
         "failure. fleet = name or UUID. Read-only. Change them with set_fleet_ssh_access, set_usb_policy, "
-        "set_fleet_image_proxy, set_fleet_security_policy, set_fleet_custom_metrics."
+        "set_fleet_image_proxy, set_fleet_security_policy, set_fleet_custom_metrics, set_fleet_dev_sessions."
     ),
     annotations=_READ_ONLY,
 )
@@ -5567,18 +5614,20 @@ def get_fleet_policies(fleet: str, organization_id: str | None = None) -> str:
         client, org_id = _ctx(organization_id)
         fl = _find_fleet(client, org_id, fleet)
         raw, notes = _fleet_policy_reads(client, org_id, fl["id"])
-        ssh, usb, proxy, sec, metrics = (raw.get(k) for k in _POLICY_NAMES)
+        ssh, usb, proxy, sec, metrics, dev = (raw.get(k) for k in _POLICY_NAMES)
         ssh_on = ssh.get("enabled") if isinstance(ssh, dict) else None
         usb_v = _usb_view(usb)
         proxy_on = proxy.get("enabled") if isinstance(proxy, dict) else None
         sec_d = sec if isinstance(sec, dict) else None
         metrics_on = metrics.get("enabled") if isinstance(metrics, dict) else None
+        dev_v = _dev_sessions_view(dev)
         bits = [
             f"ssh {'on' if ssh_on else 'off'}" if ssh_on is not None else None,
             f"usb {usb_v['mode']}" + ("" if usb_v.get("set", True) else " (not set)") if usb_v else None,
             f"registry proxy {(proxy.get('mode') or 'auto') if proxy_on else 'off'}" if proxy_on is not None else None,
             ("security " + ("enforced" if sec_d.get("enforced") else "not enforced")) if sec_d else None,
             f"custom metrics {'on' if metrics_on else 'off'}" if metrics_on is not None else None,
+            ("dev sessions " + (f"allowed (max {dev_v['max_life_seconds']}s)" if dev_v["max_life_seconds"] else "allowed") if dev_v["allowed"] else "dev sessions off") if dev_v else None,
         ]
         out = {
             "summary": f"{fl.get('name')}: " + ", ".join(b for b in bits if b) + ".",
@@ -5596,6 +5645,7 @@ def get_fleet_policies(fleet: str, organization_id: str | None = None) -> str:
                 else None
             ),
             "custom_metrics": {"enabled": metrics_on} if metrics_on is not None else None,
+            "dev_sessions": dev_v,
             "warnings": notes,
             "next": [
                 {"tool": "set_fleet_ssh_access", "why": "Turn SSH access on or off."},
@@ -5603,6 +5653,7 @@ def get_fleet_policies(fleet: str, organization_id: str | None = None) -> str:
                 {"tool": "set_fleet_image_proxy", "why": "Pull images over the control plane (billed by data)."},
                 {"tool": "set_fleet_security_policy", "why": "Require TPM / secure boot / disk encryption."},
                 {"tool": "set_fleet_custom_metrics", "why": "Collect custom workload metrics."},
+                {"tool": "set_fleet_dev_sessions", "why": "Allow developer sessions (admrl dev) and cap their life."},
             ],
         }
         return _dumps({k: v for k, v in out.items() if v not in (None, [], {})})
@@ -5764,6 +5815,189 @@ def set_fleet_custom_metrics(fleet: str, enabled: bool, organization_id: str | N
             off_effect="devices stop collecting custom workload metrics.",
         )
     )
+
+
+@mcp.tool(
+    description=(
+        "Allow or forbid developer sessions (admrl dev) on a fleet and cap their life (PUT /fleets/{id}/dev-sessions; off "
+        "unless turned on). allowed and max_life_seconds are each optional and an omitted one is left unchanged; "
+        "max_life_seconds=0 means unbounded. Turning sessions off ends the active ones on the fleet's devices and refuses "
+        "new ones. Needs the remote access management permission. Destructive: without confirm=true it only shows the change; "
+        "confirm after the user explicitly agrees. Read back from the API."
+    ),
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True),
+)
+def set_fleet_dev_sessions(
+    fleet: str,
+    allowed: bool | None = None,
+    max_life_seconds: int | None = None,
+    organization_id: str | None = None,
+    confirm: bool = False,
+) -> str:
+    def run() -> str:
+        if allowed is None and max_life_seconds is None:
+            raise ToolRefusal("Pass allowed and/or max_life_seconds; there is nothing to change.")
+        if max_life_seconds is not None and (isinstance(max_life_seconds, bool) or not isinstance(max_life_seconds, int) or max_life_seconds < 0):
+            raise ToolRefusal("max_life_seconds must be a whole number of seconds, 0 or more (0 = unbounded).")
+        client, org_id = _ctx(organization_id)
+        fl = _find_fleet(client, org_id, fleet)
+        fid = fl["id"]
+        before = _dev_sessions_view(client.get(f"fleets/{fid}/dev-sessions", org_id=org_id)) or {"allowed": False, "max_life_seconds": 0}
+        after_want = {
+            "allowed": before["allowed"] if allowed is None else allowed,
+            "max_life_seconds": before["max_life_seconds"] if max_life_seconds is None else max_life_seconds,
+        }
+        if after_want == before:
+            raise ToolRefusal(
+                f"No change: developer sessions are already {'allowed' if before['allowed'] else 'off'}"
+                f" with max life {before['max_life_seconds']}s for {fl.get('name')}.",
+                fleet=_ref(fl),
+            )
+        body: dict[str, Any] = {}
+        if allowed is not None and allowed != before["allowed"]:
+            body["devSessionsAllowed"] = allowed
+        if max_life_seconds is not None and max_life_seconds != before["max_life_seconds"]:
+            body["devSessionMaxLife"] = max_life_seconds
+        turning_off = before["allowed"] and not after_want["allowed"]
+        args: dict[str, Any] = {"fleet": fid}
+        if allowed is not None:
+            args["allowed"] = allowed
+        if max_life_seconds is not None:
+            args["max_life_seconds"] = max_life_seconds
+        gate = _gate(
+            confirm,
+            "set_fleet_dev_sessions",
+            f"change developer sessions for fleet {fl.get('name')}: "
+            + ("active sessions end now and new ones are refused." if turning_off else "users with the developer permission can open sessions on its devices, up to the max life."),
+            action={"fleet": _ref(fl), "changes": body},
+            args=args,
+            org_id=org_id,
+            preview={"before": before, "after": after_want, "devices": {"total": fl.get("devices"), "online": fl.get("online")}},
+            warnings=["Turning developer sessions off ends every active session on this fleet's devices."] if turning_off else None,
+        )
+        if gate:
+            return gate
+        client.put(f"fleets/{fid}/dev-sessions", org_id=org_id, json=body)
+        now = _dev_sessions_view(client.get(f"fleets/{fid}/dev-sessions", org_id=org_id)) or {}
+        confirmed = now == after_want
+        return _dumps(
+            {
+                "summary": f"{fl.get('name')}: developer sessions {'allowed' if now.get('allowed') else 'off'}, max life {now.get('max_life_seconds')}s"
+                + ("" if confirmed else " (NOT confirmed by read-back)")
+                + ".",
+                "fleet": _ref(fl),
+                "before": before,
+                "after": now,
+                "read_back": {"confirmed": confirmed},
+                "next": [{"tool": "get_fleet_policies", "why": "Review all fleet policies.", "arguments": {"fleet": fid}}],
+            }
+        )
+
+    return _toggle_call(run)
+
+
+def _proxy_view(p: Any) -> dict[str, Any]:
+    p = p if isinstance(p, dict) else {}
+    return {
+        "name": p.get("name"),
+        "url": p.get("url"),
+        "device_id": p.get("device_id"),
+        "service": p.get("service"),
+        "created_at": p.get("created_at"),
+        "expires": p.get("expires"),
+    }
+
+
+_PROXY_OFF = "The HTTP proxy is not enabled on this Admiral platform (503). Nothing was opened; ask the platform operator to enable it."
+
+
+@mcp.tool(
+    description=(
+        "Open an HTTP proxy to a configured service of a device (POST /devices/{id}/proxy) and return its browser URL, name "
+        "and expiry. device = name, tag, IP or UUID; service = the name of a service in the device's configuration "
+        "(edgewire.services). The first visit to the URL signs the browser in. A proxy lives at most 12 hours and closes after "
+        "30 minutes without requests; close it earlier with close_proxy. Same access and entitlement checks as an EdgeWire "
+        "session to that service. Acts only when the user asks. If the platform has not enabled the HTTP proxy this says so."
+    ),
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False),
+)
+def open_device_proxy(device: str, service: str, organization_id: str | None = None) -> str:
+    try:
+        if not (service or "").strip():
+            return _dumps({"error": "service is required: the name of a configured service on the device."})
+        found = _resolve_device(device, organization_id)
+        if not found.get("match"):
+            return _dumps(found)
+        match = found["match"]
+        try:
+            p = get_client().open_device_proxy(match["id"], service.strip(), org_id=found["organization_id"])
+        except AdmiralAPIError as exc:
+            if exc.status == 503:
+                return _dumps({"error": _PROXY_OFF, "device": match})
+            raise
+        view = _proxy_view(p)
+        return _dumps(
+            {
+                "summary": f"Proxy open to {service} on {match.get('name') or match['id']}: {view['url']} (expires {view['expires']}).",
+                "device": match,
+                "proxy": view,
+                "next": [{"tool": "close_proxy", "why": "Close it when finished.", "arguments": {"name": view["name"]}}],
+            }
+        )
+    except Exception as exc:
+        return _err(exc)
+
+
+@mcp.tool(
+    description="List the caller's open HTTP proxies to device services (GET /proxy): name, url, device, service, created and expiry. Read-only.",
+    annotations=_READ_ONLY,
+)
+def list_proxies(organization_id: str | None = None) -> str:
+    try:
+        client, org_id = _ctx(organization_id)
+        try:
+            payload = client.list_proxies(org_id=org_id)
+        except AdmiralAPIError as exc:
+            if exc.status == 503:
+                return _dumps({"error": _PROXY_OFF})
+            raise
+        rows = payload.get("items") if isinstance(payload, dict) else payload
+        proxies = [_proxy_view(p) for p in (rows or []) if isinstance(p, dict)]
+        return _dumps(
+            {
+                "summary": f"{len(proxies)} open prox{'y' if len(proxies) == 1 else 'ies'}.",
+                "organization_id": org_id,
+                "proxies": proxies,
+            }
+        )
+    except Exception as exc:
+        return _err(exc)
+
+
+@mcp.tool(
+    description=(
+        "Close an HTTP proxy by name (DELETE /proxy/{name}; names come from list_proxies or open_device_proxy). Ends its "
+        "sessions and signs every browser out; open a new one to reach the service again. Callers can close their own "
+        "proxies; closing someone else's needs a higher organisation role."
+    ),
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True),
+)
+def close_proxy(name: str, organization_id: str | None = None) -> str:
+    try:
+        if not (name or "").strip():
+            return _dumps({"error": "name is required: take it from list_proxies."})
+        client, org_id = _ctx(organization_id)
+        try:
+            client.close_proxy(name.strip(), org_id=org_id)
+        except AdmiralAPIError as exc:
+            if exc.status == 503:
+                return _dumps({"error": _PROXY_OFF})
+            if exc.status == 404:
+                return _dumps({"error": f"No open proxy named {name!r} (it may have expired or been closed). Use list_proxies."})
+            raise
+        return _dumps({"summary": f"Proxy {name} closed.", "closed": name, "next": [{"tool": "list_proxies", "why": "Confirm what is still open."}]})
+    except Exception as exc:
+        return _err(exc)
 
 
 @mcp.tool(

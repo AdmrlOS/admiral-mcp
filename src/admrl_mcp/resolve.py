@@ -79,6 +79,15 @@ def _ip(device: dict[str, Any]) -> str:
     return ""
 
 
+def _dev_session(device: dict[str, Any]) -> dict[str, Any] | None:
+    """The developer session on a device row or document (``status.devSession``), if any."""
+    status = device.get("status")
+    for cand in (device.get("devSession"), status.get("devSession") if isinstance(status, dict) else None):
+        if isinstance(cand, dict) and cand:
+            return cand
+    return None
+
+
 def summarise_device(device: dict[str, Any]) -> dict[str, Any]:
     fleet = device.get("fleet") or {}
     online = device.get("isOnline") or device.get("onlineStatus") or {}
@@ -107,6 +116,7 @@ def summarise_device(device: dict[str, Any]) -> dict[str, Any]:
         "tags": tags,
         "notes": device.get("notes") or None,
         "location": device.get("location"),
+        **({"dev_session": _dev_session(device)} if _dev_session(device) else {}),
     }
 
 
@@ -183,12 +193,14 @@ class DeviceResolver:
         status: str | None = None,
         fleet_id: str | None = None,
         limit: int = 50,
+        dev_session: bool | None = None,
     ) -> list[dict[str, Any]]:
         payload = self.client.list_devices(
             org_id=org_id,
             search=query if query and not _looks_like_tag_query(query) else None,
             status=status,
             fleet_id=fleet_id,
+            dev_session=dev_session,
             page=1,
             limit=min(max(limit, 1), 100),
         )
@@ -208,6 +220,7 @@ class DeviceResolver:
                     org_id=org_id,
                     status=status,
                     fleet_id=fleet_id,
+                    dev_session=dev_session,
                     page=1,
                     limit=100,
                 )
@@ -226,6 +239,7 @@ class DeviceResolver:
         org_id: str,
         fleet_id: str | None = None,
         limit: int = 100,
+        dev_session: bool | None = None,
     ) -> list[dict[str, Any]]:
         """Devices the platform's counts.offline bucket counts: not currently online.
 
@@ -235,7 +249,7 @@ class DeviceResolver:
         keep rows whose resolved status is not `online`, client-side.
         """
         payload = self.client.list_devices(
-            org_id=org_id, status=None, fleet_id=fleet_id, page=1, limit=min(max(limit, 1), 100)
+            org_id=org_id, status=None, fleet_id=fleet_id, page=1, limit=min(max(limit, 1), 100), dev_session=dev_session
         )
         devices = [d for d in _as_list(payload) if isinstance(d, dict)]
         return [d for d in devices if _status(d) != "online"]
