@@ -3,7 +3,7 @@ from __future__ import annotations
 import threading
 import time
 from typing import Any, Callable, Iterable, Iterator
-from urllib.parse import urljoin
+from urllib.parse import quote, urljoin
 from datetime import datetime, timedelta
 
 import httpx
@@ -576,11 +576,13 @@ class AdmiralClient:
         limit: int = 100,
         sort: str | None = None,
         direction: str | None = None,
+        dev_session: bool | None = None,
     ) -> Any:
         return self.get(
             "devices",
             org_id=org_id,
             params={
+                "devSession": "true" if dev_session else None,
                 "search": search,
                 "status": status,
                 "fleet_id": fleet_id,
@@ -910,6 +912,16 @@ class AdmiralClient:
 
     def search(self, query: str, *, org_id: str | None = None, limit: int = 20) -> Any:
         return self.get("search", org_id=org_id, params={"q": query, "limit": limit})
+
+    # Developer sessions and the HTTP proxy to device services.
+    def open_device_proxy(self, device_id: str, service: str, *, org_id: str | None = None) -> Any:
+        return self.post(f"devices/{device_id}/proxy", org_id=org_id, json={"service": service})
+
+    def list_proxies(self, *, org_id: str | None = None) -> Any:
+        return self.get("proxy", org_id=org_id)
+
+    def close_proxy(self, name: str, *, org_id: str | None = None) -> Any:
+        return self.delete(f"proxy/{quote(name, safe='')}", org_id=org_id)
 
     def reboot_device(self, device_id: str, *, org_id: str | None = None) -> Any:
         return self.post(f"devices/{device_id}/reboot", org_id=org_id, json={})

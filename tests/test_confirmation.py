@@ -194,6 +194,7 @@ def _cases(tmp_path) -> dict[str, dict[str, Any]]:
         "set_fleet_ssh_access": {"fleet": FLEET, "enabled": False},
         "set_fleet_image_proxy": {"fleet": FLEET, "enabled": True},
         "set_fleet_custom_metrics": {"fleet": FLEET, "enabled": True},
+        "set_fleet_dev_sessions": {"fleet": FLEET, "allowed": True, "max_life_seconds": 3600},
         "set_fleet_security_policy": {"fleet": FLEET, "require_tpm": True},
         "set_usb_policy": {"fleet": FLEET, "mode": "block_storage_hid"},
         "clear_usb_policy": {"device": "dan-qemu-3"},
@@ -210,7 +211,7 @@ CASE_NAMES = sorted(
     discard_local_override start_memory_test cancel_memory_test create_rollout rollout_control edit_configuration
     rollback_configuration delete_configuration assign_fleet_configuration set_fleet_update_policy move_device_to_fleet
     set_device_configuration_override reset_device_configuration_override clear_device_configuration_override set_network_configuration
-    clear_network_configuration set_fleet_ssh_access set_fleet_image_proxy set_fleet_custom_metrics
+    clear_network_configuration set_fleet_ssh_access set_fleet_image_proxy set_fleet_custom_metrics set_fleet_dev_sessions
     set_fleet_security_policy set_usb_policy clear_usb_policy delete_alert_rule update_registry_credential
     delete_registry_credential delete_secret_file upload_secret_file""".split()
 )

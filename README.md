@@ -41,9 +41,9 @@ This server uses the historical query. Live tail cannot be opened with a PAT —
 |---|---|
 | `list_organisations` | Pick an org when `ADMRL_ORG_ID` is unset |
 | `list_fleets` | Fleet list, optional search/tag |
-| `list_devices` | Filter by status / fleet / query |
+| `list_devices` | Filter by status / fleet / query / `dev_session=true` (devices held by a developer session) |
 | `find_device` | Resolve name, tag (`role=printer`), IP, UUID |
-| `get_device` | Detail + effective tags |
+| `get_device` | Detail + effective tags + active developer session (`dev_session`) |
 | `get_device_network` | IPs from list cache, spec, and live status |
 | `get_device_specs` | Hardware / versions |
 | `get_device_workload` | Container state + live config identity |
@@ -127,8 +127,10 @@ Tests enforce the rule for every registered tool, and `register_extension` rejec
 | `get_network_configuration` | A device's own and effective network configuration (a device override replaces the fleet's, no merging) or a fleet's default. Wi-Fi passwords are never returned (`has_psk`) |
 | `set_network_configuration` | Device override or fleet default, `mode=merge` (interfaces by MAC, networks by SSID, bridges by name are upserted) or `replace`; validated against the backend model; preview shows the effective diff and the risk of stranding devices |
 | `clear_network_configuration` | Remove the device override (back to the fleet's) or the fleet default |
-| `get_fleet_policies` | SSH, USB, registry proxy, security and custom-metrics policy of a fleet in one call; unentitled features show as a 402 note |
+| `get_fleet_policies` | SSH, USB, registry proxy, security, custom-metrics and developer-session policy of a fleet in one call; unentitled features show as a 402 note |
 | `set_fleet_ssh_access`, `set_fleet_custom_metrics` | On/off toggles |
+| `set_fleet_dev_sessions` | Allow developer sessions (`admrl dev`) on a fleet and cap their life (`max_life_seconds`, 0 = unbounded); turning them off ends active sessions |
+| `open_device_proxy`, `list_proxies`, `close_proxy` | HTTP proxy to a configured service of a device: returns a browser URL (max 12 h, closes after 30 min idle); a platform without the proxy answers "not enabled" |
 | `set_fleet_image_proxy`, `get_image_proxy_usage` | Registry proxy (mode auto or always; billed by data carried, needs the billing permission) and its usage |
 | `set_fleet_security_policy` | TPM / secure boot / disk encryption / recovery-key escrow requirements; unchanged flags are re-sent |
 | `get_usb_policy`, `set_usb_policy`, `clear_usb_policy` | Fleet policy or per-device override (`off`, `block_storage_hid`, `allowlist` + rules); enterprise feature |
