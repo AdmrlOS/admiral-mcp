@@ -2,7 +2,34 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+
 from admrl_mcp.config import ConfigError, load_settings, require_settings
+
+
+@pytest.mark.parametrize("base", ["", "${ADMRL_API_BASE}", "https://other.example.com/v1"])
+def test_allowed_api_base_rejects_missing_or_different_base(base, monkeypatch):
+    monkeypatch.setenv("ADMRL_MCP_NO_DOTENV", "1")
+    monkeypatch.setenv("ADMRL_MCP_ALLOWED_API_BASE", "https://isolated.example.com/v1")
+    monkeypatch.setenv("ADMRL_API_BASE", base)
+    with pytest.raises(ConfigError, match="allowed API base"):
+        load_settings()
+
+
+def test_no_dotenv_mode_never_reads_project_file(tmp_path: Path, monkeypatch):
+    dotenv = tmp_path / ".env"
+    dotenv.write_text("ADMRL_API_TOKEN_ID=file-token\nADMRL_API_SECRET_KEY=file-secret\n")
+    monkeypatch.setattr("admrl_mcp.config._project_dotenv_path", lambda: dotenv)
+    monkeypatch.setenv("ADMRL_MCP_NO_DOTENV", "1")
+    monkeypatch.setenv("ADMRL_API_BASE", "https://isolated.example.com/v1")
+    monkeypatch.setenv("ADMRL_API_TOKEN_ID", "${ISOLATED_API_TOKEN_ID}")
+    monkeypatch.setenv("ADMRL_API_SECRET_KEY", "")
+    monkeypatch.setenv("ADMRL_ORG_ID", "")
+    settings = load_settings()
+    assert not settings.configured
+    assert settings.api_base == "https://isolated.example.com/v1"
+    with pytest.raises(ConfigError, match="PAT is not configured"):
+        require_settings()
 
 
 def test_empty_and_placeholder_env_fill_from_dotenv(tmp_path: Path, monkeypatch):
