@@ -135,7 +135,20 @@ class AdmiralClient:
                 "X-API-Token-ID": self.settings.token_id,
                 "X-API-Secret-Key": self.settings.secret_key,
             }
+        def enforce_api_boundary(request: httpx.Request) -> None:
+            allowed = self.settings.allowed_api_base
+            if not allowed:
+                return
+            boundary = httpx.URL(allowed.rstrip("/") + "/")
+            url = request.url
+            if (
+                (url.scheme, url.host, url.port) != (boundary.scheme, boundary.host, boundary.port)
+                or not url.path.startswith(boundary.path)
+            ):
+                raise ConfigError("Request blocked: URL is outside the allowed API base.")
+
         self._client = httpx.Client(
+            event_hooks={"request": [enforce_api_boundary]},
             base_url=base,
             headers=headers,
             auth=auth,

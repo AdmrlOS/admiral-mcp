@@ -37,6 +37,7 @@ class Settings:
     # Hosted mode: the grant is bound to one organisation server-side, so a missing
     # organisation is not an error; no X-Organization-ID is sent and the backend defaults it.
     org_optional: bool = False
+    allowed_api_base: str = ""
 
     @property
     def configured(self) -> bool:
@@ -85,10 +86,14 @@ def _parse_dotenv(path: Path) -> dict[str, str]:
 def _load_dotenv() -> None:
     """Fill unset / placeholder ADMRL_* from the project .env.
 
+    ADMRL_MCP_NO_DOTENV=1 disables this fallback for isolated processes.
+
     Hermes forwards ``mcp_servers.admrl.env`` as empty strings or literal
     ``${ADMRL_*}`` when ``~/.hermes/.env`` has no PAT. Those must not win
     over a real project ``.env``. Already-set real values stay in place.
     """
+    if os.environ.get("ADMRL_MCP_NO_DOTENV") == "1":
+        return
     path = _project_dotenv_path()
     if not path.is_file():
         return
@@ -102,9 +107,15 @@ def _load_dotenv() -> None:
 
 
 def load_settings() -> Settings:
-    _load_dotenv()
+    allowed_api_base = _usable(os.environ.get("ADMRL_MCP_ALLOWED_API_BASE"))
+    if not allowed_api_base:
+        _load_dotenv()
+    api_base = _usable(os.environ.get("ADMRL_API_BASE"))
+    if allowed_api_base and api_base != allowed_api_base:
+        raise ConfigError("ADMRL_API_BASE must match the allowed API base (ADMRL_MCP_ALLOWED_API_BASE).")
     return Settings(
-        api_base=_usable(os.environ.get("ADMRL_API_BASE")) or DEFAULT_API_BASE,
+        allowed_api_base=allowed_api_base,
+        api_base=api_base or DEFAULT_API_BASE,
         token_id=_usable(os.environ.get("ADMRL_API_TOKEN_ID")),
         secret_key=_usable(os.environ.get("ADMRL_API_SECRET_KEY")),
         org_id=_usable(os.environ.get("ADMRL_ORG_ID")) or None,
