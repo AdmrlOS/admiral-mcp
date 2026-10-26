@@ -3774,20 +3774,86 @@ def _clean_window(window: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+def _policy_targets(targets: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    # Optional target fields may be omitted or returned empty; target order is not policy intent.
+    optional = {"board", "target", "system_version_id", "initram_version_id", "system_selection"}
+    return sorted(
+        [{k: v for k, v in t.items() if not (k in optional and v in (None, ""))} for t in targets],
+        key=lambda t: json.dumps(t, sort_keys=True),
+    )
+
+
+def _validate_system_selection(target: dict[str, Any]) -> None:
+    selection = target.get("system_selection")
+    if selection is None:
+        return
+    if target.get("system_version_id"):
+        raise ValueError("system_selection and system_version_id are mutually exclusive.")
+    if not isinstance(selection, dict) or set(selection) - {"mode", "kernel_track", "features"}:
+        raise ValueError("system_selection must be an object with mode, kernel_track and optional features.")
+    kernel_track = selection.get("kernel_track", "")
+    if selection.get("mode") != "follow" or not isinstance(kernel_track, str) or (kernel_track and not re.fullmatch(r"linux-[0-9]+\.[0-9]+", kernel_track)):
+        raise ValueError("system_selection needs mode 'follow' and a valid kernel_track (linux-N.N).")
+    if not target.get("target"):
+        raise ValueError("system_selection requires an explicit target.")
+    features = selection.get("features", {})
+    if not isinstance(features, dict) or set(features) - {"nvidia"}:
+        raise ValueError("system_selection.features supports only nvidia {track}.")
+    if "nvidia" in features:
+        nvidia = features["nvidia"]
+        if not isinstance(nvidia, dict) or set(nvidia) != {"track"} or not isinstance(nvidia["track"], str) or not re.fullmatch(r"nvidia-[0-9]+", nvidia["track"]):
+            raise ValueError("system_selection.features.nvidia needs a valid track (nvidia-N).")
+        if target.get("target") != "x86-nvidia":
+            raise ValueError("NVIDIA track selection currently requires target 'x86-nvidia'.")
+    if not kernel_track and not features.get("nvidia"):
+        raise ValueError("system_selection needs a kernel or NVIDIA track.")
+
+
 def _policy_view(payload: Any) -> dict[str, Any]:
     payload = payload if isinstance(payload, dict) else {}
-    return {"mode": payload.get("mode"), "targets": payload.get("targets") or [], "update_window": payload.get("update_window")}
+    return {"mode": payload.get("mode"), "targets": _policy_targets(payload.get("targets") or []), "update_window": payload.get("update_window")}
+
+
+@mcp.tool(
+    description=(
+        "Preview the approved OS release catalogue for a fleet (GET /fleets/{id}/update-options). "
+        "Options are grouped by architecture, installed target and board for mixed fleets; release_selection "
+        "contains kernel and feature tracks. Returns the backend catalogue unchanged, including any blocked reasons. "
+        "Does not change policy or promote releases. Use get_fleet for desired policy and set_fleet_update_policy "
+        "to preview a change. fleet = name or UUID; ambiguous names return candidates. Read-only."
+    ),
+    annotations=_READ_ONLY,
+)
+def get_fleet_update_options(fleet: str, organization_id: str | None = None) -> str:
+    try:
+        client, org_id = _ctx(organization_id)
+        fl = _find_fleet(client, org_id, fleet)
+        options = client.get(f"fleets/{fl['id']}/update-options", org_id=org_id)
+        return _dumps({
+            "summary": f"Approved OS update options for {fl.get('name')}; no policy changed.",
+            "fleet": _ref(fl),
+            "update_options": options,
+        })
+    except Exception as exc:
+        return _err(exc)
 
 
 @mcp.tool(
     description=(
         "Set a fleet's OS update policy and/or update window. This governs Admiral system/OS image updates, not the "
         "workload configuration. mode 'latest' tracks the current release; 'pinned' uses targets "
-        "[{architecture, board?, system_version_id?, initram_version_id?}] (a missing version id follows latest for that "
-        "hardware). update_window {enabled, days:[Monday..], start_time:'02:00', end_time:'06:00', timezone:'Australia/Sydney'} "
+        "[{architecture, target?, board?, system_version_id?, initram_version_id?, system_selection?}] "
+        "(a missing version id follows latest for that hardware). Optional system_selection "
+        "{mode:'follow', kernel_track:'linux-7.2', features:{nvidia:{track:'nvidia-595'}}} follows named approved "
+        "tracks instead; it is exclusive with system_version_id (an exact whole-slot pin). NVIDIA choices currently "
+        "require target 'x86-nvidia'; generic x86 and ARM targets remain independent in mixed fleets. "
+        "Use get_fleet_update_options for compatible approved choices; omitting selection keeps legacy behavior. "
+        "update_window {enabled, days:[Monday..], start_time:'02:00', end_time:'06:00', timezone:'Australia/Sydney'} "
         "limits when devices apply updates; disable_update_window=true turns it off. Policy via PUT "
         "/fleets/{id}/update-policy (replaces the whole policy; the existing targets are kept when you only change the "
-        "window), window alone via PUT /fleets/{id}/update-window. Returns before/after read back. Changes what OS "
+        "window), legacy window alone via PUT /fleets/{id}/update-window. Confirmation must pass the preview's "
+        "base_revision (empty for an unsaved policy); changed revisions require a fresh preview and approval. "
+        "Returns before/after read back. Changes what OS "
         "versions devices install: without confirm=true it only previews; confirm after the user agrees."
     ),
     annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True),
@@ -3799,6 +3865,7 @@ def set_fleet_update_policy(
     update_window: dict[str, Any] | None = None,
     disable_update_window: bool = False,
     organization_id: str | None = None,
+    base_revision: str | None = None,
     confirm: bool = False,
 ) -> str:
     try:
@@ -3817,7 +3884,9 @@ def set_fleet_update_policy(
         client, org_id = _ctx(organization_id)
         fl = _find_fleet(client, org_id, fleet)
         fid = fl["id"]
-        before = _policy_view(client.get(f"fleets/{fid}/update-policy", org_id=org_id))
+        current = client.get(f"fleets/{fid}/update-policy", org_id=org_id)
+        revision = current.get("revision") or ""
+        before = _policy_view(current)
         if disable_update_window:
             old = before["update_window"] or {}
             window = {
@@ -3836,7 +3905,10 @@ def set_fleet_update_policy(
             for i, t in enumerate(new_targets):
                 if not isinstance(t, dict) or not t.get("architecture"):
                     return _dumps({"error": f"targets[{i}] needs an architecture."})
-            if new_mode == before["mode"] and new_targets == before["targets"] and window in (None, before["update_window"]):
+                if set(t) - {"architecture", "target", "board", "system_version_id", "initram_version_id", "system_selection"}:
+                    return _dumps({"error": f"targets[{i}] contains unknown fields."})
+                _validate_system_selection(t)
+            if new_mode == before["mode"] and _policy_targets(new_targets) == before["targets"] and window in (None, before["update_window"]):
                 raise ToolRefusal("No change: the fleet already has this update policy.", before=before)
             body: dict[str, Any] = {"mode": new_mode}
             if new_targets:
@@ -3848,6 +3920,14 @@ def set_fleet_update_policy(
             if window == before["update_window"]:
                 raise ToolRefusal("No change: the fleet already has this update window.", before=before)
             plan = (f"fleets/{fid}/update-window", window)
+        if confirm is True and (base_revision is None or base_revision != revision):
+            raise ToolRefusal(
+                "Policy revision changed or no approved base_revision supplied. Nothing written; request a fresh preview and approval. Do not retry with confirm=true.",
+                current_revision=revision,
+            )
+        # The standalone window endpoint has no CAS; revisioned policies use the guarded policy endpoint.
+        if not policy_change and revision:
+            plan = (f"fleets/{fid}/update-policy", {**before, "update_window": window})
         gate = _gate(
             confirm,
             "set_fleet_update_policy",
@@ -3859,15 +3939,33 @@ def set_fleet_update_policy(
                 "targets": targets,
                 "update_window": update_window,
                 "disable_update_window": True if disable_update_window else None,
+                "base_revision": revision,
             },
             org_id=org_id,
-            preview={"before": before, "request": plan[1], "endpoint": "PUT /" + plan[0]},
+            preview={"before": before, "revision": revision, "request": plan[1], "endpoint": "PUT /" + plan[0]},
         )
         if gate:
             return gate
-        client.put(plan[0], org_id=org_id, json=plan[1])
+        try:
+            client.raw_request("PUT", plan[0], org_id=org_id, json=plan[1], headers={"If-Match": revision})
+        except AdmiralAPIError as exc:
+            if exc.status in (409, 412):
+                raise ToolRefusal("Policy revision conflict. Nothing retried; request a fresh preview and approval before applying again.") from exc
+            raise
         after = _policy_view(client.get(f"fleets/{fid}/update-policy", org_id=org_id))
-        confirmed = (not policy_change or (after["mode"] == body["mode"])) and (window is None or after["update_window"] == window)
+        request = plan[1] or {}
+        expected = {
+            "mode": request["mode"] if policy_change else before["mode"],
+            "targets": _policy_targets(request.get("targets") or []) if policy_change else before["targets"],
+            "update_window": window if window is not None else before["update_window"],
+        }
+        if after != expected:
+            raise ToolRefusal(
+                "OS update policy read-back mismatch; the requested targets, selectors, pins or window were not preserved. Do not assume success.",
+                fleet=_ref(fl), before=before, expected=expected, after=after,
+                read_back={"confirmed": False},
+            )
+        confirmed = True
         return _dumps(
             {
                 "summary": f"{fl.get('name')} update policy: mode {before['mode']} → {after['mode']}"

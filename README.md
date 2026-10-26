@@ -110,7 +110,8 @@ Tests enforce the rule for every registered tool, and `register_extension` rejec
 | `assign_fleet_configuration` | Assign a configuration/version to a fleet **directly** (no canary; use a rollout for running fleets) |
 | `get_fleet_configuration_history` | Who assigned which configuration/version, when and why |
 | `create_fleet`, `update_fleet` | Create a fleet; rename/describe/relocate and add/remove/replace tags |
-| `set_fleet_update_policy` | OS update policy (`latest`/`pinned` targets) and update window |
+| `set_fleet_update_policy` | OS update policy (`latest`/`pinned` targets), per-target kernel/NVIDIA track selection or exact slot pins, and update window; confirmation binds `base_revision`, writes use `If-Match`, and full policy read-back is verified |
+| `get_fleet_update_options` | Read-only approved OS release catalogue grouped by architecture, target and board |
 | `update_device` | Name, notes, location, tags |
 | `move_device_to_fleet` | Move a device; it takes the new fleet's configuration immediately. `wipe=true` (`wipe_images`, `wipe_volumes`, `wipe_secure`) first erases its payload data: irreversible, needs a higher device permission and an online device, aborts the move if the wipe fails |
 | `get_device_configuration` | Inherited configuration, per-device override and the merged result |

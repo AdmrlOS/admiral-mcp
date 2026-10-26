@@ -703,7 +703,7 @@ WINDOW = {"enabled": True, "days": ["monday", "Friday"], "start_time": "02:00", 
 def test_set_fleet_update_policy_window_only_uses_the_window_route(api):
     clean = {**WINDOW, "days": ["Monday", "Friday"]}
     policy_api(api, {"mode": "latest"}, {"mode": "latest", "update_window": clean})
-    out = j(server.set_fleet_update_policy(FLEET, update_window=WINDOW, confirm=True))
+    out = j(server.set_fleet_update_policy(FLEET, update_window=WINDOW, base_revision="", confirm=True))
     assert bodies(api, "PUT", "/update-window") == [clean]
     assert not bodies(api, "PUT", "/update-policy")
     assert out["read_back"]["confirmed"] is True and "window on" in out["summary"]
@@ -713,7 +713,7 @@ def test_set_fleet_update_policy_pinned_with_targets_and_window(api):
     target = {"architecture": "amd64", "system_version_id": "33333333-4444-5555-6666-777777777777"}
     clean = {**WINDOW, "days": ["Monday", "Friday"]}
     policy_api(api, {"mode": "latest"}, {"mode": "pinned", "targets": [target], "update_window": clean})
-    out = j(server.set_fleet_update_policy(FLEET, targets=[target], update_window=WINDOW, confirm=True))
+    out = j(server.set_fleet_update_policy(FLEET, targets=[target], update_window=WINDOW, base_revision="", confirm=True))
     assert bodies(api, "PUT", "/update-policy") == [{"mode": "pinned", "targets": [target], "update_window": clean}]
     assert out["before"]["mode"] == "latest" and out["after"]["mode"] == "pinned" and out["read_back"]["confirmed"] is True
 
@@ -721,14 +721,14 @@ def test_set_fleet_update_policy_pinned_with_targets_and_window(api):
 def test_set_fleet_update_policy_back_to_latest_drops_targets(api):
     t = {"architecture": "amd64"}
     policy_api(api, {"mode": "pinned", "targets": [t]}, {"mode": "latest"})
-    j(server.set_fleet_update_policy(FLEET, mode="LATEST", confirm=True))
+    j(server.set_fleet_update_policy(FLEET, mode="LATEST", base_revision="", confirm=True))
     assert bodies(api, "PUT", "/update-policy") == [{"mode": "latest"}]
 
 
 def test_set_fleet_update_policy_keeps_existing_targets_when_only_window_changes_with_mode(api):
     t = {"architecture": "arm64", "board": "b1"}
     policy_api(api, {"mode": "pinned", "targets": [t]}, {"mode": "pinned", "targets": [t], "update_window": {**WINDOW, "days": ["Monday", "Friday"]}})
-    j(server.set_fleet_update_policy(FLEET, mode="pinned", update_window=WINDOW, confirm=True))
+    j(server.set_fleet_update_policy(FLEET, mode="pinned", update_window=WINDOW, base_revision="", confirm=True))
     assert bodies(api, "PUT", "/update-policy")[0]["targets"] == [t]
 
 
@@ -736,33 +736,33 @@ def test_set_fleet_update_policy_disable_window_keeps_the_old_values(api):
     old = {**WINDOW, "days": ["Monday"]}
     off = {**old, "enabled": False}
     policy_api(api, {"mode": "latest", "update_window": old}, {"mode": "latest", "update_window": off})
-    out = j(server.set_fleet_update_policy(FLEET, disable_update_window=True, confirm=True))
+    out = j(server.set_fleet_update_policy(FLEET, disable_update_window=True, base_revision="", confirm=True))
     assert bodies(api, "PUT", "/update-window") == [off] and out["read_back"]["confirmed"] is True
 
 
 def test_set_fleet_update_policy_refusals_and_validation(api):
     policy_api(api, {"mode": "latest"}, {"mode": "latest"})
-    assert j(server.set_fleet_update_policy(FLEET, mode="latest", confirm=True))["error"].startswith("No change")
-    assert "needs targets" in j(server.set_fleet_update_policy(FLEET, mode="pinned", confirm=True))["error"]
-    assert "needs an architecture" in j(server.set_fleet_update_policy(FLEET, targets=[{"board": "x"}], confirm=True))["error"]
-    assert "Unknown mode" in j(server.set_fleet_update_policy(FLEET, mode="fast", confirm=True))["error"]
-    assert "only apply to mode 'pinned'" in j(server.set_fleet_update_policy(FLEET, mode="latest", targets=[{"architecture": "a"}], confirm=True))["error"]
-    assert "Nothing to change" in j(server.set_fleet_update_policy(FLEET, confirm=True))["error"]
-    assert "not both" in j(server.set_fleet_update_policy(FLEET, update_window=WINDOW, disable_update_window=True, confirm=True))["error"]
+    assert j(server.set_fleet_update_policy(FLEET, mode="latest", base_revision="", confirm=True))["error"].startswith("No change")
+    assert "needs targets" in j(server.set_fleet_update_policy(FLEET, mode="pinned", base_revision="", confirm=True))["error"]
+    assert "needs an architecture" in j(server.set_fleet_update_policy(FLEET, targets=[{"board": "x"}], base_revision="", confirm=True))["error"]
+    assert "Unknown mode" in j(server.set_fleet_update_policy(FLEET, mode="fast", base_revision="", confirm=True))["error"]
+    assert "only apply to mode 'pinned'" in j(server.set_fleet_update_policy(FLEET, mode="latest", targets=[{"architecture": "a"}], base_revision="", confirm=True))["error"]
+    assert "Nothing to change" in j(server.set_fleet_update_policy(FLEET, base_revision="", confirm=True))["error"]
+    assert "not both" in j(server.set_fleet_update_policy(FLEET, update_window=WINDOW, disable_update_window=True, base_revision="", confirm=True))["error"]
     for bad in ({"enabled": True, "days": [], "start_time": "02:00", "end_time": "03:00", "timezone": "UTC"},
                 {"enabled": True, "days": ["Funday"], "start_time": "02:00", "end_time": "03:00", "timezone": "UTC"},
                 {"enabled": True, "days": ["Monday"], "start_time": "2am", "end_time": "03:00", "timezone": "UTC"},
                 {"enabled": True, "days": ["Monday"], "start_time": "02:00", "end_time": "03:00"},
                 {"enabled": True, "days": ["Monday"], "start_time": "02:00", "end_time": "03:00", "timezone": "UTC", "extra": 1}):
-        assert "error" in j(server.set_fleet_update_policy(FLEET, update_window=bad, confirm=True))
-    assert "update_window must be an object" in j(server.set_fleet_update_policy(FLEET, update_window=["x"], confirm=True))["error"]
+        assert "error" in j(server.set_fleet_update_policy(FLEET, update_window=bad, base_revision="", confirm=True))
+    assert "update_window must be an object" in j(server.set_fleet_update_policy(FLEET, update_window=["x"], base_revision="", confirm=True))["error"]
     assert not [r for r in api.seen if r.method == "PUT"]
 
 
 def test_set_fleet_update_policy_window_no_op(api):
     clean = {**WINDOW, "days": ["Monday", "Friday"]}
     policy_api(api, {"mode": "latest", "update_window": clean}, {"mode": "latest", "update_window": clean})
-    assert j(server.set_fleet_update_policy(FLEET, update_window=WINDOW, confirm=True))["error"].startswith("No change")
+    assert j(server.set_fleet_update_policy(FLEET, update_window=WINDOW, base_revision="", confirm=True))["error"].startswith("No change")
 
 
 # =============================================================== devices ===
