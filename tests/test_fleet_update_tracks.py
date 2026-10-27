@@ -188,3 +188,73 @@ def test_feature_only_selection_revision_roundtrip(api):
     assert out["read_back"]["confirmed"] is True
     writes = [r for r in api.seen if r.method != "GET"]
     assert len(writes) == 1 and writes[0].headers["If-Match"] == "policy-1"
+
+
+FR_TARGETS = [
+    {"architecture": "amd64", "target": "x86-nvidia", "follow": "tag:lts", "ring": "soak"},
+    {"architecture": "arm64", "target": "rk3568", "board": "board-a", "follow": "track:linux-7.2"},
+]
+
+
+def test_follow_and_ring_roundtrip_with_defaults_ignored(api):
+    served = [{**FR_TARGETS[0], "board": ""}, {**FR_TARGETS[1], "ring": "general"}]
+    policy_api(api, {"mode": "latest"}, {"mode": "pinned", "targets": served})
+    out = j(server.set_fleet_update_policy(FLEET, targets=FR_TARGETS, base_revision="", confirm=True))
+    assert out["read_back"]["confirmed"] is True
+    assert bodies(api, "PUT", "/update-policy") == [{"mode": "pinned", "targets": FR_TARGETS}]
+
+
+@pytest.mark.parametrize("field,value", [("follow", "tag:stable"), ("ring", "general"), ("ring", None)])
+def test_dropped_or_changed_follow_ring_refuses_success(api, field, value):
+    served = copy.deepcopy(FR_TARGETS)
+    if value is None:
+        served[0].pop(field)
+    else:
+        served[0][field] = value
+    policy_api(api, {"mode": "latest"}, {"mode": "pinned", "targets": served})
+    out = j(server.set_fleet_update_policy(FLEET, targets=FR_TARGETS, base_revision="", confirm=True))
+    assert out["read_back"]["confirmed"] is False
+
+
+def test_legacy_complete_selector_matches_folded_follow(api):
+    folded = [{"architecture": "amd64", "target": "x86-nvidia", "follow": "track:linux-7.2/nvidia-595"}]
+    policy_api(api, {"mode": "latest"}, {"mode": "pinned", "targets": folded})
+    legacy = [{"architecture": "amd64", "target": "x86-nvidia", "system_selection": SELECTION}]
+    out = j(server.set_fleet_update_policy(FLEET, targets=legacy, base_revision="", confirm=True))
+    assert out["read_back"]["confirmed"] is True
+    assert bodies(api, "PUT", "/update-policy") == [{"mode": "pinned", "targets": legacy}]
+
+
+@pytest.mark.parametrize("extra", [
+    {"follow": "tag:beta"}, {"follow": "track:7.2"}, {"follow": "version:"}, {"ring": "fast"},
+    {"follow": "tag:lts", "system_version_id": "33333333-4444-5555-6666-777777777777"},
+    {"follow": "tag:lts", "system_selection": SELECTION},
+    {"follow": "tag:lts", "target": ""},
+])
+def test_invalid_follow_ring_never_writes(api, extra):
+    policy_api(api, {"mode": "latest"}, {})
+    target = {"architecture": "amd64", "target": "x86-nvidia", **extra}
+    assert "error" in j(server.set_fleet_update_policy(FLEET, targets=[target], base_revision="", confirm=True))
+    assert all(r.method == "GET" for r in api.seen)
+
+
+def test_update_options_resolution_summary(api):
+    group = {"architecture": "amd64", "target": "x86-nvidia", "board": "", "follow": "tag:lts", "ring": "soak", "resolved_track": "linux-7.2/nvidia-595", "served_ring": "current", "resolved_slot_id": "s1", "blocked_reason": "", "options": []}
+    api.on("GET", f"/fleets/{FLEET}", ok(fleet_row()))
+    api.on("GET", f"/fleets/{FLEET}/update-options", ok({"groups": [group]}))
+    out = j(server.get_fleet_update_options(FLEET))
+    assert out["resolution"][0]["follow"] == "tag:lts" and out["resolution"][0]["served_ring"] == "current"
+    assert out["update_options"]["groups"] == [group]
+
+
+def test_rollout_use_fleet_policy_and_legacy_alias(api):
+    from test_ops_tools import ROLLOUT, envelope
+    api.on("POST", "/rollouts", httpx.Response(201, json=envelope({"id": ROLLOUT})))
+    j(server.create_rollout(FLEET, type="system_update", use_fleet_policy=True, confirm=True))
+    j(server.create_rollout(FLEET, type="system_update", use_current_versions=True, confirm=True))
+    posted = bodies(api, "POST", "/rollouts")
+    assert posted[0]["system_update_spec"] == {"final_action": "reboot", "use_fleet_policy": True}
+    assert posted[1]["system_update_spec"] == {"final_action": "reboot", "use_current_versions": True}
+    out = j(server.create_rollout(FLEET, type="system_update", use_fleet_policy=True, version_ids=[FLEET], confirm=True))
+    assert "not both" in out["error"]
+    assert len(bodies(api, "POST", "/rollouts")) == 2

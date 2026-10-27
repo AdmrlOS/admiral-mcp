@@ -2227,8 +2227,9 @@ def _pick_by_name(rows: list[dict[str, Any]], name: str, what: str) -> dict[str,
         "list of them. type 'config' (default): configuration = name or UUID (required), version = integer or \"latest\"; "
         "a config rollout may also switch a fleet to a different configuration, and on completion the fleet is pinned to "
         "the explicit version. Other types need no configuration: 'reboot' (force=true skips the graceful path), "
-        "'restart_workload' (optional container_target) and 'system_update' (OS update: use_current_versions=true or "
-        "version_ids [UUID]; final_action reboot|none|restart). strategy (all optional; server defaults canary 1, "
+        "'restart_workload' (optional container_target) and 'system_update' (OS update: use_fleet_policy=true resolves each "
+        "device's image from its fleet's update policy (follow/ring), or version_ids [UUID]; use_current_versions is a legacy alias of "
+        "use_fleet_policy; final_action reboot|none|restart). strategy (all optional; server defaults canary 1, "
         "maxInFlight 50, maxUnavailable 2, failureThreshold 0.1, progressDeadline 30m): {canary, maxInFlight, "
         "maxUnavailable, failureThreshold (0-1 of admitted), progressDeadline (\"30m\" or seconds)}. Devices are admitted "
         "only while online, canary first, then a window of maxInFlight; the rollout pauses on the failure budget and "
@@ -2252,6 +2253,7 @@ def create_rollout(
     use_current_versions: bool = False,
     version_ids: list[str] | None = None,
     final_action: str | None = None,
+    use_fleet_policy: bool = False,
     confirm: bool = False,
 ) -> str:
     try:
@@ -2305,7 +2307,7 @@ def create_rollout(
                 "name": name or f"{kind} → {where}",
                 "type": kind,
                 "fleet_ids": fleet_ids,
-                **_type_spec(kind, force, container_target, use_current_versions, version_ids, final_action),
+                **_type_spec(kind, force, container_target, use_current_versions, version_ids, final_action, use_fleet_policy),
             }
         if description:
             body["description"] = description
@@ -2335,6 +2337,7 @@ def create_rollout(
                         "force": True if force else None,
                         "container_target": container_target,
                         "use_current_versions": True if use_current_versions else None,
+                        "use_fleet_policy": True if use_fleet_policy else None,
                         "version_ids": version_ids,
                         "final_action": final_action,
                     }
@@ -3776,11 +3779,43 @@ def _clean_window(window: dict[str, Any]) -> dict[str, Any]:
 
 def _policy_targets(targets: list[dict[str, Any]]) -> list[dict[str, Any]]:
     # Optional target fields may be omitted or returned empty; target order is not policy intent.
-    optional = {"board", "target", "system_version_id", "initram_version_id", "system_selection"}
-    return sorted(
-        [{k: v for k, v in t.items() if not (k in optional and v in (None, ""))} for t in targets],
-        key=lambda t: json.dumps(t, sort_keys=True),
-    )
+    optional = {"board", "target", "system_version_id", "initram_version_id", "system_selection", "follow", "ring"}
+    defaults = {"follow": "default", "ring": "general"}
+    out = []
+    for t in targets:
+        t = {k: v for k, v in t.items() if not (k in optional and v in (None, "") or defaults.get(k) == v)}
+        folded = _folded_follow(t)
+        if folded:  # the backend folds a complete legacy selector into follow on save and read
+            t = {**{k: v for k, v in t.items() if k != "system_selection"}, "follow": folded}
+        out.append(t)
+    return sorted(out, key=lambda t: json.dumps(t, sort_keys=True))
+
+
+def _folded_follow(target: dict[str, Any]) -> str:
+    selection = target.get("system_selection")
+    if not isinstance(selection, dict) or target.get("follow") or not selection.get("kernel_track"):
+        return ""
+    nvidia = ((selection.get("features") or {}).get("nvidia") or {}).get("track", "")
+    if target.get("target") == "x86-nvidia":
+        return f"track:{selection['kernel_track']}/{nvidia}" if nvidia else ""
+    return f"track:{selection['kernel_track']}"
+
+
+_FOLLOW_RE = re.compile(r"default|tag:(stable|lts)|track:linux-[0-9]+\.[0-9]+(/nvidia-[0-9]+)?|version:\S+")
+_RINGS = ("general", "soak", "lab")
+
+
+def _validate_follow_ring(target: dict[str, Any]) -> None:
+    follow, ring = target.get("follow"), target.get("ring")
+    if follow not in (None, ""):
+        if not isinstance(follow, str) or not _FOLLOW_RE.fullmatch(follow):
+            raise ValueError("follow must be 'default', 'tag:stable', 'tag:lts', 'track:<kernel>[/<nvidia>]' (e.g. track:linux-7.2/nvidia-615) or 'version:<slot id>'.")
+        if not target.get("target"):
+            raise ValueError("follow requires an explicit target.")
+        if target.get("system_version_id") or target.get("system_selection"):
+            raise ValueError("follow is exclusive with system_version_id and system_selection.")
+    if ring not in (None, "") and ring not in _RINGS:
+        raise ValueError("ring must be 'general', 'soak' or 'lab' (lab only for candidate/lab fleets).")
 
 
 def _validate_system_selection(target: dict[str, Any]) -> None:
@@ -3818,7 +3853,9 @@ def _policy_view(payload: Any) -> dict[str, Any]:
     description=(
         "Preview the approved OS release catalogue for a fleet (GET /fleets/{id}/update-options). "
         "Options are grouped by architecture, installed target and board for mixed fleets; release_selection "
-        "contains kernel and feature tracks. Returns the backend catalogue unchanged, including any blocked reasons. "
+        "contains kernel and feature tracks. Returns the backend catalogue unchanged: per group the effective follow and ring, "
+        "tags and default, resolved_track, served_ring and blocked_reason; per option track, tags, version, soak/lab pointers "
+        "and blocked_reason. A compact 'resolution' list repeats what each group receives now. "
         "Does not change policy or promote releases. Use get_fleet for desired policy and set_fleet_update_policy "
         "to preview a change. fleet = name or UUID; ambiguous names return candidates. Read-only."
     ),
@@ -3832,6 +3869,10 @@ def get_fleet_update_options(fleet: str, organization_id: str | None = None) -> 
         return _dumps({
             "summary": f"Approved OS update options for {fl.get('name')}; no policy changed.",
             "fleet": _ref(fl),
+            "resolution": [
+                {k: g.get(k) for k in ("architecture", "target", "board", "follow", "ring", "resolved_track", "served_ring", "resolved_slot_id", "blocked_reason")}
+                for g in (options.get("groups") or [] if isinstance(options, dict) else [])
+            ],
             "update_options": options,
         })
     except Exception as exc:
@@ -3842,8 +3883,12 @@ def get_fleet_update_options(fleet: str, organization_id: str | None = None) -> 
     description=(
         "Set a fleet's OS update policy and/or update window. This governs Admiral system/OS image updates, not the "
         "workload configuration. mode 'latest' tracks the current release; 'pinned' uses targets "
-        "[{architecture, target?, board?, system_version_id?, initram_version_id?, system_selection?}] "
-        "(a missing version id follows latest for that hardware). Optional system_selection "
+        "[{architecture, target?, board?, follow?, ring?, system_version_id?, initram_version_id?, system_selection?}] "
+        "(a missing version id follows latest for that hardware). follow = 'default' | 'tag:stable' | 'tag:lts' | "
+        "'track:<kernel>[/<nvidia>]' (e.g. track:linux-7.2/nvidia-615) | 'version:<slot id>' (needs an explicit target; exclusive with "
+        "system_version_id and system_selection); ring = 'general' (default) | 'soak' | 'lab' (lab fleets only) picks how early in the "
+        "release train the class receives updates. Omitting follow/ring keeps the default tag on the general ring; "
+        "the read-back compares follow and ring per target. Optional system_selection "
         "{mode:'follow', kernel_track:'linux-7.2', features:{nvidia:{track:'nvidia-595'}}} follows named approved "
         "tracks instead; it is exclusive with system_version_id (an exact whole-slot pin). NVIDIA choices currently "
         "require target 'x86-nvidia'; generic x86 and ARM targets remain independent in mixed fleets. "
@@ -3905,9 +3950,10 @@ def set_fleet_update_policy(
             for i, t in enumerate(new_targets):
                 if not isinstance(t, dict) or not t.get("architecture"):
                     return _dumps({"error": f"targets[{i}] needs an architecture."})
-                if set(t) - {"architecture", "target", "board", "system_version_id", "initram_version_id", "system_selection"}:
+                if set(t) - {"architecture", "target", "board", "system_version_id", "initram_version_id", "system_selection", "follow", "ring"}:
                     return _dumps({"error": f"targets[{i}] contains unknown fields."})
                 _validate_system_selection(t)
+                _validate_follow_ring(t)
             if new_mode == before["mode"] and _policy_targets(new_targets) == before["targets"] and window in (None, before["update_window"]):
                 raise ToolRefusal("No change: the fleet already has this update policy.", before=before)
             body: dict[str, Any] = {"mode": new_mode}
@@ -4539,6 +4585,7 @@ def _type_spec(
     use_current_versions: bool,
     version_ids: list[str] | None,
     final_action: str | None,
+    use_fleet_policy: bool = False,
 ) -> dict[str, Any]:
     """Body fragment carrying the type-specific spec of a non-config rollout."""
     if kind == "reboot":
@@ -4547,10 +4594,10 @@ def _type_spec(
         return {"restart_workload_spec": {"container_target": container_target}} if container_target else {}
     if kind == "system_update":
         ids = _as_list(version_ids)
-        if not use_current_versions and not ids:
-            raise ValueError("system_update needs version_ids [UUID] or use_current_versions=true.")
-        if use_current_versions and ids:
-            raise ValueError("Pass version_ids or use_current_versions, not both.")
+        if not (use_fleet_policy or use_current_versions) and not ids:
+            raise ValueError("system_update needs version_ids [UUID] or use_fleet_policy=true.")
+        if (use_fleet_policy or use_current_versions) and ids:
+            raise ValueError("Pass version_ids or use_fleet_policy, not both.")
         action = (final_action or "reboot").strip().lower()
         if action not in ("reboot", "none", "restart"):
             raise ValueError("final_action must be reboot, none or restart.")
@@ -4560,8 +4607,10 @@ def _type_spec(
         spec: dict[str, Any] = {"final_action": action}
         if ids:
             spec["version_ids"] = ids
+        elif use_fleet_policy:
+            spec["use_fleet_policy"] = True
         else:
-            spec["use_current_versions"] = True
+            spec["use_current_versions"] = True  # legacy alias, same behaviour
         return {"system_update_spec": spec}
     return {}
 
@@ -4634,7 +4683,7 @@ def list_rollouts(
         "the fleet already runs (such a rollout never converges), offline devices (only admitted while online), unfinished "
         "rollouts on the same fleets, a deprecated/archived configuration, a signature policy in the spec, disruptive types. "
         "Ends with the exact create_rollout arguments. type: config (default), reboot, restart_workload, system_update "
-        "(use_current_versions or version_ids)."
+        "(use_fleet_policy or version_ids)."
     ),
     annotations=_READ_ONLY,
 )
@@ -4650,6 +4699,7 @@ def preview_rollout(
     version_ids: list[str] | None = None,
     final_action: str | None = None,
     organization_id: str | None = None,
+    use_fleet_policy: bool = False,
 ) -> str:
     try:
         client, org_id = _ctx(organization_id)
@@ -4657,7 +4707,7 @@ def preview_rollout(
         strat = _effective_strategy(strategy)
         fleet_rows = _resolve_fleets(client, org_id, fleets)
         fleet_ids = [str(f["id"]) for f in fleet_rows]
-        spec_fragment = _type_spec(kind, force, container_target, use_current_versions, version_ids, final_action)
+        spec_fragment = _type_spec(kind, force, container_target, use_current_versions, version_ids, final_action, use_fleet_policy)
         warnings: list[str] = []
         cfg: dict[str, Any] | None = None
         target_version: int | None = None
@@ -4733,7 +4783,7 @@ def preview_rollout(
             args["container_target"] = container_target
         elif kind == "system_update":
             args.update({"final_action": spec_fragment["system_update_spec"]["final_action"]})
-            args.update({k: v for k, v in spec_fragment["system_update_spec"].items() if k in ("version_ids", "use_current_versions")})
+            args.update({k: v for k, v in spec_fragment["system_update_spec"].items() if k in ("version_ids", "use_current_versions", "use_fleet_policy")})
         if strategy:
             args["strategy"] = strategy
         blocking = [p for p in plans if p.get("same_version_noop")]
