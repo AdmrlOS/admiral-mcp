@@ -34,7 +34,7 @@ from . import troubleshoot as ts
 from .extensions import load_env_extensions
 from .distill import distill_events, distill_logs, health_from_stats
 from .resolve import DeviceResolver, collect_ips, is_uuid, summarise_device
-from .watch import RolloutWatch, StateWatch, summarise_state
+from .watch import ROLLBACK_COMPONENTS, RolloutWatch, StateWatch, summarise_state
 
 INSTRUCTIONS = """
 You are talking to an Admiral edge fleet (physical devices running Admiral OS).
@@ -54,8 +54,12 @@ How to answer naturally:
 - duplicate_fleet / duplicate_configuration create a copy (billed features and secret files are never copied;
   the result lists them under skipped). Only on an explicit request.
 - Rollouts: preview_rollout (read-only plan: impact, spec diff, warnings, the exact create_rollout call), create_rollout
-  (config, reboot, restart_workload, system_update over one or more fleets), list_rollouts, get_rollout,
+  (config, reboot, restart_workload, system_update, rollback over one or more fleets), list_rollouts, get_rollout,
   list_rollout_devices, rollout_control, watch_rollout (SSE until terminal).
+- Manual rollback: get_device_state summary.rollback shows, per component (system, agent), whether the device can roll
+  back and to which version. rollback_device rolls ONE device back (system restarts the device; the bootloader falls
+  back automatically if the older system fails to boot); create_rollout type=rollback does it over fleets. The version
+  left is not reinstalled on that device until a forced update. Not the same as rollout_control rollback.
 - Changing what a fleet runs: list_configurations / get_configuration / diff_configuration_versions to read;
   edit_configuration (dry_run first; saves a NEW version; base_version guards against concurrent edits),
   rollback_configuration, update_configuration_metadata, create_configuration, delete_configuration. get_fleet shows
@@ -97,7 +101,7 @@ How to answer naturally:
   READS: it resolves names to UUIDs and returns {summary: "Not done yet: ...", confirmation_required, action, preview
   (diff, before/after, affected counts), irreversible, next: {tool, arguments incl. confirm: true}}. Show that to the
   user, and call the tool again with `next.arguments` (confirm=true) only after they explicitly agree. Never set
-  confirm=true on the first call, and never reuse a confirmation for a different target. Covered: reboot, workload
+  confirm=true on the first call, and never reuse a confirmation for a different target. Covered: reboot, device rollback, workload
   commands, document patches/pushes, local-override adopt/discard, memory tests, configuration edits/rollbacks/deletes,
   fleet assignment and update policy, moving a device (wipe=true erases its data, irreversible), device overrides,
   rollouts and rollout control, network/USB/SSH/security/registry-proxy/custom-metrics policy, alert rule deletes,
@@ -1546,6 +1550,147 @@ def reboot_device(device: str, organization_id: str | None = None, confirm: bool
         return _err(inf)
 
 
+def _rollback_component(value: str | None) -> str:
+    key = (value or "").strip().lower()
+    if key not in ROLLBACK_COMPONENTS:
+        raise ValueError("component must be 'system' (the A/B system slot) or 'agent' (the admrl agent binary).")
+    return key
+
+
+@mcp.tool(
+    description=(
+        "Manually roll ONE device back: component 'system' switches it to its other system slot (the previous system "
+        "version it still holds); 'agent' switches it to the previous admrl agent binary. A system rollback RESTARTS the "
+        "device (its workload is interrupted) and the bootloader returns to the current system automatically if the "
+        "older one fails to boot. An agent rollback restarts the agent. The version left behind will NOT be reinstalled "
+        "on this device until a forced update. Without to_version it uses the rollback target the device reports in "
+        "get_device_state (summary.rollback) and sends it as the expected version, so the device refuses if its target "
+        "changed; to_version names the version you expect to land on. The device can refuse (reason: unsupported, "
+        "no_target, version_mismatch, trial_pending, busy, target_invalid, incompatible, error); the refusal reason and "
+        "detail are returned and nothing changes. 503 = device offline, 504 = no reply (check get_device_state before "
+        "retrying). For many devices use create_rollout type=rollback. Destructive: without confirm=true it only reads "
+        "and returns a preview; call again with confirm=true after the user explicitly agrees. The result is the device's "
+        "acknowledgement: confirm with get_device_state once it reconnects."
+    ),
+    annotations=ToolAnnotations(destructiveHint=True, idempotentHint=False, readOnlyHint=False),
+)
+def rollback_device(
+    device: str,
+    component: str,
+    to_version: str | None = None,
+    organization_id: str | None = None,
+    confirm: bool = False,
+) -> str:
+    try:
+        label = _rollback_component(component)
+        wire = ROLLBACK_COMPONENTS[label]
+        found = _resolve_device(device, organization_id)
+        if not found.get("match"):
+            return _dumps(found)
+        match, org_id = found["match"], found["organization_id"]
+        who = {"id": match["id"], "name": match.get("name")}
+        client = get_client()
+        state = (client.get_device_state(match["id"], org_id=org_id) or {}).get("state")
+        rollback = ((state or {}).get("boot") or {}).get("rollback") if isinstance(state, dict) else None
+        target = rollback.get(wire) if isinstance(rollback, dict) else None
+        target = target if isinstance(target, dict) else {}
+        expect = (to_version or "").strip() or None
+        warnings: list[str] = []
+        if expect is None:
+            if not (target.get("available") and target.get("toVersion")):
+                reason = target.get("reason") or "unsupported"
+                detail = target.get("detail") or (
+                    "The device does not report a rollback target for this component (an older agent, or no state yet)."
+                    if not target
+                    else "The device reports no rollback target."
+                )
+                return _dumps(
+                    {
+                        "summary": f"Not done: the {label} of {match.get('name') or match['id']} cannot be rolled back ({reason}). {detail}",
+                        "status": "unavailable",
+                        "device": who,
+                        "component": label,
+                        "reason": reason,
+                        "detail": detail,
+                        "nothing_changed": True,
+                    }
+                )
+            expect = str(target["toVersion"])
+        elif not target.get("available"):
+            warnings.append(
+                "The device does not currently report this rollback as available"
+                + (f" ({target['reason']})" if target.get("reason") else "")
+                + "; it will re-check and may refuse."
+            )
+        elif target.get("toVersion") and str(target["toVersion"]) != expect:
+            warnings.append(f"The device reports {target['toVersion']} as its rollback target, not {expect}; it will refuse on a mismatch.")
+        from_version = target.get("fromVersion")
+        leaves = f"{from_version} " if from_version else "the current version "
+        effect = (
+            f"roll back the {label} of {match.get('name') or match['id']} to {expect}. "
+            + (
+                "The device restarts now and its workload is interrupted; the bootloader returns to the current system "
+                "automatically if the older one fails to boot. "
+                if label == "system"
+                else "The agent restarts now. "
+            )
+            + f"The version left ({leaves.strip()}) will not be reinstalled on this device until a forced update."
+        )
+        gate = _gate(
+            confirm,
+            "rollback_device",
+            effect,
+            action={"device": who, "component": label, "changes": f"{label} rolls back to {expect}"},
+            args={"device": match["id"], "component": label, "to_version": expect},
+            org_id=org_id,
+            preview={"device": match, "component": label, "from_version": from_version, "to_version": expect, "slot": target.get("slot")},
+            warnings=warnings or None,
+        )
+        if gate:
+            return gate
+        try:
+            result = client.rollback_device(match["id"], wire, expect, org_id=org_id)
+        except AdmiralAPIError as exc:
+            body = exc.body.get("data") if isinstance(exc.body, dict) and isinstance(exc.body.get("data"), dict) else exc.body
+            if exc.status == 409 and isinstance(body, dict) and body.get("status") == "refused":
+                reason, detail = body.get("reason"), body.get("detail")
+                return _dumps(
+                    {
+                        "summary": f"Refused by the device ({reason}): {detail}" if detail else f"Refused by the device ({reason}).",
+                        "status": "refused",
+                        "device": who,
+                        "component": label,
+                        "reason": reason,
+                        "detail": detail,
+                        "nothing_changed": True,
+                    }
+                )
+            if exc.status in (503, 504):
+                return _dumps(
+                    {
+                        "error": str(exc),
+                        "hint": "The device is offline." if exc.status == 503 else "The device did not reply in time; the rollback may or may not have started.",
+                        "next": "Read get_device_state before retrying.",
+                    }
+                )
+            raise
+        result = result if isinstance(result, dict) else {}
+        return _dumps(
+            {
+                "summary": f"Accepted: {label} rollback of {match.get('name') or match['id']} from {result.get('from_version')} to {result.get('to_version')}. "
+                + ("The device is restarting." if label == "system" else "The agent is restarting."),
+                "status": result.get("status") or "accepted",
+                "device": who,
+                "component": label,
+                "from_version": result.get("from_version"),
+                "to_version": result.get("to_version"),
+                "next": "Once the device reconnects, confirm with get_device_state (summary.versions, summary.rollback).",
+            }
+        )
+    except Exception as inf:
+        return _err(inf)
+
+
 @mcp.tool(
     description=(
         "Change a device's workload status: start, stop, restart, or recreate. "
@@ -2227,7 +2372,11 @@ def _pick_by_name(rows: list[dict[str, Any]], name: str, what: str) -> dict[str,
         "list of them. type 'config' (default): configuration = name or UUID (required), version = integer or \"latest\"; "
         "a config rollout may also switch a fleet to a different configuration, and on completion the fleet is pinned to "
         "the explicit version. Other types need no configuration: 'reboot' (force=true skips the graceful path), "
-        "'restart_workload' (optional container_target) and 'system_update' (OS update: use_fleet_policy=true resolves each "
+        "'restart_workload' (optional container_target), 'rollback' (component 'system' or 'agent', optional to_version: each "
+        "device switches back to the previous system slot or agent binary it still holds and refuses if its target differs "
+        "from to_version; a system rollback restarts devices, the bootloader falls back automatically if the older system fails "
+        "to boot, and the version left is not reinstalled until a forced update; devices with nothing to roll back fail with the "
+        "device's refusal reason) and 'system_update' (OS update: use_fleet_policy=true resolves each "
         "device's image from its fleet's update policy (follow/ring), or version_ids [UUID]; use_current_versions is a legacy alias of "
         "use_fleet_policy; final_action reboot|none|restart). strategy (all optional; server defaults canary 1, "
         "maxInFlight 50, maxUnavailable 2, failureThreshold 0.1, progressDeadline 30m): {canary, maxInFlight, "
@@ -2254,6 +2403,8 @@ def create_rollout(
     version_ids: list[str] | None = None,
     final_action: str | None = None,
     use_fleet_policy: bool = False,
+    component: str | None = None,
+    to_version: str | None = None,
     confirm: bool = False,
 ) -> str:
     try:
@@ -2307,7 +2458,7 @@ def create_rollout(
                 "name": name or f"{kind} → {where}",
                 "type": kind,
                 "fleet_ids": fleet_ids,
-                **_type_spec(kind, force, container_target, use_current_versions, version_ids, final_action, use_fleet_policy),
+                **_type_spec(kind, force, container_target, use_current_versions, version_ids, final_action, use_fleet_policy, component, to_version),
             }
         if description:
             body["description"] = description
@@ -2340,6 +2491,8 @@ def create_rollout(
                         "use_fleet_policy": True if use_fleet_policy else None,
                         "version_ids": version_ids,
                         "final_action": final_action,
+                        "component": component,
+                        "to_version": to_version,
                     }
                 )
             return _gate(
@@ -2486,7 +2639,7 @@ _DELIVERY_NOTE = (
 )
 _ACTIVE_ROLLOUT_STATUSES = "pending,scheduled,in_progress,paused"
 _CONFIG_STATUSES = ("draft", "active", "testing", "deprecated", "archived")  # stored lower-case (swagger says capitalised)
-_ROLLOUT_TYPES = ("config", "reboot", "restart_workload", "system_update")
+_ROLLOUT_TYPES = ("config", "reboot", "restart_workload", "system_update", "rollback")
 _STRATEGY_DEFAULTS = {
     "canary": 1,
     "maxInFlight": 50,
@@ -4586,8 +4739,15 @@ def _type_spec(
     version_ids: list[str] | None,
     final_action: str | None,
     use_fleet_policy: bool = False,
+    component: str | None = None,
+    to_version: str | None = None,
 ) -> dict[str, Any]:
     """Body fragment carrying the type-specific spec of a non-config rollout."""
+    if kind == "rollback":
+        spec: dict[str, Any] = {"component": ROLLBACK_COMPONENTS[_rollback_component(component)]}
+        if (to_version or "").strip():
+            spec["to_version"] = to_version.strip()  # type: ignore[union-attr]
+        return {"rollback_spec": spec}
     if kind == "reboot":
         return {"reboot_spec": {"force": True}} if force else {}
     if kind == "restart_workload":
@@ -4604,14 +4764,14 @@ def _type_spec(
         for vid in ids:
             if not is_uuid(vid):
                 raise ValueError(f"version_ids must be UUIDs; got {vid!r}.")
-        spec: dict[str, Any] = {"final_action": action}
+        update: dict[str, Any] = {"final_action": action}
         if ids:
-            spec["version_ids"] = ids
+            update["version_ids"] = ids
         elif use_fleet_policy:
-            spec["use_fleet_policy"] = True
+            update["use_fleet_policy"] = True
         else:
-            spec["use_current_versions"] = True  # legacy alias, same behaviour
-        return {"system_update_spec": spec}
+            update["use_current_versions"] = True  # legacy alias, same behaviour
+        return {"system_update_spec": update}
     return {}
 
 
@@ -4622,7 +4782,7 @@ def _effective_strategy(strategy: dict[str, Any] | None) -> dict[str, Any]:
 @mcp.tool(
     description=(
         "List rollouts (GET /rollouts), newest first, as compact rows: id, name, type (config, reboot, restart_workload, "
-        "system_update), status (pending, scheduled, in_progress, paused, completed, failed, cancelled, rolled_back), "
+        "system_update, rollback), status (pending, scheduled, in_progress, paused, completed, failed, cancelled, rolled_back), "
         "progress, fleets, configuration + version, counts, paused reason. Filters: fleet (name/UUID or list), status "
         "(one or comma-separated), type, search, active_only. Read-only. Next: get_rollout / list_rollout_devices / "
         "watch_rollout for one rollout."
@@ -4683,7 +4843,7 @@ def list_rollouts(
         "the fleet already runs (such a rollout never converges), offline devices (only admitted while online), unfinished "
         "rollouts on the same fleets, a deprecated/archived configuration, a signature policy in the spec, disruptive types. "
         "Ends with the exact create_rollout arguments. type: config (default), reboot, restart_workload, system_update "
-        "(use_fleet_policy or version_ids)."
+        "(use_fleet_policy or version_ids), rollback (component 'system' or 'agent', optional to_version)."
     ),
     annotations=_READ_ONLY,
 )
@@ -4700,6 +4860,8 @@ def preview_rollout(
     final_action: str | None = None,
     organization_id: str | None = None,
     use_fleet_policy: bool = False,
+    component: str | None = None,
+    to_version: str | None = None,
 ) -> str:
     try:
         client, org_id = _ctx(organization_id)
@@ -4707,7 +4869,7 @@ def preview_rollout(
         strat = _effective_strategy(strategy)
         fleet_rows = _resolve_fleets(client, org_id, fleets)
         fleet_ids = [str(f["id"]) for f in fleet_rows]
-        spec_fragment = _type_spec(kind, force, container_target, use_current_versions, version_ids, final_action, use_fleet_policy)
+        spec_fragment = _type_spec(kind, force, container_target, use_current_versions, version_ids, final_action, use_fleet_policy, component, to_version)
         warnings: list[str] = []
         cfg: dict[str, Any] | None = None
         target_version: int | None = None
@@ -4772,6 +4934,11 @@ def preview_rollout(
             warnings.append(f"{len(active)} unfinished rollout(s) already target these fleets (see active_rollouts); a newer rollout takes over device pins.")
         if isinstance(impact, dict) and impact.get("is_disruptive"):
             warnings.append(f"A {kind} rollout is disruptive: devices restart or reboot.")
+        if kind == "rollback":
+            warnings.append(
+                "Devices with nothing to roll back (or a different target than to_version) are refused and counted as failed. "
+                "The version left on each device is not reinstalled until a forced update."
+            )
         if kind == "system_update" and isinstance(impact, dict) and impact.get("incompatible_count"):
             warnings.append(f"{impact['incompatible_count']} device(s) have no compatible version.")
         args: dict[str, Any] = {"fleet": fleet_ids if len(fleet_ids) > 1 else fleet_ids[0], "type": kind}
@@ -4781,6 +4948,10 @@ def preview_rollout(
             args["force"] = True
         elif kind == "restart_workload" and container_target:
             args["container_target"] = container_target
+        elif kind == "rollback":
+            args["component"] = _rollback_component(component)
+            if (to_version or "").strip():
+                args["to_version"] = to_version.strip()  # type: ignore[union-attr]
         elif kind == "system_update":
             args.update({"final_action": spec_fragment["system_update_spec"]["final_action"]})
             args.update({k: v for k, v in spec_fragment["system_update_spec"].items() if k in ("version_ids", "use_current_versions", "use_fleet_policy")})

@@ -88,6 +88,7 @@ def world() -> GuardedAPI:
     on = api.on
     on("GET", f"/devices/{DEV}", ok({"id": DEV, "name": "dan-qemu-3", "fleet": {"id": FLEET, "name": "shop"}, "isOnline": {"isOnline": True}}))
     on("GET", f"/devices/{DEV}/workload", ok({"state": "running"}))
+    on("GET", f"/devices/{DEV}/state", ok({"state": {"boot": {"rollback": {"rootfs": {"available": True, "fromVersion": "2.0.0", "toVersion": "1.9.0", "slot": "b"}}}}}))
     on("GET", f"/devices/{DEV}/memory-test", ok({"supported": True, "status": {}}))
     on("GET", f"/devices/{DEV}/document", httpx.Response(200, json={"spec": {"system": {"screenshots": "enabled"}}, "status": {}}, headers={"ETag": '"v1"'}))
     on("POST", f"/devices/{DEV}/document:render", ok({"diff": [{"path": "spec.x", "from": 1, "to": 2}], "revision": "r1", "converged": False}))
@@ -171,6 +172,7 @@ def _cases(tmp_path) -> dict[str, dict[str, Any]]:
     payload.write_text("-----BEGIN KEY-----\nabc\n")
     return {
         "reboot_device": {"device": "dan-qemu-3"},
+        "rollback_device": {"device": "dan-qemu-3", "component": "system"},
         "change_workload_status": {"device": "dan-qemu-3", "action": "restart"},
         "patch_device_document": {"device": "dan-qemu-3", "merge_patch": {"spec": {"system": {"screenshots": "disabled"}}}},
         "render_device_document": {"device": "dan-qemu-3", "push": True},
@@ -207,7 +209,7 @@ def _cases(tmp_path) -> dict[str, dict[str, Any]]:
 
 
 CASE_NAMES = sorted(
-    """reboot_device change_workload_status patch_device_document render_device_document adopt_local_override
+    """reboot_device rollback_device change_workload_status patch_device_document render_device_document adopt_local_override
     discard_local_override start_memory_test cancel_memory_test create_rollout rollout_control edit_configuration
     rollback_configuration delete_configuration assign_fleet_configuration set_fleet_update_policy move_device_to_fleet
     set_device_configuration_override reset_device_configuration_override clear_device_configuration_override set_network_configuration
