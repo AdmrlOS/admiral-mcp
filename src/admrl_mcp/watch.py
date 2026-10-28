@@ -45,6 +45,32 @@ def compact_operation(op: dict[str, Any]) -> dict[str, Any]:
     return out
 
 
+ROLLBACK_COMPONENTS = {"system": "rootfs", "agent": "initram"}  # user-facing name -> state/wire key
+
+
+def summarise_rollback(rollback: Any) -> dict[str, Any] | None:
+    """Manual rollback availability per component (state.boot.rollback); None when the agent does not report it."""
+    if not isinstance(rollback, dict):
+        return None
+    out: dict[str, Any] = {}
+    for label, key in ROLLBACK_COMPONENTS.items():
+        t = rollback.get(key)
+        if isinstance(t, dict):
+            out[label] = {
+                k: v
+                for k, v in (
+                    ("available", bool(t.get("available"))),
+                    ("from_version", t.get("fromVersion")),
+                    ("to_version", t.get("toVersion")),
+                    ("slot", t.get("slot")),
+                    ("reason", t.get("reason")),
+                    ("detail", t.get("detail")),
+                )
+                if v not in (None, "")
+            }
+    return out or None
+
+
 def summarise_state(state: dict[str, Any] | None) -> dict[str, Any]:
     """Compact view of a DeviceState document (json tags from admrl-core)."""
     st = state or {}
@@ -71,6 +97,7 @@ def summarise_state(state: dict[str, Any] | None) -> dict[str, Any]:
         or None,
         "transition": workload.get("transition"),
         "versions": system.get("versions"),
+        "rollback": summarise_rollback((st.get("boot") or {}).get("rollback")),
         "progress": {
             "targetGeneration": progress.get("targetGeneration"),
             "operations": [compact_operation(op) for op in progress.get("operations") or [] if isinstance(op, dict)],

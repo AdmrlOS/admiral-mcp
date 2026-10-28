@@ -64,6 +64,7 @@ This server uses the historical query. Live tail cannot be opened with a PAT —
 | `get_telemetry_scope` | What telemetry the caller can query (org-wide or specific fleets/devices) |
 | `search` | Global search |
 | `reboot_device` | Destructive: previews first, reboots only with `confirm=true` |
+| `rollback_device` | Destructive: roll ONE device back, `component=system` (other system slot; restarts the device, the bootloader returns automatically if the older system fails to boot) or `agent` (previous agent binary; restarts the agent). Uses the target the device reports in `get_device_state` (`summary.rollback`) unless `to_version` is given; returns the device's refusal reason and detail if it refuses. The version left is not reinstalled until a forced update. Previews first, acts only with `confirm=true` |
 | `start_memory_test` | RAM test. `mode=live` keeps the workload running (`quick`, `passes` optional); `mode=full_online` stops the workload for the run. Both modes preview first and start only with `confirm=true`. A test boot is not offered here: start it from the dashboard or the device console |
 | `cancel_memory_test` | Stop the running memory test (restarts the workload if it was held) |
 | `get_memory_test` | Status, coverage %, errors, verdict, retired pages, memory fault, capabilities; flags a fault or an interrupted last test |
@@ -118,7 +119,7 @@ Tests enforce the rule for every registered tool, and `register_extension` rejec
 | `set_device_configuration_override`, `clear_device_configuration_override` | Per-device override layered over the fleet configuration |
 | `list_rollouts` | Compact rollout rows, filter by fleet/status/type |
 | `preview_rollout` | Read-only plan: current vs target per fleet, spec diff, device impact, strategy, warnings, and the exact `create_rollout` call |
-| `create_rollout` | `config` (default), `reboot`, `restart_workload` or `system_update` over one or more fleets |
+| `create_rollout` | `config` (default), `reboot`, `restart_workload`, `system_update` or `rollback` (`component=system\|agent`, optional `to_version`) over one or more fleets |
 | `get_rollout`, `list_rollout_devices`, `rollout_control`, `watch_rollout` | Inspect, pause/resume/cancel/rollback, and follow a rollout |
 
 ### Network, fleet policies, alerting, credentials, secret files

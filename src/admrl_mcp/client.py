@@ -939,6 +939,13 @@ class AdmiralClient:
     def reboot_device(self, device_id: str, *, org_id: str | None = None) -> Any:
         return self.post(f"devices/{device_id}/reboot", org_id=org_id, json={})
 
+    def rollback_device(self, device_id: str, component: str, expect_version: str | None, *, org_id: str | None = None) -> Any:
+        body: dict[str, Any] = {"component": component}
+        if expect_version:
+            body["expect_version"] = expect_version
+        # The backend waits up to 60 s for the device's verdict.
+        return self.post(f"devices/{device_id}/rollback", org_id=org_id, json=body, timeout=75.0)
+
     # Memory tests (online modes only; a test boot is operator-only and is not exposed here).
     def start_memory_test(self, device_id: str, body: dict[str, Any], *, org_id: str | None = None) -> Any:
         return self.post(f"devices/{device_id}/memory-test", org_id=org_id, json=body, timeout=45.0)
