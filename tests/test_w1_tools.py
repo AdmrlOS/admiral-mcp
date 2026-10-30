@@ -601,3 +601,87 @@ def test_list_fleet_protocols_counts_by_protocol_and_agent(monkeypatch):
     assert not any(r.url.path == "/v1/devices/d1" for r in api.seen)
     assert out["legacyDevices"] == [{"id": "d2", "name": "old", "agentVersion": "v40", "online": True}]
     assert "platform_gate" not in out and "platform_gate_error" not in out
+
+
+# ------------------------------------------------------------------- dump ---
+
+DUMP = {
+    "apiVersion": "admrl.co/v1",
+    "kind": "DeviceDump",
+    "metadata": {"deviceId": DEV, "sections": ["document", "usb"]},
+    "sections": {
+        "document": {"source": "stored", "data": {"kind": "Device"}},
+        "usb": {"source": "live", "error": "device_timeout"},
+    },
+}
+
+
+def test_get_device_dump_default_and_partial_errors(monkeypatch):
+    api = FakeAPI()
+    api.on("GET", f"/devices/{DEV}/dump", httpx.Response(200, json=DUMP))
+    install(monkeypatch, api)
+
+    out = json.loads(server.get_device_dump("dan-qemu-3"))
+
+    req = api.only()
+    assert dict(req.url.params) == {}
+    assert_pat(req)
+    assert out["device"]["id"] == DEV
+    assert out["dump"]["sections"]["usb"]["error"] == "device_timeout"
+    assert out["dump"]["sections"]["document"]["data"]["kind"] == "Device"
+
+
+def test_get_device_dump_builds_query(monkeypatch):
+    api = FakeAPI()
+    api.on("GET", f"/devices/{DEV}/dump", httpx.Response(200, json=DUMP))
+    install(monkeypatch, api)
+
+    json.loads(server.get_device_dump(DEV, sections=["document", "usb"], live=True, probe=True))
+
+    assert dict(api.only().url.params) == {"sections": "document,usb", "live": "1", "probe": "1"}
+
+
+def test_get_device_dump_probe_section_implies_probe(monkeypatch):
+    api = FakeAPI()
+    api.on("GET", f"/devices/{DEV}/dump", httpx.Response(200, json=DUMP))
+    install(monkeypatch, api)
+
+    json.loads(server.get_device_dump(DEV, sections=["probe"]))
+
+    assert dict(api.only().url.params) == {"sections": "probe", "probe": "1"}
+
+
+def test_get_device_dump_rejects_unknown_section_without_http(monkeypatch):
+    api = FakeAPI()
+    install(monkeypatch, api)
+
+    out = json.loads(server.get_device_dump(DEV, sections=["document", "bogus"]))
+
+    assert "bogus" in out["error"] and "systemServices" in out["valid_sections"]
+    assert api.seen == []
+
+
+@pytest.mark.parametrize("status", [403, 404])
+def test_get_device_dump_error_mapping(monkeypatch, status):
+    api = FakeAPI()
+    api.on("GET", f"/devices/{DEV}/dump", httpx.Response(status, json={"code": status, "msg": "nope"}))
+    install(monkeypatch, api)
+
+    out = json.loads(server.get_device_dump(DEV))
+
+    assert "error" in out
+    if status == 403:
+        assert out["permission_denied"] is True
+
+
+def test_get_device_dump_resolves_name(monkeypatch):
+    api = FakeAPI()
+    api.on("GET", f"/devices/{DEV}/dump", httpx.Response(200, json=DUMP))
+    install(monkeypatch, api)
+    monkeypatch.setattr(server, "_resolve_device", lambda q, organization_id=None, fleet_id=None: (
+        {"match": None, "candidates": [{"id": "a"}, {"id": "b"}], "organization_id": "org-1"} if q == "amb" else dict(RESOLVED)))
+
+    assert json.loads(server.get_device_dump("amb"))["candidates"]
+    assert api.seen == []
+    json.loads(server.get_device_dump("dan-qemu-3"))
+    assert api.only().url.path.endswith(f"/devices/{DEV}/dump")

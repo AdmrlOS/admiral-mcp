@@ -411,6 +411,27 @@ class AdmiralClient:
         accept = "application/yaml" if fmt == "yaml" else "application/json"
         return self.raw_request("GET", f"devices/{device_id}/document", org_id=org_id, headers={"Accept": accept})
 
+    def get_device_dump(
+        self,
+        device_id: str,
+        *,
+        org_id: str | None = None,
+        sections: list[str] | None = None,
+        live: bool = False,
+        probe: bool = False,
+    ) -> httpx.Response:
+        params: dict[str, Any] = {}
+        if sections:
+            params["sections"] = ",".join(sections)
+        if live:
+            params["live"] = "1"
+        if probe or (sections and "probe" in sections):
+            params["probe"] = "1"
+        # The probe section can take about 60 s on the device side.
+        return self.raw_request(
+            "GET", f"devices/{device_id}/dump", org_id=org_id, params=params or None, timeout=90.0
+        )
+
     def patch_device_document(
         self,
         device_id: str,
