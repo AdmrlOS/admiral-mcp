@@ -49,6 +49,7 @@ This server uses the historical query. Live tail cannot be opened with a PAT —
 | `get_device_workload` | Container state + live config identity |
 | `get_device_stats` | Health gauges |
 | `get_device_screenshot` | Live display capture (metadata + image block) |
+| `get_device_dump` | One-call full snapshot for analysis: Device document (requested and observed state, health) plus specifications, system services, USB, volumes, images, services, diagnose verdict, optional live probe (`probe=true`), memtest, boot reasons, configuration history, update state, versions, EdgeWire, progress. `sections` narrows it |
 | `get_device_logs` | Historical logs + crash-signature distill |
 | `get_device_events` | Lifecycle events |
 | `diagnose_device` | Offline/error sweep, or one device: stats + events + logs |

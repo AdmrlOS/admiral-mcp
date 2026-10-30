@@ -48,7 +48,9 @@ How to answer naturally:
 - For "what's on the screen of X", use get_device_screenshot (live capture; the device must be online).
 - Observed state: get_device_state (stored; live=true asks the device), watch_device_state (SSE timeline of
   condition transitions and progress operations). Desired state: get_device_document / render_device_document
-  (dry run) / patch_device_document. diagnose_device uses the backend verdict (plus the check-in/restart schedule)
+  (dry run) / patch_device_document. get_device_dump is the one-call full snapshot for analysis (document, specs,
+  services, USB, volumes, images, diagnose verdict, optional live probe, memtest, boot reasons, configuration
+  history, update state, versions, EdgeWire, progress). diagnose_device uses the backend verdict (plus the check-in/restart schedule)
   and falls back to local distillation. Device policy (health/connectivity/telemetry/maintenance limits, layered
   org < fleet < device): get_device_policy; change it with patch_device_document on spec.policy.
 - duplicate_fleet / duplicate_configuration create a copy (billed features and secret files are never copied;
@@ -1891,6 +1893,60 @@ def get_device_document(device: str, format: str = "json", organization_id: str 
         if _workload_override_missing(body):
             out["note"] = f"spec.workload.override is absent: either there is none or it is withheld. {_NEEDS_CONFIGS_VIEW}"
         return _dumps(out)
+    except Exception as exc:
+        return _err(exc)
+
+
+DEVICE_DUMP_SECTIONS = (
+    "document", "specifications", "systemServices", "usb", "volumes", "images", "services", "diagnose",
+    "probe", "memtest", "bootReasons", "configurationHistory", "updateState", "versionInfo", "edgewire", "progress",
+)
+
+
+@mcp.tool(
+    description=(
+        "One-call full snapshot of a device for analysis and troubleshooting (GET /devices/{id}/dump). Returns the "
+        "Device document (requested and observed state, including health: services, hardware, security, integrity, "
+        "init, certs, panic, rollback history, conditions) plus specifications, system services, USB, volumes, "
+        "images, services and listening ports, the diagnose verdict, an optional live probe, memtest summary, boot "
+        "reasons, configuration history, update state, version info, EdgeWire sessions and progress. Each entry in "
+        "`sections` has source (stored, live or computed), collectedAt, and either data or error; a section that "
+        "fails carries its error and the rest is still returned. sections: optional list from "
+        f"{', '.join(DEVICE_DUMP_SECTIONS)} (default all except probe). live=true asks the device for fresh data "
+        "where a section supports it (online devices only). probe=true (or requesting the probe section) runs the "
+        "on-device diagnostics probe, the same read-only call as probe_device, and can take about 60 s. Values like "
+        "`hmac:v1:...` are fingerprints of secrets and `sealed:v1:...` are platform values that are intentionally "
+        "withheld: do not try to decode them. `fp:sha256:` values are public key fingerprints. Logs, events, "
+        "metrics and screenshots are never in the dump: use get_device_logs, get_device_events, get_device_metrics "
+        "or get_device_screenshot."
+    ),
+    annotations=ToolAnnotations(readOnlyHint=True, idempotentHint=True),
+)
+def get_device_dump(
+    device: str,
+    sections: list[str] | None = None,
+    live: bool = False,
+    probe: bool = False,
+    organization_id: str | None = None,
+) -> str:
+    try:
+        wanted = [s.strip() for s in (sections or []) if s and s.strip()]
+        by_lower = {n.lower(): n for n in DEVICE_DUMP_SECTIONS}
+        bad = [s for s in wanted if s.lower() not in by_lower]
+        if bad:
+            return _dumps({"error": f"Unknown section(s): {', '.join(bad)}", "valid_sections": list(DEVICE_DUMP_SECTIONS)})
+        wanted = [by_lower[s.lower()] for s in wanted]
+        found = _resolve_device(device, organization_id)
+        if not found.get("match"):
+            return _dumps(found)
+        response = get_client().get_device_dump(
+            found["match"]["id"],
+            org_id=found["organization_id"],
+            sections=wanted or None,
+            live=live,
+            probe=probe or "probe" in wanted,
+        )
+        return _dumps({"device": found["match"], "dump": _json_or_text(response)})
     except Exception as exc:
         return _err(exc)
 
