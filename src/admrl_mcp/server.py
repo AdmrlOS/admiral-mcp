@@ -31,6 +31,7 @@ from . import fleetmetrics
 from . import memtest
 from . import ops
 from . import troubleshoot as ts
+from . import workloadset
 from .extensions import load_env_extensions
 from .distill import distill_events, distill_logs, health_from_stats
 from .resolve import DeviceResolver, collect_ips, is_uuid, summarise_device
@@ -71,12 +72,16 @@ How to answer naturally:
   edit_configuration -> preview_rollout -> create_rollout, then follow it with get_rollout. Fleet/device management: create_fleet,
   update_fleet, set_fleet_update_policy (OS update policy/window), update_device, move_device_to_fleet,
   get_device_configuration, set_device_configuration_override, reset_device_configuration_override, clear_device_configuration_override.
+- Workloads are service sets: a configuration has services.<name> (each with its own image, environment, ports) that the device
+  runs as separate containers. get_device_workload returns set.state and services[]; change_workload_status, get_device_logs
+  and explain_workload_failure address one service with service=<name>; edit_configuration needs service=<name> for
+  image/env edits when the set has more than one service; create_configuration also takes compose_yaml.
 - For how-to / what-is questions about Admiral itself (concepts, setup, provisioning, configuration), use
   search_docs then read_docs_page, answer from them, and always cite the docs URL.
 - "What is wrong with my device?" -> troubleshoot_device (one call: state, backend diagnosis, fresh probe, logs, events,
   workload, storage, time, connectivity, desired-vs-observed drift -> ranked findings with concrete steps and a docs
   link). Narrower: check_device_connectivity (DNS/TCP/NTP/NATS/clock/link), explain_workload_failure (crash loops,
-  exit codes, pull/signature/USB denials, OOM), fleet_health_report (problems grouped across a fleet). All read-only.
+  exit codes, pull/signature/USB denials, OOM, per service for a multi-service set), fleet_health_report (problems grouped across a fleet). All read-only.
 - Fleet / organisation metrics: get_fleet_metrics (avg, max, latest, device count; per_device=true ranks devices; pass
   device to compare one device with its fleet), get_fleet_health, get_fleet_uptime, get_org_metrics (org-wide, by
   fleet or device, top N), query_telemetry_metrics (raw PromQL), get_telemetry_scope. A 402 means the organisation
@@ -538,14 +543,41 @@ def get_device_system_services(
         return _err(exc)
 
 
-@mcp.tool(description="Current workload container state on a device (running/stopped/exited/unknown), plus live configuration identity in running (configurationName, image, version). Offline devices often report state=unknown. running and latestReport.configuration are withheld (null) without the View configurations permission.", annotations=_READ_ONLY)
+def _scrub_services(rows: list[dict[str, Any]]) -> None:
+    """Health probe output and errors are free text from the workload: mask credentials and bound the length."""
+    for row in rows:
+        if isinstance(row.get("health"), dict) and row["health"].get("last"):
+            row["health"]["last"] = ts.scrub(row["health"]["last"], 200)
+        if row.get("error"):
+            row["error"] = ts.scrub(row["error"], 200)
+
+
+@mcp.tool(
+    description=(
+        "Current workload state on a device (running/stopped/exited/unknown), plus live configuration identity in running "
+        "(configurationName, image, version). A multi-service set also returns set {state, configuration, version, service_count, "
+        "not_running, unhealthy} and services [{name, state, image, digest, restarts, health, ip, pid, exit_code, oom_killed, error}]; "
+        "set.state adds DEGRADED (a service is down without a restart loop). Older agents return only the single-workload shape. "
+        "Offline devices often report state=unknown. running and latestReport.configuration are withheld (null) without the View configurations permission."
+    ),
+    annotations=_READ_ONLY,
+)
 def get_device_workload(device: str, organization_id: str | None = None) -> str:
     try:
         found = _resolve_device(device, organization_id)
         if not found.get("match"):
             return _dumps(found)
-        workload = get_client().get_device_workload(found["match"]["id"], org_id=found["organization_id"])
+        client = get_client()
+        workload = client.get_device_workload(found["match"]["id"], org_id=found["organization_id"])
         out: dict[str, Any] = {"device": found["match"], "workload": workload}
+        # Per-service detail (ip, pid) lives in the state document; fetch it only when the agent reports a set.
+        view = workloadset.set_view(workload, None)
+        if view is not None:
+            doc = _safe(lambda: client.get_device_state(found["match"]["id"], org_id=found["organization_id"]), [], "state")
+            state = doc.get("state") if isinstance(doc, dict) else None
+            view = workloadset.set_view(workload, state) or view
+            _scrub_services(view["services"])
+            out.update(view)
         if isinstance(workload, dict) and workload.get("running") is None and (workload.get("state") or workload.get("latestReport")):
             out["note"] = f"The running configuration (image, command, environment) is withheld if you lack access to it. {_NEEDS_CONFIGS_VIEW}"
         return _dumps(out)
@@ -980,6 +1012,8 @@ def get_device_screenshot(
         "Historical logs for a device from VictoriaLogs (kernel, supervisor, workload). "
         "Works for offline and crashing devices. PAT cannot open the live websocket tail. "
         "level is one of debug, info, warn, error, fatal. lookback_hours defaults to 24. "
+        "service keeps only the lines of one service of a multi-service workload (matched on the service label or the "
+        "workload.<instance>-<service> source); the window is searched up to 1000 lines deep before filtering. "
         "Pagination: when page.next_before is set, pass it as `before` to fetch the next-older page "
         "(lookback_hours stays the window size); it is None once the oldest page is reached."
     ),
@@ -992,9 +1026,11 @@ def get_device_logs(
     search: str | None = None,
     limit: int = 200,
     before: str | None = None,
+    service: str | None = None,
     organization_id: str | None = None,
 ) -> str:
     try:
+        target = workloadset.check_service_name(service)
         found = _resolve_device(device, organization_id)
         if not found.get("match"):
             return _dumps(found)
@@ -1002,6 +1038,7 @@ def get_device_logs(
         client = get_client()
         org_id = found["organization_id"]
         device_id = found["match"]["id"]
+        wanted = min(max(limit, 1), 1000)
         payload = client.fetch_logs(
             device_id=device_id,
             org_id=org_id,
@@ -1009,21 +1046,34 @@ def get_device_logs(
             end=end,
             level=level,
             search=search,
-            limit=min(max(limit, 1), 1000),
+            # A service filter runs on the fetched page, so fetch the deepest page the API allows.
+            limit=1000 if target else wanted,
         )
-        distilled = distill_logs(payload)
         logs = payload.get("logs") or []
         has_more = bool(payload.get("has_more"))
-        return _dumps(
-            {
-                "device": found["match"],
-                "query": {"start": start, "end": end, "level": level, "search": search},
-                "log_source": payload.get("source"),
-                "page": {"has_more": has_more, "next_before": log_page_cursor(logs, has_more)},
-                "summary": distilled,
-                "logs": logs,
-            }
-        )
+        cursor_from = logs
+        if target:
+            logs = [e for e in logs if isinstance(e, dict) and workloadset.log_matches_service(e, target)]
+            if len(logs) > wanted:
+                logs = logs[:wanted]
+                cursor_from = logs  # older matching lines are re-fetched by the next page
+                has_more = True
+            payload = {**payload, "logs": logs}
+        distilled = distill_logs(payload)
+        out: dict[str, Any] = {
+            "device": found["match"],
+            "query": {"start": start, "end": end, "level": level, "search": search, **({"service": target} if target else {})},
+            "log_source": payload.get("source"),
+            "page": {"has_more": has_more, "next_before": log_page_cursor(cursor_from, has_more)},
+            "summary": distilled,
+            "logs": logs,
+        }
+        if target and not logs:
+            out["note"] = (
+                f"No lines for service {target} in this window. Lines are matched on the service label or a workload.<instance>-{target} "
+                "source; a single-service workload from an older agent has neither, so read it without service."
+            )
+        return _dumps(out)
     except Exception as exc:
         return _err(exc)
 
@@ -1696,6 +1746,8 @@ def rollback_device(
 @mcp.tool(
     description=(
         "Change a device's workload status: start, stop, restart, or recreate. "
+        "service names one service of a multi-service set (see get_device_workload services); omit it to act on the whole set "
+        "(for a single-service workload that is the workload). "
         "Resolves the device first (ambiguous names return candidates and send nothing). "
         "start/stop toggle the current workload; restart relaunches the same image; "
         "recreate tears down the workload bundle and rebuilds it from the current configuration. "
@@ -1709,6 +1761,7 @@ def rollback_device(
 def change_workload_status(
     device: str,
     action: str,
+    service: str | None = None,
     organization_id: str | None = None,
     confirm: bool = False,
 ) -> str:
@@ -1722,27 +1775,44 @@ def change_workload_status(
                     "choices": list(AdmiralClient.WORKLOAD_ACTIONS),
                 }
             )
+        target = workloadset.check_service_name(service)
         found = _resolve_device(device, organization_id)
         if not found.get("match"):
             return _dumps(found)
+        who = found["match"].get("name") or found["match"]["id"]
+        scope = f"service {target} of the workload" if target else "the workload"
         if confirm is not True:
             now = _safe(lambda: get_client().get_device_workload(found["match"]["id"], org_id=found["organization_id"]), [], "workload")
+            known = [r["name"] for r in (workloadset.set_view(now, None) or {}).get("services", [])]
+            if target and known and target not in known:
+                return _dumps({"error": f"Unknown service {target!r} on {who}; its services are: {', '.join(known)}.", "services": known, "device": found["match"]})
             return _gate(
                 confirm,
                 "change_workload_status",
-                f"{normalised} the workload on {found['match'].get('name') or found['match']['id']}. It is interrupted while the device applies the command.",
-                action={"device": found["match"], "workload_action": normalised, "changes": "the running workload"},
-                args={"device": found["match"]["id"], "action": normalised},
+                f"{normalised} {scope} on {who}. " + ("That service is" if target else "It is") + " interrupted while the device applies the command.",
+                action={
+                    "device": found["match"],
+                    "workload_action": normalised,
+                    **({"service": target} if target else {}),
+                    "changes": f"the running {'service' if target else 'workload'}",
+                },
+                args={"device": found["match"]["id"], "action": normalised, "service": target},
                 org_id=found["organization_id"],
                 preview={"workload_now": now},
             ) or ""
-        result = get_client().workload_command(
-            found["match"]["id"], action=normalised, org_id=found["organization_id"]
-        )
+        if target:
+            result = get_client().workload_command(
+                found["match"]["id"], action=normalised, service=target, org_id=found["organization_id"]
+            )
+        else:
+            result = get_client().workload_command(
+                found["match"]["id"], action=normalised, org_id=found["organization_id"]
+            )
         return _dumps(
             {
                 "device": found["match"],
                 "operation": f"workload_{normalised}",
+                **({"service": target} if target else {}),
                 "result": result,
                 "verify_with": "get_device_workload",
             }
@@ -1771,7 +1841,12 @@ def _redact_render(result: Any) -> Any:
         return result
     bundle = result["bundle"]
     workload = bundle.get("workload")
-    groups = [bundle.get("secrets"), workload.get("secretFiles") if isinstance(workload, dict) else None]
+    services = bundle.get("services")  # the service-set section of agents that run sets
+    groups = [
+        bundle.get("secrets"),
+        workload.get("secretFiles") if isinstance(workload, dict) else None,
+        services.get("secretFiles") if isinstance(services, dict) else None,
+    ]
     for files in groups:
         for f in files if isinstance(files, list) else []:
             if isinstance(f, dict) and f.get("content") is not None:
@@ -2074,7 +2149,7 @@ def render_device_document(device: str, push: bool = False, organization_id: str
         )
         out = {"device": found["match"], "dry_run": not push, "render": _redact_render(result)}
         bundle = result.get("bundle") if isinstance(result, dict) else None
-        if isinstance(bundle, dict) and not bundle.get("workload"):
+        if isinstance(bundle, dict) and not (bundle.get("workload") or bundle.get("services")):
             out["note"] = f"The bundle has no workload section and workload.* diff entries are omitted when withheld. {_NEEDS_CONFIGS_VIEW}"
         return _dumps(out)
     except Exception as exc:
@@ -2428,7 +2503,7 @@ def _pick_by_name(rows: list[dict[str, Any]], name: str, what: str) -> dict[str,
         "list of them. type 'config' (default): configuration = name or UUID (required), version = integer or \"latest\"; "
         "a config rollout may also switch a fleet to a different configuration, and on completion the fleet is pinned to "
         "the explicit version. Other types need no configuration: 'reboot' (force=true skips the graceful path), "
-        "'restart_workload' (optional container_target), 'rollback' (component 'system' or 'agent', optional to_version: each "
+        "'restart_workload' (optional container_target: one service name of a multi-service set, default the whole set), 'rollback' (component 'system' or 'agent', optional to_version: each "
         "device switches back to the previous system slot or agent binary it still holds and refuses if its target differs "
         "from to_version; a system rollback restarts devices, the bootloader falls back automatically if the older system fails "
         "to boot, and the version left is not reinstalled until a forced update; devices with nothing to roll back fail with the "
@@ -3017,7 +3092,9 @@ def list_configurations(
 @mcp.tool(
     description=(
         "One configuration in full: metadata, the spec of the latest (or the requested) version, recent version history "
-        "and the fleets assigned to it (GET /configurations/{id}/details, /versions, /versions/{n}). configuration = name "
+        "and the fleets assigned to it (GET /configurations/{id}/details, /versions, /versions/{n}). The spec is a service set: "
+        "services.<name> (image, command, environment, ports, mounts, volumes, dependsOn, restart, healthcheck, secrets, ...) plus "
+        "set-level network, volumes, edgewire, options, signaturePolicy. configuration = name "
         "or UUID (ambiguous names return candidates). Environment values whose names look like credentials are masked "
         "unless show_secret_env=true. Needs the View configurations permission (403 otherwise). Read-only."
     ),
@@ -3093,7 +3170,7 @@ def get_configuration(
             out["warnings"] = warnings
         out["next"] = [
             {"tool": "diff_configuration_versions", "why": "See what changed between versions."},
-            {"tool": "edit_configuration", "why": "Change the image, environment or any spec field (creates a new version)."},
+            {"tool": "edit_configuration", "why": "Change a service's image or environment, or any spec field (creates a new version)."},
         ]
         return _dumps(out)
     except Exception as exc:
@@ -3103,9 +3180,10 @@ def get_configuration(
 @mcp.tool(
     description=(
         "Structured diff between two versions of a configuration spec (GET /configurations/{id}/versions/{n}). Defaults: "
-        "to_version = latest, from_version = the one before. Returns one row per changed field (image, environment.NAME, "
-        "ports[tcp/80], volumes.NAME, options.*, mounts[...], command, ...) with old/new values; credential-looking "
-        "environment values are masked. Read-only."
+        "to_version = latest, from_version = the one before. Returns one row per changed field with old/new values: per service "
+        "services.<name>.image, services.<name>.environment.NAME, services.<name>.ports[tcp/80], services.<name>.volumes[NAME], "
+        "services.<name>.mounts[...], services.<name>.command, ... and set-level network.mode, volumes.NAME.*, options.*; "
+        "credential-looking environment values are masked. Read-only."
     ),
     annotations=_READ_ONLY,
 )
@@ -3146,6 +3224,20 @@ def diff_configuration_versions(
         return _err(exc)
 
 
+def _parse_ports(ports: list[Any]) -> list[dict[str, Any]]:
+    parsed = []
+    for p in ports:
+        if isinstance(p, dict):
+            row: dict[str, Any] = {"port": int(p["port"]), "protocol": p.get("protocol", "tcp")}
+            if p.get("hostPort"):
+                row["hostPort"] = int(p["hostPort"])
+            parsed.append(row)
+            continue
+        num, _, proto = str(p).partition("/")
+        parsed.append({"port": int(num), "protocol": (proto or "tcp").lower()})
+    return parsed
+
+
 def _spec_from_args(
     image: str | None,
     env: dict[str, Any] | None,
@@ -3154,43 +3246,99 @@ def _spec_from_args(
     desired_state: str | None,
     spec: dict[str, Any] | None,
 ) -> dict[str, Any]:
+    """Version-2 spec: the given set, or a one-service set named ``app`` built from the individual fields."""
     if spec is not None:
         if any((image, env, ports, command, desired_state)):
             raise ValueError("Pass either spec (a full spec) or the individual fields, not both.")
-        if not isinstance(spec, dict):
-            raise ValueError("spec must be a JSON object.")
-        built = dict(spec)
+        built = dict(ops.require_service_set(spec))
     else:
-        built = {}
+        svc: dict[str, Any] = {}
         if image:
-            built["image"] = image
+            svc["image"] = image
         if env:
-            built["environment"] = {str(k): "" if v is None else str(v) for k, v in env.items()}
+            svc["environment"] = {str(k): "" if v is None else str(v) for k, v in env.items()}
         if command:
-            built["command"] = list(command)
+            svc["command"] = list(command)
+        if ports:
+            svc["ports"] = _parse_ports(ports)
+        built = {"version": 2, "services": {"app": svc}}
         if desired_state:
             built["desiredState"] = desired_state
-        if ports:
-            parsed = []
-            for p in ports:
-                if isinstance(p, dict):
-                    parsed.append({"port": int(p["port"]), "protocol": p.get("protocol", "tcp")})
-                    continue
-                num, _, proto = str(p).partition("/")
-                parsed.append({"port": int(num), "protocol": (proto or "tcp").lower()})
-            built["ports"] = parsed
     built = ops.norm_spec(built)
-    if not built.get("image"):
-        raise ValueError("A configuration needs an image (pass image=... or spec={'image': ...}).")
+    missing = [name for name, svc in ops.services_of(built).items() if not svc.get("image")]
+    if missing:
+        raise ValueError(
+            "A configuration needs an image (pass image=... or spec={'services': {'<name>': {'image': ...}}})"
+            + (f"; no image on service {', '.join(sorted(missing))}." if spec is not None else ".")
+        )
     if built["desiredState"] not in ("RUNNING", "STOPPED"):
         raise ValueError("desired_state must be RUNNING or STOPPED.")
     return built
 
 
+_COMPOSE_MAX_BYTES = 256 * 1024
+
+
+def _compose_messages(payload: Any, key: str) -> list[str]:
+    """Warnings or errors of an importCompose answer as ``compose.path: message`` lines."""
+    if isinstance(payload, dict) and isinstance(payload.get("data"), dict) and key not in payload:
+        payload = payload["data"]
+    rows = payload.get(key) if isinstance(payload, dict) else None
+    out: list[str] = []
+    for row in rows if isinstance(rows, list) else []:
+        if isinstance(row, dict):
+            where = row.get("path") or row.get("field") or row.get("key")
+            what = row.get("message") or row.get("msg") or row.get("error") or json.dumps(row, default=str)
+            out.append(f"{where}: {what}" if where else str(what))
+        else:
+            out.append(str(row))
+    return out
+
+
+def _import_compose(client: AdmiralClient, org_id: str, text: str) -> tuple[dict[str, Any], list[str]]:
+    """Translate a compose file on the backend. Returns (version-2 spec, warnings); refuses on hard errors."""
+    if not text.strip():
+        raise ValueError("compose_yaml is empty.")
+    if len(text.encode()) > _COMPOSE_MAX_BYTES:
+        raise ValueError(f"compose_yaml is larger than {_COMPOSE_MAX_BYTES // 1024} KiB.")
+    try:
+        result = client.import_compose(text, org_id=org_id)
+    except AdmiralAPIError as exc:
+        if exc.status in (404, 405, 501):
+            raise ToolRefusal(
+                "This backend does not support compose import yet (POST /configurations:importCompose is not available). "
+                "Nothing was created. Describe the services with spec={'services': {...}} or create a one-service configuration with image=...",
+                compose_import_supported=False,
+            ) from exc
+        errors = _compose_messages(exc.body, "errors")
+        if exc.status in (400, 422) and errors:
+            raise ToolRefusal("The compose file cannot be imported; nothing was created. Fix these and retry.", errors=errors) from exc
+        raise
+    errors = _compose_messages(result, "errors")
+    if errors:
+        raise ToolRefusal("The compose file cannot be imported; nothing was created. Fix these and retry.", errors=errors)
+    built = result.get("spec") if isinstance(result, dict) else None
+    if not isinstance(built, dict):
+        raise ToolRefusal("The backend answered the compose import without a spec; nothing was created.")
+    ops.require_service_set(built, "The imported spec")
+    return built, _compose_messages(result, "warnings")
+
+
+def _services_text(spec: dict[str, Any]) -> str:
+    svcs = ops.services_of(spec)
+    if len(svcs) == 1:
+        return f"image {next(iter(svcs.values())).get('image')}"
+    return "services " + ", ".join(f"{name} ({svc.get('image')})" for name, svc in sorted(svcs.items()))
+
+
 @mcp.tool(
     description=(
-        "Create a configuration (POST /configurations) at version 1. Give a name plus either image (with optional env "
-        "{NAME: value}, ports ['8080/tcp', 80], command [...], desired_state RUNNING|STOPPED) or a full spec object. "
+        "Create a configuration (POST /configurations) at version 1: a set of services (compose-style). Give a name plus one of: "
+        "image (a one-service set named app, with optional env {NAME: value}, ports ['8080/tcp', 80], command [...], desired_state "
+        "RUNNING|STOPPED); spec, a version-2 object {version: 2, services: {<name>: {image, command, environment, ports, volumes, "
+        "dependsOn, restart, healthcheck, secrets, ...}}, volumes, network, options, ...}; or compose_yaml, the text of a "
+        "docker-compose file (translated by the backend, which lists unsupported keys as errors and lossy mappings as warnings; "
+        "needs a backend with compose import). New services see no secret files unless secrets lists their paths. "
         "Does not assign it to any fleet: use assign_fleet_configuration afterwards. 409 means the name already exists. "
         "Creates a resource, explicit request only. Do not put real secrets in env: use the dashboard's secret files."
     ),
@@ -3206,13 +3354,21 @@ def create_configuration(
     command: list[str] | None = None,
     desired_state: str | None = None,
     spec: dict[str, Any] | None = None,
+    compose_yaml: str | None = None,
     organization_id: str | None = None,
 ) -> str:
     try:
         if not name or not name.strip():
             return _dumps({"error": "name is required"})
-        built = _spec_from_args(image, env, ports, command, desired_state, spec)
-        client, org_id = _ctx(organization_id)
+        warnings: list[str] = []
+        if compose_yaml is not None:
+            if any((image, env, ports, command, desired_state, spec)):
+                raise ValueError("Pass compose_yaml, or spec, or the individual fields (image, env, ports, command), not a mix.")
+            client, org_id = _ctx(organization_id)
+            built, warnings = _import_compose(client, org_id, compose_yaml)
+        else:
+            built = _spec_from_args(image, env, ports, command, desired_state, spec)
+            client, org_id = _ctx(organization_id)
         body: dict[str, Any] = {"name": name.strip(), "spec": built}
         if description:
             body["description"] = description
@@ -3224,21 +3380,23 @@ def create_configuration(
         back = client.get(f"configurations/{cid}/details", org_id=org_id) if cid else {}
         back = back if isinstance(back, dict) else {}
         meta = back.get("configuration") or created
-        return _dumps(
+        out: dict[str, Any] = {
+            "summary": f"Created configuration {meta.get('name')} (v{_latest_of(meta) or 1}, {meta.get('status')}) with {_services_text(built)}.",
+            "configuration": {**_ref(meta), "status": meta.get("status"), "latest_version": _latest_of(meta)},
+            "spec": ops.mask_spec(ops.norm_spec(back.get("latest_spec") or built)),
+            "confirmed": bool(back),
+        }
+        if compose_yaml is not None:
+            out["source"] = "compose"
+            out["warnings"] = warnings
+        out["next"] = [
             {
-                "summary": f"Created configuration {meta.get('name')} (v{_latest_of(meta) or 1}, {meta.get('status')}) with image {built['image']}.",
-                "configuration": {**_ref(meta), "status": meta.get("status"), "latest_version": _latest_of(meta)},
-                "spec": ops.mask_spec(ops.norm_spec(back.get("latest_spec") or built)),
-                "confirmed": bool(back),
-                "next": [
-                    {
-                        "tool": "assign_fleet_configuration",
-                        "why": "Nothing runs this configuration until a fleet is assigned to it.",
-                        "arguments": {"fleet": "<fleet name or UUID>", "configuration": cid, "version": "latest"},
-                    }
-                ],
+                "tool": "assign_fleet_configuration",
+                "why": "Nothing runs this configuration until a fleet is assigned to it.",
+                "arguments": {"fleet": "<fleet name or UUID>", "configuration": cid, "version": "latest"},
             }
-        )
+        ]
+        return _dumps(out)
     except Exception as exc:
         return _err(exc)
 
@@ -3247,8 +3405,10 @@ def create_configuration(
     description=(
         "Edit a configuration: starts from the latest spec, applies the edits and saves a NEW version (PUT "
         "/configurations/{id}/spec). Edits: image (full reference) or image_tag (swap the tag only), env_set {NAME: value}, "
-        "env_unset [NAME], merge_patch (RFC 7386 JSON merge patch over the spec, null deletes a key, lists replace), or spec "
-        "(whole replacement, exclusive with the others). change_reason is required to write. base_version refuses the edit "
+        "env_unset [NAME] (these four act on one service: service names it and is required when the set has more than one, "
+        "the only service is the default), merge_patch (RFC 7386 JSON merge patch over the stored version-2 spec, e.g. "
+        "{services: {web: {restart: 'no'}}, network: {mode: 'host'}}; null deletes a key, lists replace), or spec "
+        "(whole version-2 replacement, exclusive with the others). change_reason is required to write. base_version refuses the edit "
         "if the latest version is no longer that number (someone else edited). Without confirm=true (or with the legacy "
         "dry_run=true) it only returns the diff and the effect; call again with confirm=true after the user agrees. No-op edits are refused. The result lists old → new version, the diff, which fleets follow "
         "'latest' (they resolve the new version immediately but devices only receive it when they reconnect or get a push; "
@@ -3269,6 +3429,7 @@ def edit_configuration(
     spec: dict[str, Any] | None = None,
     base_version: int | None = None,
     dry_run: bool = False,
+    service: str | None = None,
     organization_id: str | None = None,
     confirm: bool = False,
 ) -> str:
@@ -3293,7 +3454,7 @@ def edit_configuration(
             )
         current = ops.norm_spec(detail.get("latest_spec"))
         new_spec, notes = ops.apply_spec_edits(
-            current, image=image, image_tag=image_tag, env_set=env_set, env_unset=env_unset, patch=merge_patch, replace=spec
+            current, image=image, image_tag=image_tag, env_set=env_set, env_unset=env_unset, patch=merge_patch, replace=spec, service=service
         )
         rows = ops.spec_diff(current, new_spec)
         if not rows:
@@ -3321,7 +3482,7 @@ def edit_configuration(
             "warnings": warnings,
         }
         if preview_only:
-            edits = {"image": image, "image_tag": image_tag, "env_set": env_set, "env_unset": env_unset, "merge_patch": merge_patch, "spec": spec}
+            edits = {"image": image, "image_tag": image_tag, "env_set": env_set, "env_unset": env_unset, "merge_patch": merge_patch, "spec": spec, "service": service}
             out = json.loads(
                 _gate(
                     False,
@@ -4519,7 +4680,8 @@ def _check_override(override: Any) -> dict[str, Any]:
 @mcp.tool(
     description=(
         "Set a sparse per-device configuration override (PATCH /devices/{id}/configuration/override): fields layered over the fleet's "
-        "configuration for this one device. override keys: image, command, environment {NAME: value}, mounts, options, "
+        "configuration for this one device. override keys (single-image form; the backend applies them to the set's only service, "
+        "or the service named app): image, command, environment {NAME: value}, mounts, options, "
         "volumes, ports, image_cleaning, registry_credential_id, desiredState (RUNNING|STOPPED; STOPPED stops only this "
         "device's workload). By default the override is merged into the existing one (merge patch: null removes a field); "
         "Only given fields are sent and stored, including options per field; absent fields inherit. A blank environment value "
@@ -4559,7 +4721,8 @@ def set_device_configuration_override(
             body["reason"] = reason.strip()
         if confirm is not True:
             base_cfg = ops.norm_spec((current or {}).get("base_config"))
-            merged_after = ops.norm_spec(ops.merge_patch(base_cfg, wanted))
+            # Device overrides are still written in the single-image shape; the backend applies them to the set's only (or `app`) service.
+            merged_after, not_previewed = ops.legacy_override_preview(base_cfg, wanted)
             return _gate(
                 confirm,
                 "set_device_configuration_override",
@@ -4567,7 +4730,12 @@ def set_device_configuration_override(
                 action={"device": found["match"], "replace": bool(replace), "changes": "what this one device runs (layered over its fleet configuration)"},
                 args={"device": did, "override": override, "replace": True if replace else None, "reason": reason},
                 org_id=org_id,
-                preview={"override_before": existing or None, "override_after": wanted, "effective_changes": ops.spec_diff(base_cfg, merged_after)},
+                preview={
+                    "override_before": existing or None,
+                    "override_after": wanted,
+                    "effective_changes": ops.spec_diff(base_cfg, merged_after),
+                    **({"not_previewed": not_previewed} if not_previewed else {}),
+                },
             ) or ""
         if replace:
             client.put(f"devices/{did}/configuration", org_id=org_id, json=body)
@@ -5341,7 +5509,9 @@ def check_device_connectivity(
         "Explain why a device's workload is failing: crash/restart loops (failure count, last exit code with its meaning, last "
         "exit time), OOM kills, image pull/extract errors, signature-policy and USB-policy denials, configuration rollbacks and "
         "stuck updates (progress operations), with short scrubbed log excerpts from the workload/runtime and recent restart "
-        "events. Returns {summary, workload, findings, log_excerpts, restart_events}. Reads stored state (live when online); "
+        "events. For a multi-service set it explains per service: workload.services lists each service's state, restarts, exit code "
+        "with meaning, OOM kill, health probe output and its own log excerpts, and findings name the failing service (also the "
+        "DEGRADED set state and unhealthy services). Returns {summary, workload, findings, log_excerpts, restart_events}. Reads stored state (live when online); "
         "needs the Telemetry add-on for log excerpts (says so when missing). Read-only."
     ),
     annotations=_TROUBLESHOOT_ANNOTATIONS,
@@ -5376,6 +5546,7 @@ def explain_workload_failure(
         stored = ev.get("workload") if isinstance(ev.get("workload"), dict) else {}
         running = stored.get("running") or (stored.get("data") or {}).get("running") or {}
         exit_code = rt.get("exitCode")
+        svc_rows = workloadset.service_rows(stored, st)
         workload = {
             "state": wl.get("state") or stored.get("state") or (ev.get("diagnose") or {}).get("verdict", {}).get("workloadState"),
             "configuration": wl.get("configurationName") or running.get("configurationName"),
@@ -5410,8 +5581,28 @@ def explain_workload_failure(
             if ts._level(e) in ("error", "fatal", "critical", "panic", "warn")
             or any(k in ts._source(e) for k in ("workload", "container", "crun", "runtime"))
         ]
+        if svc_rows:
+            # The singular runtime fields describe only the first service of a set: each service row carries its own.
+            for key in ("failure_count", "last_exit_code", "last_exit_meaning", "last_exit_at", "oom_killed", "oom_events"):
+                workload.pop(key)
+            _scrub_services(svc_rows)
+            for row in svc_rows:
+                if row.get("exit_code") is not None:
+                    row["exit_meaning"] = ts._EXIT_MEANING.get(row["exit_code"], "application-defined")
+                row["log_excerpts"] = [
+                    {"time": e.get("timestamp"), "level": ts._level(e), "message": ts.scrub(ts._message(e), 200)}
+                    for e in wanted
+                    if workloadset.log_matches_service(e, row["name"])
+                ][:3]
+            workload["services"] = svc_rows
         excerpts = [
-            {"time": e.get("timestamp"), "level": ts._level(e), "source": e.get("source"), "message": ts.scrub(ts._message(e), 200)}
+            {
+                "time": e.get("timestamp"),
+                "level": ts._level(e),
+                "source": e.get("source"),
+                **({"service": next((r["name"] for r in svc_rows if workloadset.log_matches_service(e, r["name"])), None)} if svc_rows else {}),
+                "message": ts.scrub(ts._message(e), 200),
+            }
             for e in wanted[:10]
         ]
         restarts = [
@@ -7093,7 +7284,7 @@ def _credential_users(client: AdmiralClient, org_id: str, cid: str) -> tuple[lis
         except AdmiralAPIError:
             return None
         spec = (d or {}).get("latest_spec") if isinstance(d, dict) else None
-        if isinstance(spec, dict) and str(spec.get("registry_credential_id") or "").lower() == str(cid).lower():
+        if isinstance(spec, dict) and str(cid).lower() in ops.credential_ids(spec):
             return {"id": c["id"], "name": c.get("name")}
         return None
 
@@ -7105,7 +7296,7 @@ def _credential_users(client: AdmiralClient, org_id: str, cid: str) -> tuple[lis
     description=(
         "List registry credentials (GET /registry-credentials): name, registry, type (basic | aws_ecr), username and which "
         "secrets are stored (has_password, has_registry_token ...). Secret values are never returned by the API or this tool. "
-        "Optional search. Read-only. Attach a credential to a workload with registry_credential_id in the configuration spec."
+        "Optional search. Read-only. Attach a credential to a service with services.<name>.registryCredentialId in the configuration spec."
     ),
     annotations=_READ_ONLY,
 )
@@ -7196,7 +7387,7 @@ def create_registry_credential(
                 "summary": f"Created registry credential {name.strip()} for {registry.strip()}; {field} stored" + ("" if confirmed else " (NOT confirmed by read-back)") + ".",
                 "credential": row,
                 "read_back": {"confirmed": confirmed},
-                "next": [{"tool": "edit_configuration", "why": "Reference it from a configuration with merge_patch {registry_credential_id: <id>}.", "arguments": {"merge_patch": {"registry_credential_id": row.get("id")}}}],
+                "next": [{"tool": "edit_configuration", "why": "Reference it from a service with merge_patch {services: {<name>: {registryCredentialId: <id>}}}.", "arguments": {"merge_patch": {"services": {"<name>": {"registryCredentialId": row.get("id")}}}}}],
             }
         )
     except ops.SecretInputError as exc:
@@ -7311,7 +7502,7 @@ def delete_registry_credential(credential: str, organization_id: str | None = No
                 f"{row.get('name')} is referenced by {len(users)} configuration(s); nothing was deleted.",
                 credential=_ref(row),
                 configurations=users,
-                next=[{"tool": "edit_configuration", "why": "Remove or change registry_credential_id in those configurations first."}],
+                next=[{"tool": "edit_configuration", "why": "Remove or change registryCredentialId in those configurations first."}],
             )
         gate = _gate(
             confirm,

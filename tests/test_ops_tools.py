@@ -250,14 +250,15 @@ def test_diff_configuration_versions_edge_cases(api):
 
 def test_create_configuration_happy_path_with_read_back(api):
     api.on("POST", "/configurations", httpx.Response(201, json=envelope({"id": CONFIG, "name": "kiosk", "latest_version": 1, "status": "active"})))
-    api.on("GET", f"/configurations/{CONFIG}/details", details(1, spec(image="web:1", environment={"A": "1"})))
+    api.on("GET", f"/configurations/{CONFIG}/details", details(1, {"version": 2, "desiredState": "RUNNING", "services": {"app": {"image": "web:1", "environment": {"A": "1"}}}}))
 
     out = j(server.create_configuration(" kiosk ", image="web:1", env={"A": 1}, ports=["8080/udp", 80], command=["x"], description="d", tags=["t"]))
 
     body = bodies(api, "POST", "/configurations")[0]
     assert body["name"] == "kiosk" and body["description"] == "d" and body["tags"] == ["t"]
-    assert body["spec"]["image"] == "web:1" and body["spec"]["environment"] == {"A": "1"} and body["spec"]["command"] == ["x"]
-    assert body["spec"]["ports"] == [{"port": 8080, "protocol": "udp"}, {"port": 80, "protocol": "tcp"}]
+    app = body["spec"]["services"]["app"]
+    assert body["spec"]["version"] == 2 and app["image"] == "web:1" and app["environment"] == {"A": "1"} and app["command"] == ["x"]
+    assert app["ports"] == [{"port": 8080, "protocol": "udp"}, {"port": 80, "protocol": "tcp"}]
     assert out["confirmed"] is True and out["configuration"]["latest_version"] == 1
     assert out["next"][0]["tool"] == "assign_fleet_configuration"
 
@@ -267,9 +268,10 @@ def test_create_configuration_validation_and_conflict(api):
     assert "needs an image" in j(server.create_configuration("n"))["error"]
     assert "not both" in j(server.create_configuration("n", image="x", spec={"image": "y"}))["error"]
     assert "RUNNING or STOPPED" in j(server.create_configuration("n", image="x", desired_state="PAUSED"))["error"]
+    assert "version-2 spec" in j(server.create_configuration("n", spec={"image": "y"}))["error"]
     assert api.seen == []
     api.on("POST", "/configurations", httpx.Response(409, json={"msg": "Configuration already exists"}))
-    out = j(server.create_configuration("n", spec={"image": "y"}))
+    out = j(server.create_configuration("n", spec={"services": {"app": {"image": "y"}}}))
     assert out["conflict"] is True and "409" in out["error"]
 
 
@@ -339,7 +341,7 @@ def test_edit_configuration_refuses_no_op(api):
 
 def test_edit_configuration_bad_edit_arguments_are_errors_not_writes(api):
     edit_api(api)
-    out = j(server.edit_configuration(CONFIG, change_reason="x", spec={"image": "a"}, image_tag="2", confirm=True))
+    out = j(server.edit_configuration(CONFIG, change_reason="x", spec={"services": {"a": {"image": "a"}}}, image_tag="2", confirm=True))
     assert "cannot be combined" in out["error"]
     out = j(server.edit_configuration(CONFIG, change_reason="x", image="a:1", image_tag="2", confirm=True))
     assert "not both" in out["error"]
@@ -348,9 +350,9 @@ def test_edit_configuration_bad_edit_arguments_are_errors_not_writes(api):
 
 def test_edit_configuration_full_replacement_and_merge_patch(api):
     edit_api(api, after_spec=spec(image="other:1", environment={}, ports=[]))
-    out = j(server.edit_configuration(CONFIG, change_reason="swap", spec={"image": "other:1"}, confirm=True))
-    assert bodies(api, "PUT", "/spec")[0]["spec"]["image"] == "other:1"
-    assert {c["path"] for c in out["diff"]} >= {"image", "environment.MODE", "ports[tcp/80]"}
+    out = j(server.edit_configuration(CONFIG, change_reason="swap", spec={"services": {"app": {"image": "other:1"}}}, confirm=True))
+    assert bodies(api, "PUT", "/spec")[0]["spec"]["services"]["app"]["image"] == "other:1"
+    assert {c["path"] for c in out["diff"]} >= {"image", "environment.MODE", "ports[tcp/80]", "services.app.image"}
 
 
 def test_edit_configuration_merge_patch_deletes_and_sets(monkeypatch):

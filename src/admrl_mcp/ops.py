@@ -1,8 +1,12 @@
 """Pure helpers for the operations tools: configuration spec edits and diffs.
 
-Nothing here talks to the network. Specs are the JSON objects the configuration API returns
-(``image``, ``desiredState``, ``command``, ``environment``, ``mounts``, ``options``, ``volumes``,
-``ports``, ``registry_credential_id``, ``signaturePolicy``).
+Nothing here talks to the network. A spec is the JSON object the configuration API returns. Current
+backends answer with the version-2 shape: ``version: 2``, ``desiredState``, ``network``, ``services``
+(a map keyed by service name; each service has ``image``, ``command``, ``environment``, ``ports``,
+``mounts``, ``volumes``, ``registryCredentialId``, ``dependsOn``, ``restart``, ``healthcheck``,
+``secrets``, ...) and the set-level ``volumes``, ``edgewire``, ``options`` and ``signaturePolicy``.
+Older backends answer with the single-image shape (``image``, ``command``, ``environment``, ...); the
+read helpers here still understand it, the write helpers only build version 2.
 """
 
 from __future__ import annotations
@@ -19,15 +23,75 @@ MASK = "***"
 
 _COLLECTIONS_LIST = ("command", "mounts", "ports")
 _COLLECTIONS_DICT = ("environment", "volumes", "options")
+_SERVICE_LISTS = ("command", "mounts", "ports", "volumes", "secrets")
+# Version-1 top-level keys that live inside a service in version 2.
+LEGACY_SERVICE_KEYS = ("image", "command", "environment", "ports", "mounts", "registry_credential_id")
+# environment.NAME (single image) or services.<service>.environment.NAME (set).
+_ENV_PATH_RE = re.compile(r"^(?:services\.[^.]+\.)?environment\.(.+)$")
+
+
+def is_v2(spec: Any) -> bool:
+    """True for a service-set spec (``version: 2`` or a ``services`` map), False for the single-image shape."""
+    return isinstance(spec, dict) and (spec.get("version") == 2 or isinstance(spec.get("services"), dict))
+
+
+def services_of(spec: Any) -> dict[str, dict[str, Any]]:
+    """The ``services`` map of a version-2 spec (empty for the single-image shape)."""
+    services = spec.get("services") if isinstance(spec, dict) else None
+    return {str(k): v for k, v in services.items() if isinstance(v, dict)} if isinstance(services, dict) else {}
+
+
+def pick_service(spec: dict[str, Any], service: str | None) -> str:
+    """Name of the service an edit applies to: the requested one, or the only one of a single-service set."""
+    names = sorted(services_of(spec))
+    if not names:
+        raise ValueError("The configuration has no services.")
+    if service:
+        wanted = service.strip()
+        if wanted not in names:
+            raise ValueError(f"Unknown service {service!r}; this configuration has: {', '.join(names)}.")
+        return wanted
+    if len(names) == 1:
+        return names[0]
+    raise ValueError(f"This configuration has {len(names)} services ({', '.join(names)}): pass service=<name>.")
+
+
+def _norm_service(svc: dict[str, Any]) -> None:
+    for key in _SERVICE_LISTS:
+        if svc.get(key) is None:
+            svc[key] = []
+    if svc.get("environment") is None:
+        svc["environment"] = {}
+    else:
+        svc["environment"] = {str(k): v for k, v in svc["environment"].items()}
+    if isinstance(svc.get("image"), str):
+        svc["image"] = svc["image"].strip()
+    for port in svc["ports"]:
+        if isinstance(port, dict):
+            port["protocol"] = str(port.get("protocol") or "tcp").strip().lower()
 
 
 def norm_spec(spec: Any) -> dict[str, Any]:
     """Canonical copy of a spec, mirroring the backend's own normalisation.
 
     ``null`` collections become ``[]`` / ``{}``, ``desiredState`` is upper-cased (default RUNNING),
-    port protocols are lower-cased (default tcp) and the image is trimmed. Unknown keys are kept.
+    port protocols are lower-cased (default tcp) and images are trimmed (per service for a set).
+    Unknown keys are kept.
     """
     out = copy.deepcopy(spec) if isinstance(spec, dict) else {}
+    if is_v2(out):
+        out["version"] = 2
+        state = str(out.get("desiredState") or "").strip().upper()
+        out["desiredState"] = state or "RUNNING"
+        for key in ("volumes", "options"):
+            if out.get(key) is None:
+                out[key] = {}
+        if not isinstance(out.get("services"), dict):
+            out["services"] = {}
+        for svc in out["services"].values():
+            if isinstance(svc, dict):
+                _norm_service(svc)
+        return out
     for key in _COLLECTIONS_LIST:
         if out.get(key) is None:
             out[key] = []
@@ -51,14 +115,26 @@ def is_secret_key(name: str) -> bool:
 
 
 def mask_spec(spec: Any) -> Any:
-    """Copy of ``spec`` with credential-looking environment values masked."""
+    """Copy of ``spec`` with credential-looking environment values masked (every service of a set)."""
     out = copy.deepcopy(spec)
-    env = out.get("environment") if isinstance(out, dict) else None
-    if isinstance(env, dict):
-        for key in env:
-            if is_secret_key(key):
-                env[key] = MASK
+    if not isinstance(out, dict):
+        return out
+    envs = [out.get("environment")] + [svc.get("environment") for svc in services_of(out).values()]
+    for env in envs:
+        if isinstance(env, dict):
+            for key in env:
+                if is_secret_key(key):
+                    env[key] = MASK
     return out
+
+
+def credential_ids(spec: Any) -> set[str]:
+    """Lower-cased registry credential ids a spec references (``registry_credential_id`` or per-service ``registryCredentialId``)."""
+    if not isinstance(spec, dict):
+        return set()
+    found = {str(spec.get("registry_credential_id") or "")}
+    found |= {str(svc.get("registryCredentialId") or "") for svc in services_of(spec).values()}
+    return {c.lower() for c in found if c}
 
 
 # ----------------------------------------------------------------- edits ---
@@ -92,6 +168,20 @@ def merge_patch(target: Any, patch: Any) -> Any:
     return result
 
 
+def require_service_set(spec: Any, what: str = "spec") -> dict[str, Any]:
+    """A caller-supplied whole spec must be the version-2 shape (a non-empty ``services`` map)."""
+    if not isinstance(spec, dict):
+        raise ValueError(f"{what} must be a JSON object.")  # noqa: TRY004 - every spec validation error is a ValueError
+    if not services_of(spec):
+        legacy = sorted(k for k in LEGACY_SERVICE_KEYS if k in spec)
+        hint = f" Top-level {', '.join(legacy)} must move inside a service." if legacy else ""
+        raise ValueError(
+            f"{what} must be a version-2 spec: {{\"version\": 2, \"services\": {{\"<name>\": {{\"image\": ...}}}}}}.{hint} "
+            "Or pass the individual fields (image, env, ports, command) to describe a single service."
+        )
+    return spec
+
+
 def apply_spec_edits(
     spec: dict[str, Any],
     *,
@@ -101,79 +191,189 @@ def apply_spec_edits(
     env_unset: list[str] | None = None,
     patch: dict[str, Any] | None = None,
     replace: dict[str, Any] | None = None,
+    service: str | None = None,
 ) -> tuple[dict[str, Any], list[str]]:
     """Return ``(new_spec, notes)`` for the requested edits applied to ``spec``.
 
     ``replace`` (a whole spec) is exclusive with every other edit. Order otherwise: image/tag, env set,
-    env unset, then the merge patch (so the patch has the last word).
+    env unset, then the merge patch (so the patch has the last word). image, image_tag, env_set and
+    env_unset act on one service of a set: ``service`` names it and is required when the set has more
+    than one (the only service is the default). The merge patch addresses the spec as stored
+    (``services.<name>.<field>``).
     """
     notes: list[str] = []
     if replace is not None:
-        if any(v for v in (image, image_tag, env_set, env_unset, patch)):
-            raise ValueError("spec (full replacement) cannot be combined with image, image_tag, env_set, env_unset or patch.")
-        if not isinstance(replace, dict):
-            raise ValueError("spec must be a JSON object.")
+        if any(v for v in (image, image_tag, env_set, env_unset, patch, service)):
+            raise ValueError("spec (full replacement) cannot be combined with image, image_tag, env_set, env_unset, service or patch.")
+        require_service_set(replace)
         return norm_spec(replace), notes
     if image and image_tag:
         raise ValueError("Pass image (full reference) or image_tag (tag only), not both.")
+    per_service = bool(image or image_tag or env_set or env_unset)
+    if service and not per_service:
+        raise ValueError("service selects the target of image, image_tag, env_set and env_unset; for other fields use merge_patch with services.<name>.<field>.")
     new = norm_spec(spec)
+    target = new
+    if is_v2(new):
+        if per_service:
+            name = pick_service(new, service)
+            target = new["services"][name]
+            if len(new["services"]) > 1:
+                notes.append(f"edited service {name}")
+    elif service:
+        notes.append("service ignored: this configuration is a single image, not a service set")
     if image:
-        new["image"] = image.strip()
+        target["image"] = image.strip()
     if image_tag:
-        new["image"] = retag_image(new.get("image", ""), image_tag)
+        target["image"] = retag_image(target.get("image", ""), image_tag)
     if env_set:
         if not isinstance(env_set, dict):
             raise ValueError("env_set must be an object of NAME: value.")
         for key, value in env_set.items():
             if not str(key).strip():
                 raise ValueError("Environment variable names cannot be empty.")
-            new["environment"][str(key)] = "" if value is None else str(value)
+            target["environment"][str(key)] = "" if value is None else str(value)
     for key in env_unset or []:
-        if key in new["environment"]:
-            del new["environment"][key]
+        if key in target["environment"]:
+            del target["environment"][key]
         else:
             notes.append(f"env_unset: {key} was not set (ignored)")
     if patch:
         if not isinstance(patch, dict):
             raise ValueError("patch must be a JSON object (RFC 7386 merge patch).")
+        if is_v2(new):
+            legacy = sorted(k for k in LEGACY_SERVICE_KEYS if k in patch)
+            if legacy:
+                names = ", ".join(sorted(new["services"]))
+                raise ValueError(f"merge_patch keys {legacy} are single-image fields; this configuration is a service set, so use services.<name>.<field> (services: {names}).")
         new = norm_spec(merge_patch(new, patch))
     return new, notes
+
+
+_OVERRIDE_SERVICE_OPTIONS = {"read_only_root": "readOnlyRoot", "ephemeral_root": "ephemeralRoot"}
+_OVERRIDE_SET_OPTIONS = {
+    "host_resolvconf": "hostResolv",
+    "host_hosts_file": "hostHosts",
+    "new_privileges": "newPrivileges",
+    "parent_cgroup_devices": "parentCgroupDevices",
+    "masked_paths": "maskedPaths",
+    "readonly_paths": "readonlyPaths",
+    "exposeDBus": "exposeDBus",
+    "disableHostBluetooth": "disableHostBluetooth",
+    "privileged": "privileged",
+    "capabilities": "capabilities",
+    "devices": "devices",
+    "cgroup": "cgroup",
+}
+
+
+def legacy_override_preview(base: dict[str, Any], override: dict[str, Any]) -> tuple[dict[str, Any], list[str]]:
+    """Best-effort effective spec for a device override written in the single-image shape.
+
+    Device overrides still use ``image``, ``environment``, ``options`` ...; the backend applies them to
+    the only service of a set (or the service named ``app``). Returns ``(merged_spec, not_previewed)``;
+    fields this mapping does not cover are listed, never guessed.
+    """
+    base = norm_spec(base)
+    if not is_v2(base):
+        return norm_spec(merge_patch(base, override)), []
+    names = sorted(base["services"])
+    target = names[0] if len(names) == 1 else ("app" if "app" in names else None)
+    patch: dict[str, Any] = {}
+    skipped: list[str] = []
+    svc: dict[str, Any] = {}
+    for key, value in override.items():
+        if key == "desiredState":
+            patch["desiredState"] = value
+        elif key == "registry_credential_id":
+            svc["registryCredentialId"] = value
+        elif key in ("image", "command", "environment", "ports", "mounts"):
+            svc[key] = value
+        elif key == "options" and isinstance(value, dict):
+            set_opts: dict[str, Any] = {}
+            for opt, val in value.items():
+                if opt == "tty":
+                    svc["tty"] = val
+                elif opt in _OVERRIDE_SERVICE_OPTIONS:
+                    svc[_OVERRIDE_SERVICE_OPTIONS[opt]] = val
+                elif opt in _OVERRIDE_SET_OPTIONS:
+                    set_opts[_OVERRIDE_SET_OPTIONS[opt]] = val
+                elif opt == "all_devices_allowed":
+                    set_opts["isolateDevices"] = None if val is None else not val
+                elif opt == "host_namespaces":
+                    patch["network"] = {"mode": "host" if val and "network" in val else "bridge"}
+                else:
+                    skipped.append(f"options.{opt}")
+            if set_opts:
+                patch["options"] = set_opts
+        else:
+            skipped.append(key)
+    if svc:
+        if target is None:
+            skipped.extend(sorted(svc))
+        else:
+            patch["services"] = {target: svc}
+    return norm_spec(merge_patch(base, patch)), skipped
 
 
 # ------------------------------------------------------------------ diff ---
 
 
+def _walk(flat: dict[str, Any], prefix: str, value: Any) -> None:
+    if isinstance(value, dict):
+        for key, item in value.items():
+            _walk(flat, f"{prefix}.{key}" if prefix else str(key), item)
+        return
+    if value in (None, "", [], {}):
+        return
+    flat[prefix] = value
+
+
+def _flatten_lists(flat: dict[str, Any], prefix: str, key: str, value: Any) -> bool:
+    """Keyed rows for the list fields that have an identity: ports[tcp/80], mounts[/dest], volumes[name]."""
+    ident = {
+        "ports": lambda p: f"{p.get('protocol', 'tcp')}/{p.get('port')}",
+        "mounts": lambda p: str(p.get("destination")),
+        "volumes": lambda p: str(p.get("name")),
+    }.get(key)
+    if ident is None:
+        return False
+    for item in value or []:
+        if isinstance(item, dict):
+            flat[f"{prefix}{key}[{ident(item)}]"] = item
+    return True
+
+
 def _flatten(spec: dict[str, Any]) -> dict[str, Any]:
     flat: dict[str, Any] = {}
-
-    def walk(prefix: str, value: Any) -> None:
-        if isinstance(value, dict):
-            for key, item in value.items():
-                walk(f"{prefix}.{key}" if prefix else str(key), item)
-            return
-        if value in (None, "", [], {}):
-            return
-        flat[prefix] = value
-
+    if is_v2(spec):
+        for key, value in spec.items():
+            if key != "services" or not isinstance(value, dict):
+                _walk(flat, str(key), value)
+                continue
+            for name, svc in value.items():
+                base = f"services.{name}"
+                if not isinstance(svc, dict):
+                    _walk(flat, base, svc)
+                    continue
+                for field, item in svc.items():
+                    if not (field in ("ports", "mounts", "volumes") and _flatten_lists(flat, f"{base}.", field, item)):
+                        _walk(flat, f"{base}.{field}", item)
+        return flat
     for key, value in spec.items():
-        if key == "ports":
-            for port in value or []:
-                if isinstance(port, dict):
-                    flat[f"ports[{port.get('protocol', 'tcp')}/{port.get('port')}]"] = port
-        elif key == "mounts":
-            for mount in value or []:
-                if isinstance(mount, dict):
-                    flat[f"mounts[{mount.get('destination')}]"] = mount
-        else:
-            walk(str(key), value)
+        if not (key in ("ports", "mounts") and _flatten_lists(flat, "", key, value)):
+            _walk(flat, str(key), value)
     return flat
 
 
 def spec_diff(old: Any, new: Any, *, mask: bool = True) -> list[dict[str, Any]]:
     """Structured differences between two specs, one row per changed leaf.
 
-    Rows are ``{path, change: added|removed|changed, old?, new?}``, sorted by path. ``null`` / empty
-    collections compare equal. Credential-looking environment values are masked unless ``mask=False``.
+    Rows are ``{path, change: added|removed|changed, old?, new?}``, sorted by path. A set's paths are
+    ``services.<name>.<field>`` (``services.web.environment.X``, ``services.web.ports[tcp/80]``,
+    ``services.web.volumes[data]``) plus the set-level ``network.*``, ``volumes.*``, ``options.*``.
+    ``null`` / empty collections compare equal. Credential-looking environment values are masked
+    unless ``mask=False``.
     """
     before, after = _flatten(norm_spec(old)), _flatten(norm_spec(new))
     rows: list[dict[str, Any]] = []
@@ -187,7 +387,8 @@ def spec_diff(old: Any, new: Any, *, mask: bool = True) -> list[dict[str, Any]]:
             row = {"path": path, "change": "added", "new": b}
         else:
             row = {"path": path, "change": "removed", "old": a}
-        if mask and path.startswith("environment.") and is_secret_key(path.split(".", 1)[1]):
+        env = _ENV_PATH_RE.match(path)
+        if mask and env and is_secret_key(env.group(1)):
             for k in ("old", "new"):
                 if k in row:
                     row[k] = MASK
@@ -218,8 +419,22 @@ def diff_summary(rows: list[dict[str, Any]], limit: int = 6) -> str:
 
 
 def spec_summary(spec: Any) -> dict[str, Any]:
-    """Short human view of a spec: image, state, counts. Safe to put in lists."""
+    """Short human view of a spec: images, state, counts. Safe to put in lists."""
     s = norm_spec(spec)
+    if is_v2(s):
+        svcs = services_of(s)
+        out: dict[str, Any] = {
+            "services": {name: svc.get("image") for name, svc in sorted(svcs.items())},
+            "desiredState": s.get("desiredState"),
+            "env_vars": sum(len(svc.get("environment") or {}) for svc in svcs.values()),
+            "ports": sum(len(svc.get("ports") or []) for svc in svcs.values()),
+            "volumes": len(s["volumes"]),
+            "mounts": sum(len(svc.get("mounts") or []) for svc in svcs.values()),
+            "signature_policy": bool(s.get("signaturePolicy")),
+        }
+        if len(svcs) == 1:
+            out["image"] = next(iter(svcs.values())).get("image")
+        return out
     return {
         "image": s.get("image"),
         "desiredState": s.get("desiredState"),

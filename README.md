@@ -46,16 +46,16 @@ This server uses the historical query. Live tail cannot be opened with a PAT —
 | `get_device` | Detail + effective tags + active developer session (`dev_session`) |
 | `get_device_network` | IPs from list cache, spec, and live status |
 | `get_device_specs` | Hardware / versions |
-| `get_device_workload` | Container state + live config identity |
+| `get_device_workload` | Workload state + live config identity; for a multi-service set also `set.state` and per-service `services[]` (state, image, digest, restarts, health, ip, pid) |
 | `get_device_stats` | Health gauges |
 | `get_device_screenshot` | Live display capture (metadata + image block) |
 | `get_device_dump` | One-call full snapshot for analysis: Device document (requested and observed state, health) plus specifications, system services, USB, volumes, images, services, diagnose verdict, optional live probe (`probe=true`), memtest, boot reasons, configuration history, update state, versions, EdgeWire, progress. `sections` narrows it |
-| `get_device_logs` | Historical logs + crash-signature distill |
+| `get_device_logs` | Historical logs + crash-signature distill; `service` keeps one service's lines |
 | `get_device_events` | Lifecycle events |
 | `diagnose_device` | Offline/error sweep, or one device: stats + events + logs |
 | `troubleshoot_device` | "What is wrong with this device?" in one call: state, diagnosis, probe, logs, events, workload, storage, time, connectivity, drift → ranked findings with steps and docs links |
 | `check_device_connectivity` | Link, DNS, TCP, NTP/clock and NATS/transport checks plus the classic causes |
-| `explain_workload_failure` | Crash loops, exit codes, pull/signature/USB denials, OOM, with scrubbed log excerpts |
+| `explain_workload_failure` | Crash loops, exit codes, pull/signature/USB denials, OOM, with scrubbed log excerpts; per service (exit code, OOM, health output) for a multi-service set |
 | `fleet_health_report` | Devices by status and grouped by top problem for a fleet or organisation (bounded) |
 | `get_fleet_metrics` | Fleet CPU/memory/disk/network over a window: avg, max, latest, device count; `per_device=true` ranks devices; `device=` compares one device with its fleet |
 | `get_fleet_health` | Fleet snapshot: devices online/offline and average CPU, memory, disk |
@@ -102,9 +102,9 @@ Tests enforce the rule for every registered tool, and `register_extension` rejec
 |---|---|
 | `list_configurations` | Configurations with status, latest version and the fleets using each |
 | `get_configuration` | Metadata, spec of the latest (or a given) version, version history, fleets (credential-looking env values masked) |
-| `diff_configuration_versions` | Structured spec diff between two versions (default: previous → latest) |
-| `create_configuration` | New configuration (image/env/ports/command or a full spec) at version 1 |
-| `edit_configuration` | Edit the latest spec into a **new version**: `image`/`image_tag`, `env_set`/`env_unset`, `merge_patch`, or full `spec`. Needs `change_reason` to write; `base_version` guards concurrent edits; without `confirm` it previews the diff; shows which fleets follow `latest` vs pinned |
+| `diff_configuration_versions` | Structured spec diff between two versions (default: previous → latest); rows are `services.<name>.*` plus set-level `network`, `volumes`, `options` |
+| `create_configuration` | New configuration at version 1: `image`/`env`/`ports`/`command` (a one-service set named `app`), a version-2 `spec` with `services`, or `compose_yaml` (docker-compose text, translated by the backend; needs a backend with compose import) |
+| `edit_configuration` | Edit the latest spec into a **new version**: `image`/`image_tag`, `env_set`/`env_unset` (with `service` when the set has more than one service), `merge_patch` over the version-2 spec, or full `spec`. Needs `change_reason` to write; `base_version` guards concurrent edits; without `confirm` it previews the diff; shows which fleets follow `latest` vs pinned |
 | `update_configuration_metadata` | Name, description, tags and lifecycle status |
 | `rollback_configuration` | New latest version copied from an earlier one |
 | `delete_configuration` | Refuses while a fleet or unfinished rollout still uses it |
