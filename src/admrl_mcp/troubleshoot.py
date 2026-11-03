@@ -31,6 +31,7 @@ from collections import Counter
 from datetime import datetime, timezone
 from typing import Any, Callable, Iterable
 
+from . import workloadset
 from .client import AdmiralAPIError, parse_rfc3339
 from .distill import _event_key, _level, _message, _source, distill_events, distill_logs, health_from_stats
 
@@ -92,6 +93,28 @@ KB: dict[str, dict[str, Any]] = {
         docs="workload container crash restart troubleshooting",
         support=False,
     ),
+    "workload_degraded": {
+        "area": "workload",
+        "cause": "One or more services of the workload set are down but not restarting (for example restart: no or on-failure after a clean exit), so the set runs partly.",
+        "steps": [
+            "Read the service lines in the evidence: each names the service, its state and last exit code.",
+            "A service with restart 'no' that exited is not restarted by design; restart it with change_workload_status service=<name> action=restart if it should run.",
+            "Run explain_workload_failure for exit codes and log lines per service.",
+        ],
+        "docs": "multi-service workloads services restart policy",
+        "support": False,
+    },
+    "service_unhealthy": {
+        "area": "workload",
+        "cause": "A service's healthcheck keeps failing, so the set is not counted as healthy and services that wait for it (dependsOn service_healthy) do not start.",
+        "steps": [
+            "Read the probe output in the evidence: it is the last healthcheck result of that service.",
+            "Check the healthcheck test, interval and startPeriod in the service's configuration, and that the service listens where the probe looks.",
+            "Look at the service's own logs: get_device_logs with service=<name>.",
+        ],
+        "docs": "multi-service workloads healthcheck",
+        "support": False,
+    },
     "workload_oom": dict(
         area="workload",
         cause="The workload (or the device) ran out of memory and the kernel killed it.",
@@ -994,6 +1017,49 @@ def _offline(ev: dict[str, Any]) -> list[dict[str, Any]]:
     return [f]
 
 
+def _service_line(row: dict[str, Any]) -> str:
+    """One evidence line for a service row: state, restarts, last exit, error."""
+    bits = [f"service {row.get('name')}: {str(row.get('state') or 'unknown').lower()}"]
+    if row.get("restarts"):
+        bits.append(f"{row['restarts']} restarts")
+    if row.get("exit_code") is not None:
+        bits.append(f"last exit code {row['exit_code']}: {_EXIT_MEANING.get(row['exit_code'], 'application-defined')}")
+    if row.get("error"):
+        bits.append(f"error: {row['error']}")
+    return ", ".join(bits)
+
+
+def _service_findings(rows: list[dict[str, Any]], state: str) -> list[dict[str, Any]]:
+    """Findings for a multi-service set, one evidence line per affected service."""
+    out: list[dict[str, Any]] = []
+    crashing = [r for r in rows if str(r.get("state") or "").upper() == "CRASHING"]
+    down = [r for r in rows if str(r.get("state") or "").upper() in ("STOPPED", "EXITED", "ERROR")]
+    if state == "CRASHING" or crashing:
+        names = ", ".join(r["name"] for r in crashing) or "a service"
+        out.append(finding("workload_crashing", "critical", f"Service {names} is crash-looping", [_service_line(r) for r in crashing or rows]))
+    elif state == "DEGRADED" or (down and state not in ("STOPPED", "STAGING", "STAGED")):
+        names = ", ".join(r["name"] for r in down) or "a service"
+        out.append(finding("workload_degraded", "warning", f"The workload set is degraded: {names} is down", [_service_line(r) for r in down or rows]))
+    oom = [r for r in rows if r.get("oom_killed")]
+    if oom:
+        out.append(
+            finding(
+                "workload_oom",
+                "critical",
+                f"Service {', '.join(r['name'] for r in oom)} was killed for running out of memory",
+                [_service_line(r) + ", oomKilled" for r in oom],
+            )
+        )
+    unhealthy = [r for r in rows if str((r.get("health") or {}).get("status") or "").lower() == "unhealthy"]
+    if unhealthy:
+        evid = []
+        for r in unhealthy:
+            h = r["health"]
+            evid.append(f"service {r['name']}: unhealthy ({h.get('failing_streak', '?')} failing probes)" + (f": {h['last']}" if h.get("last") else ""))
+        out.append(finding("service_unhealthy", "warning", f"Service {', '.join(r['name'] for r in unhealthy)} fails its healthcheck", evid))
+    return out
+
+
 def _workload(ev: dict[str, Any]) -> list[dict[str, Any]]:
     out: list[dict[str, Any]] = []
     st = ev.get("state_doc") or {}
@@ -1002,18 +1068,27 @@ def _workload(ev: dict[str, Any]) -> list[dict[str, Any]]:
     stored = _dig(ev.get("workload"), "latestReport", "status") or {}
     state = str(wl.get("state") or stored.get("state") or _dig(ev.get("diagnose"), "verdict", "workloadState") or "").upper()
     err = wl.get("error") or stored.get("error")
+    # A multi-service set reports per service; the singular runtime fields then describe only the first service.
+    rows = workloadset.service_rows(ev.get("workload"), st)
     evid: list[Any] = []
     if state:
         evid.append(f"workload state {state}")
-    if rt.get("failureCount"):
-        evid.append(f"{rt['failureCount']} failures since start")
-    if rt.get("exitCode") is not None:
-        evid.append(f"last exit code {rt['exitCode']}: {_EXIT_MEANING.get(rt['exitCode'], 'application-defined')}")
-    if rt.get("lastExitAt") and not str(rt["lastExitAt"]).startswith("0001"):
-        evid.append(f"last exit {ago(rt['lastExitAt'])}")
+    if rows:
+        evid.append(f"{len(rows)} services: " + ", ".join(f"{r['name']} {str(r.get('state') or '?').lower()}" for r in rows))
+    else:
+        if rt.get("failureCount"):
+            evid.append(f"{rt['failureCount']} failures since start")
+        if rt.get("exitCode") is not None:
+            evid.append(f"last exit code {rt['exitCode']}: {_EXIT_MEANING.get(rt['exitCode'], 'application-defined')}")
+        if rt.get("lastExitAt") and not str(rt["lastExitAt"]).startswith("0001"):
+            evid.append(f"last exit {ago(rt['lastExitAt'])}")
     if err:
         evid.append(f"error: {err}")
-    if state == "CRASHING":
+    if rows:
+        out.extend(_service_findings(rows, state))
+        if state == "ERROR" or (err and state not in ("RUNNING", "DEGRADED", "CRASHING", "")):
+            out.append(finding("workload_error", "critical", "The workload is in an error state", evid))
+    elif state == "CRASHING":
         out.append(finding("workload_crashing", "critical", "The workload is crash-looping", evid))
     elif state == "ERROR" or (err and state not in ("RUNNING", "")):
         out.append(finding("workload_error", "critical", "The workload is in an error state", evid))
@@ -1028,7 +1103,7 @@ def _workload(ev: dict[str, Any]) -> list[dict[str, Any]]:
                 steps=["If it should be running, start it with change_workload_status action=start (only with the user's go-ahead).", "If it exited by itself, run explain_workload_failure."],
             )
         )
-    if rt.get("oomKilled") or (rt.get("oomEvents") or 0) > 0:
+    if not rows and (rt.get("oomKilled") or (rt.get("oomEvents") or 0) > 0):
         out.append(
             finding(
                 "workload_oom",

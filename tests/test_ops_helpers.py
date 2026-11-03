@@ -84,10 +84,12 @@ def test_apply_edits_image_tag_env_and_patch_order():
 
 
 def test_apply_edits_full_replacement_is_exclusive():
-    new, _ = ops.apply_spec_edits(base_spec(), replace={"image": "other:1"})
-    assert new["image"] == "other:1" and new["environment"] == {}
+    new, _ = ops.apply_spec_edits(base_spec(), replace={"services": {"app": {"image": "other:1"}}})
+    assert new["services"]["app"]["image"] == "other:1" and new["services"]["app"]["environment"] == {}
     with pytest.raises(ValueError, match="cannot be combined"):
-        ops.apply_spec_edits(base_spec(), replace={"image": "x"}, image_tag="2")
+        ops.apply_spec_edits(base_spec(), replace={"services": {"app": {"image": "x"}}}, image_tag="2")
+    with pytest.raises(ValueError, match="version-2 spec"):
+        ops.apply_spec_edits(base_spec(), replace={"image": "other:1"})
     with pytest.raises(ValueError, match="JSON object"):
         ops.apply_spec_edits(base_spec(), replace=["nope"])  # type: ignore[arg-type]
 

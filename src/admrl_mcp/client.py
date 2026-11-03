@@ -997,20 +997,34 @@ class AdmiralClient:
     # deliberately not exposed through this client.
     WORKLOAD_ACTIONS = ("start", "stop", "restart", "recreate")
 
-    def workload_command(self, device_id: str, *, action: str, org_id: str | None = None) -> Any:
+    def workload_command(
+        self, device_id: str, *, action: str, service: str | None = None, org_id: str | None = None
+    ) -> Any:
         normalised = (action or "").strip().lower()
         if normalised not in self.WORKLOAD_ACTIONS:
             raise ValueError(
                 f"Unsupported workload action {action!r}; one of {self.WORKLOAD_ACTIONS}"
             )
+        body: dict[str, Any] = {"action": normalised.upper()}
+        if service:
+            # Empty/omitted = the whole set (and the only service of a single-service set).
+            body["service"] = service
         # The edge executes the command synchronously under the handler's 60s
         # budget — the 30s default read timeout would cut slow edges off first.
         return self.put(
             f"devices/{device_id}/workload/cmd",
             org_id=org_id,
-            json={"action": normalised.upper()},
+            json=body,
             timeout=70.0,
         )
+
+    def import_compose(self, compose_yaml: str, *, org_id: str | None = None) -> Any:
+        """Translate a docker-compose file to a version-2 spec (POST /configurations:importCompose).
+
+        Returns the backend's ``{spec, warnings, errors}`` answer. Nothing is stored.
+        """
+        # "./": a first path segment containing a colon would otherwise be read as a URL scheme.
+        return self.post("./configurations:importCompose", org_id=org_id, json={"compose": compose_yaml})
 
 
 def _log_stamp(entry: dict[str, Any]) -> str:

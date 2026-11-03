@@ -11,6 +11,8 @@ from __future__ import annotations
 from collections import Counter
 from typing import Any
 
+from .workloadset import service_rows
+
 ROLLOUT_TERMINAL = ("completed", "failed", "cancelled", "rolled_back")
 
 # Conditions that are "good" when True; used only to label a final verdict.
@@ -71,6 +73,20 @@ def summarise_rollback(rollback: Any) -> dict[str, Any] | None:
     return out or None
 
 
+def _services_summary(st: dict[str, Any]) -> dict[str, Any]:
+    """``{"services": [{name, state, restarts, health, ip}]}`` for a multi-service set, ``{}`` otherwise."""
+    rows = service_rows(None, st)
+    if not rows:
+        return {}
+    keep = ("name", "state", "restarts", "ip")
+    return {
+        "services": [
+            {**{k: r[k] for k in keep if k in r}, **({"health": r["health"]["status"]} if (r.get("health") or {}).get("status") else {})}
+            for r in rows
+        ]
+    }
+
+
 def summarise_state(state: dict[str, Any] | None) -> dict[str, Any]:
     """Compact view of a DeviceState document (json tags from admrl-core)."""
     st = state or {}
@@ -96,6 +112,7 @@ def summarise_state(state: dict[str, Any] | None) -> dict[str, Any]:
         }
         or None,
         "transition": workload.get("transition"),
+        **_services_summary(st),
         "versions": system.get("versions"),
         "rollback": summarise_rollback((st.get("boot") or {}).get("rollback")),
         "progress": {
