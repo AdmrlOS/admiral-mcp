@@ -43,6 +43,9 @@ class GuardedAPI(FakeAPI):
                 or path.startswith("/telemetry/")
                 or path.endswith("/diagnostics/probe")
                 or (path.endswith("/document:render") and request.url.params.get("dryRun") == "1")
+                # compose: the translation persists nothing, the update only checks with dryRun=true
+                or path == "/configurations:importCompose"
+                or (path.endswith(":importCompose") and request.url.params.get("dryRun") == "true")
             )
             if not read_only:
                 self.violations.append(f"{request.method} {path}")
@@ -102,6 +105,7 @@ def world() -> GuardedAPI:
     on("GET", "/configurations", page([cfg(), cfg(5, id=CONFIG2, name="signage")]))
     on("GET", f"/configurations/{CONFIG}", ok(cfg()))
     on("GET", f"/configurations/{CONFIG}/details", details())
+    on("POST", f"/configurations/{CONFIG}:importCompose", ok({"spec": spec(), "diff": [{"path": "services.app.image", "from": "registry.example.com/kiosk:1.0", "to": "registry.example.com/kiosk:2.0"}], "warnings": [], "errors": [], "carriedOver": [], "baseVersion": 7, "currentVersion": 7, "unchanged": False, "version": None}))
     on("GET", f"/configurations/{CONFIG2}", ok(cfg(5, id=CONFIG2, name="signage")))
     for cid in (CONFIG, CONFIG2):
         for v in range(1, 8):
@@ -183,6 +187,7 @@ def _cases(tmp_path) -> dict[str, dict[str, Any]]:
         "create_rollout": {"fleet": FLEET, "configuration": CONFIG, "version": 6},
         "rollout_control": {"rollout_id": ROLLOUT, "action": "cancel"},
         "edit_configuration": {"configuration": CONFIG, "image_tag": "9", "change_reason": "bump"},
+        "import_configuration_compose": {"compose": "services:\n  app:\n    image: registry.example.com/kiosk:2.0\n", "configuration": CONFIG, "base_version": 7, "dry_run": False},
         "rollback_configuration": {"configuration": CONFIG, "target_version": 5},
         "delete_configuration": {"configuration": CONFIG2},
         "assign_fleet_configuration": {"fleet": FLEET2, "configuration": CONFIG2, "version": 3},
@@ -210,7 +215,7 @@ def _cases(tmp_path) -> dict[str, dict[str, Any]]:
 
 CASE_NAMES = sorted(
     """reboot_device rollback_device change_workload_status patch_device_document render_device_document adopt_local_override
-    discard_local_override start_memory_test cancel_memory_test create_rollout rollout_control edit_configuration
+    discard_local_override start_memory_test cancel_memory_test create_rollout rollout_control edit_configuration import_configuration_compose
     rollback_configuration delete_configuration assign_fleet_configuration set_fleet_update_policy move_device_to_fleet
     set_device_configuration_override reset_device_configuration_override clear_device_configuration_override set_network_configuration
     clear_network_configuration set_fleet_ssh_access set_fleet_image_proxy set_fleet_custom_metrics set_fleet_dev_sessions

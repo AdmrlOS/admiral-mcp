@@ -30,6 +30,7 @@ from . import docs
 from . import fleetmetrics
 from . import memtest
 from . import ops
+from . import refusals
 from . import troubleshoot as ts
 from . import workloadset
 from .extensions import load_env_extensions
@@ -76,6 +77,10 @@ How to answer naturally:
   runs as separate containers. get_device_workload returns set.state and services[]; change_workload_status, get_device_logs
   and explain_workload_failure address one service with service=<name>; edit_configuration needs service=<name> for
   image/env edits when the set has more than one service; create_configuration also takes compose_yaml.
+- Compose round trip: export_configuration_compose returns a configuration version as docker-compose YAML (settings compose cannot
+  express live under x-admrl: keep that block when editing). import_configuration_compose creates a configuration from compose or
+  updates one as a new version: dry_run defaults to true (diff, warnings, carried-over settings); saving needs dry_run=false and
+  confirm=true. A 409 base_version_conflict means a newer version exists: export again, re-apply the edit, retry with its base_version.
 - For how-to / what-is questions about Admiral itself (concepts, setup, provisioning, configuration), use
   search_docs then read_docs_page, answer from them, and always cite the docs URL.
 - "What is wrong with my device?" -> troubleshoot_device (one call: state, backend diagnosis, fresh probe, logs, events,
@@ -204,6 +209,8 @@ def _err(exc: Exception) -> str:
         elif exc.status == 409:
             out["conflict"] = True
             out["hint"] = "The resource changed or already exists. Re-read it and retry."
+        # Named refusals (host access, agent support, stale base version) say who refused, why and how to retry.
+        out.update(refusals.describe(exc.body) or {})
         return _dumps(out)
     if isinstance(exc, ConfigError):
         return _dumps({"error": str(exc)})
@@ -3295,14 +3302,29 @@ def _compose_messages(payload: Any, key: str) -> list[str]:
     return out
 
 
-def _import_compose(client: AdmiralClient, org_id: str, text: str) -> tuple[dict[str, Any], list[str]]:
-    """Translate a compose file on the backend. Returns (version-2 spec, warnings); refuses on hard errors."""
-    if not text.strip():
-        raise ValueError("compose_yaml is empty.")
+def _check_compose_text(text: Any, label: str) -> str:
+    if not isinstance(text, str) or not text.strip():
+        raise ValueError(f"{label} is empty.")
     if len(text.encode()) > _COMPOSE_MAX_BYTES:
-        raise ValueError(f"compose_yaml is larger than {_COMPOSE_MAX_BYTES // 1024} KiB.")
+        raise ValueError(f"{label} is larger than {_COMPOSE_MAX_BYTES // 1024} KiB.")
+    return text
+
+
+def _clean_profiles(profiles: Any) -> list[str]:
+    """Compose profiles as a list of names (a comma-separated string is accepted too)."""
+    if profiles is None:
+        return []
+    items = profiles.split(",") if isinstance(profiles, str) else list(profiles)
+    return [p for p in (str(i).strip() for i in items) if p]
+
+
+def _translate_compose(
+    client: AdmiralClient, org_id: str, text: str, profiles: list[str] | None = None, label: str = "compose_yaml"
+) -> tuple[dict[str, Any], dict[str, Any], list[str]]:
+    """Translate a compose file on the backend. Returns (answer, version-2 spec, warnings); refuses on hard errors."""
+    _check_compose_text(text, label)
     try:
-        result = client.import_compose(text, org_id=org_id)
+        result = client.import_compose(text, profiles=profiles, org_id=org_id)
     except AdmiralAPIError as exc:
         if exc.status in (404, 405, 501):
             raise ToolRefusal(
@@ -3321,7 +3343,13 @@ def _import_compose(client: AdmiralClient, org_id: str, text: str) -> tuple[dict
     if not isinstance(built, dict):
         raise ToolRefusal("The backend answered the compose import without a spec; nothing was created.")
     ops.require_service_set(built, "The imported spec")
-    return built, _compose_messages(result, "warnings")
+    return result, built, _compose_messages(result, "warnings")
+
+
+def _import_compose(client: AdmiralClient, org_id: str, text: str) -> tuple[dict[str, Any], list[str]]:
+    """Translate a compose file on the backend. Returns (version-2 spec, warnings); refuses on hard errors."""
+    _, built, warnings = _translate_compose(client, org_id, text)
+    return built, warnings
 
 
 def _services_text(spec: dict[str, Any]) -> str:
@@ -3397,6 +3425,360 @@ def create_configuration(
             }
         ]
         return _dumps(out)
+    except Exception as exc:
+        return _err(exc)
+
+
+_COMPOSE_NEXT_HINT = (
+    "The exported file carries a top-level x-admrl block with the Admiral-only settings (registry credential ids, secret-file paths, "
+    "EdgeWire, signature policy, tty, process defaults, unhealthy action, volume backup). Keep that block when you edit: a file "
+    "with x-admrl replaces everything, a file without it keeps those settings from the base version."
+)
+
+
+@mcp.tool(
+    description=(
+        "Export a configuration version as a docker-compose file (GET /configurations/{id}:exportCompose). Use it to read a "
+        "configuration in a familiar form, to edit it as compose and write it back with import_configuration_compose, or to copy it. "
+        "configuration is a name or UUID; version is optional (default: latest). Returns the compose YAML in 'compose', the version "
+        "that was exported and 'warnings' (for example an environment value that looks like a credential: move it to a secret file). "
+        "Admiral-only settings (registry credential ids, secret-file paths, EdgeWire, signature policy, tty, process defaults, "
+        "unhealthy action, volume backup) that compose cannot express are kept under a top-level x-admrl key: leave it in when you edit and "
+        "re-import, because a file WITH x-admrl replaces the whole configuration and a file without it keeps those settings from the base "
+        "version. The export is deterministic and re-importing it unchanged is a no-op. A version that compose cannot express is refused "
+        "with the reason. Read-only; nothing is stored. Next: edit the YAML, then import_configuration_compose with dry_run=true."
+    ),
+    annotations=_READ_ONLY,
+)
+def export_configuration_compose(configuration: str, version: int | None = None, organization_id: str | None = None) -> str:
+    try:
+        client, org_id = _ctx(organization_id)
+        cfg = _find_config(client, org_id, configuration)
+        cid = cfg["id"]
+        latest = _latest_of(cfg)
+        if version is not None and (int(version) < 1 or (latest and int(version) > latest)):
+            return _dumps({"error": f"version must be between 1 and {latest}.", "configuration": _ref(cfg)})
+        try:
+            res = client.export_compose(cid, version=int(version) if version is not None else None, org_id=org_id)
+        except AdmiralAPIError as exc:
+            if exc.status in (404, 405, 501):
+                raise ToolRefusal(
+                    f"Could not export {cfg.get('name')}"
+                    + (f" v{int(version)}" if version is not None else "")
+                    + ": the version does not exist, or this backend does not support compose export yet.",
+                    configuration=_ref(cfg),
+                    latest_version=latest,
+                ) from exc
+            raise
+        compose = res.get("compose") if isinstance(res, dict) else None
+        if not isinstance(compose, str) or not compose.strip():
+            raise ToolRefusal("The backend answered the export without a compose file.", configuration=_ref(cfg))
+        exported = int((res.get("version") if isinstance(res, dict) else None) or version or latest or 0) or None
+        warnings = _compose_messages(res, "warnings")
+        note = []
+        if exported and latest and exported != latest:
+            note.append(
+                f"v{exported} is not the latest (v{latest}): saving a file based on it needs base_version={latest} and replaces v{latest}'s content."
+            )
+        return _dumps(
+            {
+                "summary": f"Exported {cfg.get('name')} v{exported} as compose ({len(compose.encode())} bytes, {len(warnings)} warning(s)).",
+                "configuration": {**_ref(cfg), "latest_version": latest},
+                "version": exported,
+                "warnings": warnings,
+                "notes": note + [_COMPOSE_NEXT_HINT],
+                "next": [
+                    {
+                        "tool": "import_configuration_compose",
+                        "why": "Edit the compose, then check it (dry_run is the default) before saving a new version.",
+                        "arguments": {"configuration": cid, "compose": "<the edited compose>", "base_version": latest, "dry_run": True},
+                    }
+                ],
+                "compose": compose,
+            }
+        )
+    except Exception as exc:
+        return _err(exc)
+
+
+def _gate_text(*args: Any, **kwargs: Any) -> str:
+    """The confirmation preview as JSON text, always (``_gate`` with ``confirm`` false)."""
+    return _gate(False, *args, **kwargs) or "{}"
+
+
+def _compose_carried(res: dict[str, Any]) -> list[dict[str, Any]]:
+    rows = res.get("carriedOver")
+    return [{"path": r.get("path"), "from": r.get("from")} for r in rows if isinstance(r, dict)] if isinstance(rows, list) else []
+
+
+def _compose_update_call(
+    client: AdmiralClient,
+    org_id: str,
+    cfg: dict[str, Any],
+    compose: str,
+    *,
+    dry_run: bool,
+    base_version: int | None,
+    profiles: list[str],
+    change_reason: str | None,
+) -> dict[str, Any]:
+    """One POST /configurations/{id}:importCompose; refuses on compose errors (nothing is saved then)."""
+    try:
+        res = client.update_from_compose(
+            cfg["id"], compose, dry_run=dry_run, base_version=base_version, profiles=profiles, change_reason=change_reason, org_id=org_id
+        )
+    except AdmiralAPIError as exc:
+        if exc.status in (405, 501) or (exc.status == 404 and "version" not in exc.message.lower()):
+            raise ToolRefusal(
+                "This backend does not support updating a configuration from compose yet (POST /configurations/{id}:importCompose "
+                "is not available). Nothing was saved. Use edit_configuration instead.",
+                compose_update_supported=False,
+            ) from exc
+        raise
+    if not isinstance(res, dict):
+        raise ToolRefusal("The backend answered the compose update without a result; check get_configuration before retrying.")
+    errors = _compose_messages(res, "errors")
+    if errors:
+        raise ToolRefusal(
+            "The compose file cannot be applied; nothing was saved. Fix these (the paths are compose paths) and retry.",
+            errors=errors,
+            warnings=_compose_messages(res, "warnings"),
+            configuration=_ref(cfg),
+        )
+    return res
+
+
+def _compose_update(
+    client: AdmiralClient,
+    org_id: str,
+    cfg: dict[str, Any],
+    compose: str,
+    *,
+    base_version: int | None,
+    dry_run: bool,
+    confirm: bool,
+    profiles: list[str],
+    change_reason: str | None,
+) -> str:
+    cid, cname = cfg["id"], cfg.get("name")
+    reason = (change_reason or "").strip() or None
+    if base_version is not None and int(base_version) < 1:
+        raise ValueError("base_version must be a positive version number.")
+    if dry_run or confirm is not True:
+        res = _compose_update_call(client, org_id, cfg, compose, dry_run=True, base_version=base_version, profiles=profiles, change_reason=reason)
+        base, current = res.get("baseVersion"), res.get("currentVersion")
+        rows, more = ops.compose_diff_rows(res.get("diff"))
+        warnings = _compose_messages(res, "warnings")
+        carried = _compose_carried(res)
+        if res.get("unchanged"):
+            return _dumps(
+                {
+                    "summary": f"No change: the compose file equals {cname} v{base}, so no version would be created.",
+                    "configuration": _ref(cfg),
+                    "unchanged": True,
+                    "saved": False,
+                    "base_version": base,
+                    "current_version": current,
+                    "warnings": warnings,
+                    "carried_over": carried,
+                }
+            )
+        usage = _safe(lambda: _fleet_usage(_paged_items(client, "fleets", org_id), cid), warnings, "fleets") or {"follow_latest": [], "pinned": []}
+        new_version = (current or base or 0) + 1
+        warnings = warnings + _delivery_warnings(usage, new_version)
+        if carried:
+            warnings.append(
+                f"{len(carried)} Admiral-only setting(s) were kept from v{base} because the file has no x-admrl block (see carried_over)."
+            )
+        summary = ops.diff_summary(rows)
+        out = json.loads(
+            _gate_text(
+                "import_configuration_compose",
+                f"save {cname} v{new_version} (from v{base}) from compose: {summary}. Fleets that follow 'latest' resolve it immediately.",
+                action={"configuration": _ref(cfg), "from_version": base, "to_version": new_version, "changes": "the configuration spec (a new version)"},
+                args={"configuration": cid, "compose": compose, "base_version": base, "dry_run": False, "profiles": profiles or None, "change_reason": reason},
+                org_id=org_id,
+                preview={
+                    "diff": rows,
+                    "diff_more": more or None,
+                    "fleets": usage,
+                    "carried_over": carried,
+                    "base_version": base,
+                    "current_version": current,
+                },
+                warnings=warnings,
+            )
+        )
+        if dry_run:
+            out["dry_run"] = True
+        return _dumps(out)
+    res = _compose_update_call(client, org_id, cfg, compose, dry_run=False, base_version=base_version, profiles=profiles, change_reason=reason)
+    warnings = _compose_messages(res, "warnings")
+    base = res.get("baseVersion")
+    if res.get("unchanged") or res.get("version") is None:
+        return _dumps(
+            {
+                "summary": f"No change: the compose file equals {cname} v{base}, so no version was created.",
+                "configuration": _ref(cfg),
+                "unchanged": True,
+                "saved": False,
+                "base_version": base,
+                "warnings": warnings,
+            }
+        )
+    saved = int(res["version"])
+    rows, more = ops.compose_diff_rows(res.get("diff"))
+    back = _safe(lambda: client.get(f"configurations/{cid}", org_id=org_id), warnings, "read-back")
+    back_latest = _latest_of(back) if isinstance(back, dict) else None
+    confirmed = back_latest == saved
+    if back_latest is not None and back_latest != saved:
+        warnings.append(f"Expected v{saved} but the configuration is now at v{back_latest}: another edit landed at the same time. Check diff_configuration_versions.")
+    usage = _safe(lambda: _fleet_usage(_paged_items(client, "fleets", org_id), cid), warnings, "fleets") or {"follow_latest": [], "pinned": []}
+    warnings += _delivery_warnings(usage, saved)
+    return _dumps(
+        {
+            "summary": f"{cname} v{base} → v{saved} from compose: {ops.diff_summary(rows)}.",
+            "saved": True,
+            "configuration": {**_ref(cfg), "latest_version": back_latest or saved},
+            "old_version": base,
+            "new_version": saved,
+            "diff": rows,
+            "diff_more": more or None,
+            "carried_over": _compose_carried(res),
+            "fleets": usage,
+            "warnings": warnings,
+            "read_back": {"latest_version": back_latest, "confirmed": confirmed},
+            "delivery": _DELIVERY_NOTE,
+            "next": [
+                {"tool": "preview_rollout", "why": "Stage the new version on a fleet instead of letting 'latest' followers resolve it directly."}
+            ],
+        }
+    )
+
+
+def _compose_create(
+    client: AdmiralClient,
+    org_id: str,
+    compose: str,
+    *,
+    name: str | None,
+    description: str | None,
+    dry_run: bool,
+    confirm: bool,
+    profiles: list[str],
+) -> str:
+    result, built, warnings = _translate_compose(client, org_id, compose, profiles, label="compose")
+    cname = (name or "").strip() or str(result.get("name") or "").strip()
+    if not cname:
+        if dry_run or confirm is not True:
+            warnings.append("The file has no name: pass name=... (or put 'name:' in the compose file) before saving.")
+        else:
+            raise ToolRefusal("A new configuration needs a name: pass name=... or put 'name:' in the compose file. Nothing was created.")
+    elif dry_run or confirm is not True:
+        existing = _safe(lambda: _items(client.list_configurations(org_id=org_id, search=cname, limit=100)), warnings, "name check") or []
+        if any(str(r.get("name") or "").lower() == cname.lower() for r in existing):
+            warnings.append(f"A configuration named {cname} already exists: saving would be refused (409). Pick another name, or pass configuration=<it> to update it.")
+    if dry_run or confirm is not True:
+        out = json.loads(
+            _gate_text(
+                "import_configuration_compose",
+                f"create configuration {cname or '(unnamed)'} v1 with {_services_text(built)} from compose. Nothing runs it until a fleet is assigned.",
+                action={"configuration": {"name": cname or None}, "to_version": 1, "changes": "a new configuration"},
+                args={"compose": compose, "name": cname or None, "description": description, "profiles": profiles or None, "dry_run": False},
+                org_id=org_id,
+                preview={"spec": ops.mask_spec(ops.norm_spec(built))},
+                warnings=warnings,
+            )
+        )
+        if dry_run:
+            out["dry_run"] = True
+        return _dumps(out)
+    body: dict[str, Any] = {"name": cname, "spec": built}
+    if description:
+        body["description"] = description
+    created = client.post("configurations", org_id=org_id, json=body)
+    created = created if isinstance(created, dict) else {}
+    cid = created.get("id")
+    back = client.get(f"configurations/{cid}/details", org_id=org_id) if cid else {}
+    back = back if isinstance(back, dict) else {}
+    meta = back.get("configuration") or created
+    return _dumps(
+        {
+            "summary": f"Created configuration {meta.get('name')} (v{_latest_of(meta) or 1}, {meta.get('status')}) with {_services_text(built)} from compose.",
+            "saved": True,
+            "configuration": {**_ref(meta), "status": meta.get("status"), "latest_version": _latest_of(meta)},
+            "spec": ops.mask_spec(ops.norm_spec(back.get("latest_spec") or built)),
+            "warnings": warnings,
+            "read_back": {"confirmed": bool(back)},
+            "next": [
+                {
+                    "tool": "assign_fleet_configuration",
+                    "why": "Nothing runs this configuration until a fleet is assigned to it.",
+                    "arguments": {"fleet": "<fleet name or UUID>", "configuration": cid, "version": "latest"},
+                }
+            ],
+        }
+    )
+
+
+@mcp.tool(
+    description=(
+        "Create a configuration from a docker-compose file, or update an existing one from it. Use it to apply compose you "
+        "wrote or edited (typically after export_configuration_compose); to change one image or variable, edit_configuration is "
+        "simpler. compose is the YAML text (at most 256 KiB here; the API itself accepts 1 MiB). With configuration (name or UUID) "
+        "it UPDATES that configuration: the file is compared with base_version (the version the file was based on; default: the one "
+        "recorded in the file's x-admrl.configuration when it was exported from this configuration, otherwise you must pass it) and, "
+        "when saved, becomes a NEW version. Without configuration it CREATES a new configuration at version 1 (name from name=, "
+        "else the file's 'name:'); the create dry run is a translation only. "
+        "x-admrl: a file that has a top-level x-admrl block (as exported) is the complete truth and replaces everything, including "
+        "the Admiral-only settings (registry credential ids, secret-file paths, EdgeWire, signature policy, tty, process defaults, "
+        "unhealthy action, volume backup); a hand-written file without it keeps those settings from the base version and lists "
+        "them in carried_over. Compose keys Admiral cannot run are listed as errors with their compose path (nothing is saved); lossy "
+        "mappings are warnings. "
+        "dry_run defaults to TRUE: it only checks and returns the diff against the base version, warnings, carried_over, which "
+        "fleets follow 'latest', and the exact call that saves. To save, pass dry_run=false and confirm=true after the user agrees "
+        "(saving needs write access; the check only needs read access). Saving creates a new version immediately for fleets that "
+        "follow 'latest' (no canary; devices pick it up when they reconnect or get a push): for running fleets stage it with "
+        "preview_rollout and create_rollout instead. "
+        "Conflicts: a 409 base_version_conflict means someone saved a newer version than base_version (the answer gives "
+        "current_version and who saved it). Nothing was saved: export the latest version again, re-apply your edits, and call again with "
+        "base_version=<current_version>; do not just raise base_version. A 409 host_access_not_allowed (privileged mode, dangerous "
+        "capabilities, devices or host namespaces that a fleet's security policy forbids) or unsupported_by_agent (devices whose agent "
+        "lacks a feature the file needs) names the fleet or devices and refuses the save. "
+        "Saving without confirm=true only previews. Changes what devices will run: explicit request only."
+    ),
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=False),
+)
+def import_configuration_compose(
+    compose: str,
+    configuration: str | None = None,
+    base_version: int | None = None,
+    dry_run: bool = True,
+    profiles: list[str] | None = None,
+    change_reason: str | None = None,
+    name: str | None = None,
+    description: str | None = None,
+    organization_id: str | None = None,
+    confirm: bool = False,
+) -> str:
+    try:
+        _check_compose_text(compose, "compose")
+        wanted = _clean_profiles(profiles)
+        client, org_id = _ctx(organization_id)
+        if configuration is None or not str(configuration).strip():
+            if base_version is not None or (change_reason or "").strip():
+                raise ValueError("base_version and change_reason only apply when updating: pass configuration (name or UUID), or drop them to create.")
+            return _compose_create(
+                client, org_id, compose, name=name, description=description, dry_run=dry_run, confirm=confirm, profiles=wanted
+            )
+        if (name or "").strip() or description:
+            raise ValueError("name and description are for creating a new configuration; use update_configuration_metadata to rename one.")
+        cfg = _find_config(client, org_id, configuration)
+        return _compose_update(
+            client, org_id, cfg, compose, base_version=base_version, dry_run=dry_run, confirm=confirm, profiles=wanted, change_reason=change_reason
+        )
+    except ToolRefusal as refusal:
+        return _dumps(refusal.payload)
     except Exception as exc:
         return _err(exc)
 
