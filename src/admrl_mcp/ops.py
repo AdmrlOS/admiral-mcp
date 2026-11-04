@@ -418,6 +418,32 @@ def diff_summary(rows: list[dict[str, Any]], limit: int = 6) -> str:
     return "; ".join(parts)
 
 
+def compose_diff_rows(diff: Any, *, limit: int = 100) -> tuple[list[dict[str, Any]], int]:
+    """Rows ``{path, change, old?, new?}`` from the API's compose ``diff`` entries ``{path, from, to}``.
+
+    A missing ``from`` is an addition, a missing ``to`` a removal. Credential-looking environment values are
+    masked like ``spec_diff``. Returns (at most ``limit`` rows, number of rows beyond the limit).
+    """
+    rows: list[dict[str, Any]] = []
+    for entry in diff if isinstance(diff, list) else []:
+        if not isinstance(entry, dict):
+            continue
+        path = str(entry.get("path") or "")
+        old, new = entry.get("from"), entry.get("to")
+        row: dict[str, Any] = {"path": path, "change": "added" if old is None else "removed" if new is None else "changed"}
+        if old is not None:
+            row["old"] = old
+        if new is not None:
+            row["new"] = new
+        env = _ENV_PATH_RE.match(path)
+        if env and is_secret_key(env.group(1)):
+            for k in ("old", "new"):
+                if k in row:
+                    row[k] = MASK
+        rows.append(row)
+    return rows[:limit], max(0, len(rows) - limit)
+
+
 def spec_summary(spec: Any) -> dict[str, Any]:
     """Short human view of a spec: images, state, counts. Safe to put in lists."""
     s = norm_spec(spec)

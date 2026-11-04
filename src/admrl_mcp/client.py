@@ -1018,13 +1018,53 @@ class AdmiralClient:
             timeout=70.0,
         )
 
-    def import_compose(self, compose_yaml: str, *, org_id: str | None = None) -> Any:
+    def import_compose(self, compose_yaml: str, *, profiles: list[str] | None = None, org_id: str | None = None) -> Any:
         """Translate a docker-compose file to a version-2 spec (POST /configurations:importCompose).
 
-        Returns the backend's ``{spec, warnings, errors}`` answer. Nothing is stored.
+        Returns the backend's ``{spec, warnings, errors, name}`` answer. Nothing is stored.
         """
+        body: dict[str, Any] = {"compose": compose_yaml}
+        if profiles:
+            body["profiles"] = list(profiles)
         # "./": a first path segment containing a colon would otherwise be read as a URL scheme.
-        return self.post("./configurations:importCompose", org_id=org_id, json={"compose": compose_yaml})
+        return self.post("./configurations:importCompose", org_id=org_id, json=body)
+
+    def export_compose(self, config_id: str, *, version: int | None = None, org_id: str | None = None) -> Any:
+        """Export one configuration version as docker-compose (GET /configurations/{id}:exportCompose).
+
+        The client asks for JSON, so the answer is ``{compose, warnings, version}``.
+        """
+        return self.get(f"configurations/{config_id}:exportCompose", org_id=org_id, params={"version": version})
+
+    def update_from_compose(
+        self,
+        config_id: str,
+        compose_yaml: str,
+        *,
+        dry_run: bool,
+        base_version: int | None = None,
+        profiles: list[str] | None = None,
+        change_reason: str | None = None,
+        org_id: str | None = None,
+    ) -> Any:
+        """Check (dry run) or save a docker-compose file as a new version (POST /configurations/{id}:importCompose).
+
+        ``dryRun`` is always sent explicitly: it is the spelling the hosted read scope recognises, and the
+        server default (save) must never apply by omission.
+        """
+        body: dict[str, Any] = {"compose": compose_yaml}
+        if base_version is not None:
+            body["baseVersion"] = int(base_version)
+        if profiles:
+            body["profiles"] = list(profiles)
+        if change_reason:
+            body["changeReason"] = change_reason
+        return self.post(
+            f"configurations/{config_id}:importCompose",
+            org_id=org_id,
+            params={"dryRun": "true" if dry_run else "false"},
+            json=body,
+        )
 
 
 def _log_stamp(entry: dict[str, Any]) -> str:
