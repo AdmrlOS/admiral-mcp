@@ -604,7 +604,7 @@ def get_device_stats(device: str, organization_id: str | None = None) -> str:
         return _err(exc)
 
 
-# GPU metrics exist only for devices with a discrete NVIDIA GPU; names follow the backend metric types.
+# GPU metrics exist only for devices with an NVIDIA GPU (discrete or Jetson integrated); names follow the backend metric types.
 _GPU_METRIC_CHOICES = ("gpu_temperature", "gpu_power", "gpu_power_limit", "gpu_memory", "gpu_memory_total", "gpu_utilization")
 _METRIC_CHOICES = ("cpu", "memory", "disk", "network_rx", "network_tx") + _GPU_METRIC_CHOICES
 
@@ -617,7 +617,8 @@ _METRIC_CHOICES = ("cpu", "memory", "disk", "network_rx", "network_tx") + _GPU_M
         "devices with an NVIDIA GPU gpu_temperature (Celsius), gpu_power (watts), gpu_power_limit (enforced "
         "board power limit, watts), gpu_memory (used bytes), gpu_memory_total (total VRAM bytes) and "
         "gpu_utilization (percent); GPU series are returned per GPU, identified by the "
-        "series labels, and are null on devices without an NVIDIA GPU. "
+        "series labels, and are null on devices without an NVIDIA GPU. Jetson integrated GPUs carry "
+        "label integrated=true, have no power series, and their gpu_memory_total is the system RAM they share. "
         "lookback_hours defaults to 24; the server picks the bucket interval (5m under 24h, 30m to 7d, "
         "1h beyond). Returns meta (metric, unit, start, end, interval) and series with labels and "
         "[unix_ts, value] points. series is null when the window has no data — not an error; "
@@ -2244,7 +2245,7 @@ def discard_local_override(
         "Run the structured on-device diagnostics probe now (POST /devices/{id}/diagnostics/probe): sections "
         "such as network, time, identity, wireless, storage, boot, thermal, workload, services, gpu (default all). "
         "The gpu section (NVIDIA GPUs) has gpu.power_<n> (draw vs limit, e.g. '42 W of 215 W limit'), "
-        "gpu.memory_<n> (VRAM used vs total) and gpu.probe; read it for GPU power and memory questions. "
+        "gpu.memory_<n> (VRAM used vs total, or shared system memory on Jetson integrated GPUs) and gpu.probe; read it for GPU power and memory questions. "
         "timeout_ms caps the device side (max 20000). Live round-trip: device must be online (503/504 "
         "otherwise). Items marked sensitive come back as [redacted] for non-staff callers. Audited. The network "
         "section reports packet loss and path quality on newer device agents (loss to the gateway, DNS server and "
