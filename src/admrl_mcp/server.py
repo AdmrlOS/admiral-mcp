@@ -102,7 +102,10 @@ How to answer naturally:
   get_image_proxy_usage, set_fleet_security_policy, set_fleet_custom_metrics. A 402 is a billing entitlement, not a fault.
 - Developer sessions and HTTP proxy: get_device / list_devices(dev_session=true) show who holds a device in a developer session.\
   open_device_proxy opens a browser URL to a configured service of a device (needs the HTTP proxy enabled on the platform),\
-  list_proxies shows the caller's open proxies, close_proxy closes one. There is no tool to end a developer session.
+  list_proxies shows the caller's open proxies, update_proxy changes one, close_proxy closes one. Proxies are private by default;
+  visibility=public means anyone with the link can use it without signing in and bills the org's EdgeWire usage, and needs
+  set_fleet_proxy_policy (get_fleet_proxy_policy reads it). Custom names need an org prefix (get/set_org_proxy_prefix).
+  There is no tool to end a developer session.
 - Alerting: list_alert_rules, get_alert_rule, list_alerts (history), preview_alert_rule (evaluates, saves nothing),
   create_alert_rule, update_alert_rule, delete_alert_rule. Needs the Telemetry add-on for writes and previews.
 - Registry credentials: list_registry_credentials, get_registry_credential, delete_registry_credential. Secret files:
@@ -211,6 +214,11 @@ def _err(exc: Exception) -> str:
             out["hint"] = "The resource changed or already exists. Re-read it and retry."
         # Named refusals (host access, agent support, stale base version) say who refused, why and how to retry.
         out.update(refusals.describe(exc.body) or {})
+        proxy = refusals.proxy_error(exc.body)
+        if proxy:
+            for generic in ("permission_denied", "conflict", "hint"):
+                out.pop(generic, None)
+            out.update(proxy)
         return _dumps(out)
     if isinstance(exc, ConfigError):
         return _dumps({"error": str(exc)})
@@ -6852,53 +6860,181 @@ def _proxy_view(p: Any) -> dict[str, Any]:
         "url": p.get("url"),
         "device_id": p.get("device_id"),
         "service": p.get("service"),
+        "visibility": p.get("visibility") or "private",
         "created_at": p.get("created_at"),
-        "expires": p.get("expires"),
+        "expires": p.get("expires") or "never",
+        "idle_timeout": p.get("idle_timeout"),
     }
 
 
 _PROXY_OFF = "The HTTP proxy is not enabled on this Admiral platform (503). Nothing was opened; ask the platform operator to enable it."
 
 
+_PROXY_NAME = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
+_PROXY_PREFIX = re.compile(r"^[a-z0-9]+$")
+
+
+def _proxy_seconds(value: Any, field: str) -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ToolRefusal(f"{field} must be a whole number of seconds, 0 or more.")
+    return value
+
+
+def _proxy_visibility(value: Any) -> str | None:
+    if value is None:
+        return None
+    v = str(value).strip().lower()
+    if v not in ("private", "public"):
+        raise ToolRefusal("visibility must be 'private' or 'public'.")
+    return v
+
+
+def _public_warning(view: dict[str, Any]) -> str | None:
+    if view.get("visibility") != "public":
+        return None
+    return "PUBLIC: anyone with this link can use the service without signing in, and the traffic counts towards the organisation's EdgeWire usage."
+
+
 @mcp.tool(
     description=(
         "Open an HTTP proxy to a configured service of a device (POST /devices/{id}/proxy) and return its browser URL, name "
         "and expiry. device = name, tag, IP or UUID; service = the name of a service in the device's configuration "
-        "(edgewire.services). The first visit to the URL signs the browser in. A proxy lives at most 12 hours and closes after "
-        "30 minutes without requests; close it earlier with close_proxy. Same access and entitlement checks as an EdgeWire "
-        "session to that service. Acts only when the user asks. If the platform has not enabled the HTTP proxy this says so."
+        "(edgewire.services). visibility='private' (default): the first visit signs the browser in and only people with access "
+        "to the device can use it. visibility='public': ANYONE WITH THE LINK can use the service WITHOUT SIGNING IN, and all "
+        "traffic through it counts towards the organisation's EdgeWire usage; public needs the fleet setting "
+        "(set_fleet_proxy_policy public_allowed=true, else it is refused) and a fleet max life may cap expires_in. Only open a "
+        "public proxy when the user explicitly asks for one. expires_in = lifetime in seconds (omitted = backend default, 12 "
+        "hours; 0 = never expires). idle_timeout = seconds without requests before it closes (omitted = 30 minutes; 0 = no idle "
+        "close). name = custom name, only for organisations with a proxy prefix (set_org_proxy_prefix); the URL is then "
+        "<prefix>-<name>, otherwise a random name is used. Close it earlier with close_proxy, change it with update_proxy. Same "
+        "access and entitlement checks as an EdgeWire session to that service. Acts only when the user asks. If the platform "
+        "has not enabled the HTTP proxy this says so."
     ),
     annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=False),
 )
-def open_device_proxy(device: str, service: str, organization_id: str | None = None) -> str:
+def open_device_proxy(
+    device: str,
+    service: str,
+    visibility: str = "private",
+    expires_in: int | None = None,
+    idle_timeout: int | None = None,
+    name: str | None = None,
+    organization_id: str | None = None,
+) -> str:
     try:
         if not (service or "").strip():
             return _dumps({"error": "service is required: the name of a configured service on the device."})
+        vis = _proxy_visibility(visibility) or "private"
+        expires = _proxy_seconds(expires_in, "expires_in")
+        idle = _proxy_seconds(idle_timeout, "idle_timeout")
+        label = (name or "").strip() or None
+        if label and (len(label) > 40 or not _PROXY_NAME.match(label)):
+            raise ToolRefusal("name must be 1-40 characters: lowercase letters, digits and single hyphens (no leading or trailing hyphen).")
         found = _resolve_device(device, organization_id)
         if not found.get("match"):
             return _dumps(found)
         match = found["match"]
+        body: dict[str, Any] = {"service": service.strip()}
+        if vis != "private":
+            body["visibility"] = vis
+        if expires is not None:
+            body["expires_in"] = expires
+        if idle is not None:
+            body["idle_timeout"] = idle
+        if label:
+            body["name"] = label
         try:
-            p = get_client().open_device_proxy(match["id"], service.strip(), org_id=found["organization_id"])
+            p = get_client().open_device_proxy(
+                match["id"],
+                body["service"],
+                org_id=found["organization_id"],
+                visibility=body.get("visibility"),
+                expires_in=body.get("expires_in"),
+                idle_timeout=body.get("idle_timeout"),
+                name=body.get("name"),
+            )
         except AdmiralAPIError as exc:
             if exc.status == 503:
                 return _dumps({"error": _PROXY_OFF, "device": match})
             raise
         view = _proxy_view(p)
-        return _dumps(
-            {
-                "summary": f"Proxy open to {service} on {match.get('name') or match['id']}: {view['url']} (expires {view['expires']}).",
-                "device": match,
-                "proxy": view,
-                "next": [{"tool": "close_proxy", "why": "Close it when finished.", "arguments": {"name": view["name"]}}],
-            }
-        )
+        out: dict[str, Any] = {
+            "summary": f"Proxy open to {service} on {match.get('name') or match['id']}: {view['url']} ({view['visibility']}, expires {view['expires']}).",
+            "device": match,
+            "proxy": view,
+            "next": [
+                {"tool": "update_proxy", "why": "Change visibility, expiry or idle close.", "arguments": {"name": view["name"]}},
+                {"tool": "close_proxy", "why": "Close it when finished.", "arguments": {"name": view["name"]}},
+            ],
+        }
+        warn = _public_warning(view)
+        if warn:
+            out["warnings"] = [warn]
+        return _dumps(out)
     except Exception as exc:
         return _err(exc)
 
 
 @mcp.tool(
-    description="List the caller's open HTTP proxies to device services (GET /proxy): name, url, device, service, created and expiry. Read-only.",
+    description=(
+        "Change an open HTTP proxy (PATCH /proxy/{name}; names come from list_proxies or open_device_proxy). Pass only what "
+        "should change: visibility ('private' or 'public'), expires_in (seconds from now; 0 = never), idle_timeout (seconds; "
+        "0 = no idle close). Making a proxy public means ANYONE WITH THE LINK can use it WITHOUT SIGNING IN and its traffic "
+        "counts towards the organisation's EdgeWire usage; it needs the fleet setting (set_fleet_proxy_policy "
+        "public_allowed=true) and may be capped by the fleet's max life. Same rules as close_proxy: the owner or an "
+        "organisation admin. Acts only when the user asks."
+    ),
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True),
+)
+def update_proxy(
+    name: str,
+    visibility: str | None = None,
+    expires_in: int | None = None,
+    idle_timeout: int | None = None,
+    organization_id: str | None = None,
+) -> str:
+    try:
+        if not (name or "").strip():
+            return _dumps({"error": "name is required: take it from list_proxies."})
+        vis = _proxy_visibility(visibility)
+        expires = _proxy_seconds(expires_in, "expires_in")
+        idle = _proxy_seconds(idle_timeout, "idle_timeout")
+        body: dict[str, Any] = {}
+        if vis is not None:
+            body["visibility"] = vis
+        if expires is not None:
+            body["expires_in"] = expires
+        if idle is not None:
+            body["idle_timeout"] = idle
+        if not body:
+            raise ToolRefusal("Pass visibility, expires_in and/or idle_timeout; there is nothing to change.")
+        client, org_id = _ctx(organization_id)
+        try:
+            p = client.update_proxy(name.strip(), org_id=org_id, **body)
+        except AdmiralAPIError as exc:
+            if exc.status == 503:
+                return _dumps({"error": _PROXY_OFF})
+            if exc.status == 404:
+                return _dumps({"error": f"No open proxy named {name!r} (it may have expired or been closed). Use list_proxies."})
+            raise
+        view = _proxy_view(p)
+        out: dict[str, Any] = {
+            "summary": f"Proxy {view['name'] or name} updated: {view['visibility']}, expires {view['expires']}, idle close {view['idle_timeout']}s.",
+            "proxy": view,
+            "next": [{"tool": "list_proxies", "why": "Review open proxies."}],
+        }
+        warn = _public_warning(view)
+        if warn:
+            out["warnings"] = [warn]
+        return _dumps(out)
+    except Exception as exc:
+        return _err(exc)
+
+
+@mcp.tool(
+    description="List the caller's open HTTP proxies to device services (GET /proxy): name, url, device, service, visibility (private or public), created, expiry ('never' when it does not expire) and idle timeout. Read-only.",
     annotations=_READ_ONLY,
 )
 def list_proxies(organization_id: str | None = None) -> str:
@@ -6945,6 +7081,198 @@ def close_proxy(name: str, organization_id: str | None = None) -> str:
                 return _dumps({"error": f"No open proxy named {name!r} (it may have expired or been closed). Use list_proxies."})
             raise
         return _dumps({"summary": f"Proxy {name} closed.", "closed": name, "next": [{"tool": "list_proxies", "why": "Confirm what is still open."}]})
+    except Exception as exc:
+        return _err(exc)
+
+
+def _proxy_policy_view(payload: Any) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+    return {
+        "public_allowed": bool(payload.get("publicProxiesAllowed")),
+        "public_max_life_seconds": int(payload.get("publicProxyMaxLife") or 0),
+    }
+
+
+@mcp.tool(
+    description=(
+        "Read a fleet's HTTP proxy policy (GET /fleets/{id}/proxy-policy): whether public proxies (open to anyone with the "
+        "link, no sign-in, billed to the organisation's EdgeWire usage) are allowed for its devices, and the longest life "
+        "(seconds, 0 = unbounded) a public proxy may have. Read-only."
+    ),
+    annotations=_READ_ONLY,
+)
+def get_fleet_proxy_policy(fleet: str, organization_id: str | None = None) -> str:
+    try:
+        client, org_id = _ctx(organization_id)
+        fl = _find_fleet(client, org_id, fleet)
+        view = _proxy_policy_view(client.get(f"fleets/{fl['id']}/proxy-policy", org_id=org_id)) or {"public_allowed": False, "public_max_life_seconds": 0}
+        life = view["public_max_life_seconds"]
+        return _dumps(
+            {
+                "summary": f"{fl.get('name')}: public proxies {'allowed' if view['public_allowed'] else 'not allowed'}"
+                + (f", max life {life}s" if view["public_allowed"] and life else "")
+                + ".",
+                "fleet": _ref(fl),
+                "proxy_policy": view,
+                "next": [{"tool": "set_fleet_proxy_policy", "why": "Allow or forbid public proxies and cap their life.", "arguments": {"fleet": fl["id"]}}],
+            }
+        )
+    except Exception as exc:
+        return _err(exc)
+
+
+@mcp.tool(
+    description=(
+        "Allow or forbid PUBLIC HTTP proxies on a fleet and cap their life (PUT /fleets/{id}/proxy-policy; off unless turned "
+        "on). A public proxy is usable by anyone with the link without signing in, and its traffic counts towards the "
+        "organisation's EdgeWire usage. public_allowed and public_max_life_seconds are each optional and an omitted one is left "
+        "unchanged; public_max_life_seconds=0 means unbounded, otherwise public proxies must expire within that many seconds. "
+        "Turning it off stops existing public proxies of the fleet's devices from serving (they are not deleted). Needs the "
+        "remote access management permission. Destructive: without confirm=true it only shows the change; confirm after the "
+        "user explicitly agrees. Read back from the API."
+    ),
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True),
+)
+def set_fleet_proxy_policy(
+    fleet: str,
+    public_allowed: bool | None = None,
+    public_max_life_seconds: int | None = None,
+    organization_id: str | None = None,
+    confirm: bool = False,
+) -> str:
+    def run() -> str:
+        if public_allowed is None and public_max_life_seconds is None:
+            raise ToolRefusal("Pass public_allowed and/or public_max_life_seconds; there is nothing to change.")
+        if public_max_life_seconds is not None and (
+            isinstance(public_max_life_seconds, bool) or not isinstance(public_max_life_seconds, int) or public_max_life_seconds < 0
+        ):
+            raise ToolRefusal("public_max_life_seconds must be a whole number of seconds, 0 or more (0 = unbounded).")
+        client, org_id = _ctx(organization_id)
+        fl = _find_fleet(client, org_id, fleet)
+        fid = fl["id"]
+        before = _proxy_policy_view(client.get(f"fleets/{fid}/proxy-policy", org_id=org_id)) or {"public_allowed": False, "public_max_life_seconds": 0}
+        after_want = {
+            "public_allowed": before["public_allowed"] if public_allowed is None else public_allowed,
+            "public_max_life_seconds": before["public_max_life_seconds"] if public_max_life_seconds is None else public_max_life_seconds,
+        }
+        if after_want == before:
+            raise ToolRefusal(
+                f"No change: public proxies are already {'allowed' if before['public_allowed'] else 'not allowed'}"
+                f" with max life {before['public_max_life_seconds']}s for {fl.get('name')}.",
+                fleet=_ref(fl),
+            )
+        body: dict[str, Any] = {}
+        if public_allowed is not None and public_allowed != before["public_allowed"]:
+            body["publicProxiesAllowed"] = public_allowed
+        if public_max_life_seconds is not None and public_max_life_seconds != before["public_max_life_seconds"]:
+            body["publicProxyMaxLife"] = public_max_life_seconds
+        turning_off = before["public_allowed"] and not after_want["public_allowed"]
+        turning_on = after_want["public_allowed"] and not before["public_allowed"]
+        args: dict[str, Any] = {"fleet": fid}
+        if public_allowed is not None:
+            args["public_allowed"] = public_allowed
+        if public_max_life_seconds is not None:
+            args["public_max_life_seconds"] = public_max_life_seconds
+        warnings = []
+        if turning_off:
+            warnings.append("Existing public proxies of this fleet's devices stop serving (they are not deleted).")
+        if turning_on:
+            warnings.append("Users with access can then open proxies that anyone with the link can use without signing in; the traffic counts towards the organisation's EdgeWire usage.")
+        gate = _gate(
+            confirm,
+            "set_fleet_proxy_policy",
+            f"change the public proxy policy for fleet {fl.get('name')}: "
+            + ("public proxies stop serving." if turning_off else "public (no sign-in) proxies become possible, billed to the organisation's EdgeWire usage." if turning_on else "the public proxy life cap changes."),
+            action={"fleet": _ref(fl), "changes": body},
+            args=args,
+            org_id=org_id,
+            preview={"before": before, "after": after_want, "devices": {"total": fl.get("devices"), "online": fl.get("online")}},
+            warnings=warnings or None,
+        )
+        if gate:
+            return gate
+        client.put(f"fleets/{fid}/proxy-policy", org_id=org_id, json=body)
+        now = _proxy_policy_view(client.get(f"fleets/{fid}/proxy-policy", org_id=org_id)) or {}
+        confirmed = now == after_want
+        return _dumps(
+            {
+                "summary": f"{fl.get('name')}: public proxies {'allowed' if now.get('public_allowed') else 'not allowed'}, max life {now.get('public_max_life_seconds')}s"
+                + ("" if confirmed else " (NOT confirmed by read-back)")
+                + ".",
+                "fleet": _ref(fl),
+                "before": before,
+                "after": now,
+                "read_back": {"confirmed": confirmed},
+                "next": [{"tool": "get_fleet_proxy_policy", "why": "Review the policy.", "arguments": {"fleet": fid}}],
+            }
+        )
+
+    return _toggle_call(run)
+
+
+def _prefix_value(payload: Any) -> str | None:
+    if isinstance(payload, dict):
+        v = payload.get("prefix")
+        return v if isinstance(v, str) and v else None
+    return None
+
+
+@mcp.tool(
+    description=(
+        "Read the organisation's HTTP proxy prefix (GET /organisations/{id}/proxy-settings). With a prefix, proxy URLs are "
+        "<prefix>-<name> and open_device_proxy accepts a custom name; without one only random names are used. Any "
+        "organisation member can read it. Read-only."
+    ),
+    annotations=_READ_ONLY,
+)
+def get_org_proxy_prefix(organization_id: str | None = None) -> str:
+    try:
+        client, org_id = _ctx(organization_id)
+        prefix = _prefix_value(client.get(f"organisations/{org_id}/proxy-settings", org_id=org_id))
+        return _dumps(
+            {
+                "summary": f"Proxy prefix: {prefix}." if prefix else "No proxy prefix set: proxies get random names.",
+                "organization_id": org_id,
+                "prefix": prefix,
+                "next": [{"tool": "set_org_proxy_prefix", "why": "Choose or clear the prefix (organisation admin)."}],
+            }
+        )
+    except Exception as exc:
+        return _err(exc)
+
+
+@mcp.tool(
+    description=(
+        "Set or clear the organisation's HTTP proxy prefix (PUT /organisations/{id}/proxy-settings; organisation admin only). "
+        "prefix = 3-20 lowercase letters and digits (no hyphens), unique across organisations; platform, brand and common-word "
+        "names are reserved. An empty prefix clears it. Proxy URLs become <prefix>-<name> and open_device_proxy accepts a custom "
+        "name. Changing it never renames proxies that are already open. Acts only when the user asks. Read back from the API."
+    ),
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True),
+)
+def set_org_proxy_prefix(prefix: str, organization_id: str | None = None) -> str:
+    try:
+        want = (prefix or "").strip().lower() or None
+        if want is not None and (not 3 <= len(want) <= 20 or not _PROXY_PREFIX.match(want)):
+            raise ToolRefusal("prefix must be 3-20 characters: lowercase letters and digits only. Pass an empty string to clear it.")
+        client, org_id = _ctx(organization_id)
+        before = _prefix_value(client.get(f"organisations/{org_id}/proxy-settings", org_id=org_id))
+        if before == want:
+            raise ToolRefusal(f"No change: the proxy prefix is already {before!r}." if before else "No change: no proxy prefix is set.")
+        client.put(f"organisations/{org_id}/proxy-settings", org_id=org_id, json={"prefix": want})
+        now = _prefix_value(client.get(f"organisations/{org_id}/proxy-settings", org_id=org_id))
+        confirmed = now == want
+        return _dumps(
+            {
+                "summary": (f"Proxy prefix set to {now}." if now else "Proxy prefix cleared.") + ("" if confirmed else " (NOT confirmed by read-back)"),
+                "organization_id": org_id,
+                "before": before,
+                "after": now,
+                "read_back": {"confirmed": confirmed},
+                "note": "Open proxies keep their names.",
+            }
+        )
     except Exception as exc:
         return _err(exc)
 

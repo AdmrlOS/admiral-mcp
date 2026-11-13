@@ -118,6 +118,7 @@ def world() -> GuardedAPI:
     on("GET", f"/fleets/{FLEET}/network/configuration", ok(net_cfg(scope="fleet", interfaces=[{"match_mac": "aa:bb:cc:00:00:01", "enabled": True, "type": "ethernet", "ethernet": {"ip": {"proxy": {"server": "http://proxy.example.com:3128", "ignore_tls": False}}}}], client_networks=[])))
     on("GET", f"/fleets/{FLEET}/ssh", ok({"enabled": True}))
     on("GET", f"/fleets/{FLEET}/image-proxy", ok({"fleet_id": FLEET, "enabled": False}))
+    on("GET", f"/fleets/{FLEET}/proxy-policy", ok({"publicProxiesAllowed": False, "publicProxyMaxLife": 0}))
     on("GET", f"/fleets/{FLEET}/custom-metrics", ok({"enabled": False}))
     on("GET", f"/fleets/{FLEET}/security-policy", ok({"fleet_id": FLEET, "require_tpm": False, "require_secure_boot": False, "require_disk_encryption": False, "require_recovery_key_escrow": False, "enforced": False, "devices_total": 4, "devices_noncompliant": 0, "devices_not_reported": 0, "can_manage": True}))
     on("GET", f"/fleets/{FLEET}/usb-policy", ok({"fleet_id": FLEET, "policy": None}))
@@ -202,6 +203,7 @@ def _cases(tmp_path) -> dict[str, dict[str, Any]]:
         "set_fleet_image_proxy": {"fleet": FLEET, "enabled": True},
         "set_fleet_custom_metrics": {"fleet": FLEET, "enabled": True},
         "set_fleet_dev_sessions": {"fleet": FLEET, "allowed": True, "max_life_seconds": 3600},
+        "set_fleet_proxy_policy": {"fleet": FLEET, "public_allowed": True},
         "set_fleet_security_policy": {"fleet": FLEET, "require_tpm": True},
         "set_usb_policy": {"fleet": FLEET, "mode": "block_storage_hid"},
         "clear_usb_policy": {"device": "dan-qemu-3"},
@@ -218,7 +220,7 @@ CASE_NAMES = sorted(
     discard_local_override start_memory_test cancel_memory_test create_rollout rollout_control edit_configuration import_configuration_compose
     rollback_configuration delete_configuration assign_fleet_configuration set_fleet_update_policy move_device_to_fleet
     set_device_configuration_override reset_device_configuration_override clear_device_configuration_override set_network_configuration
-    clear_network_configuration set_fleet_ssh_access set_fleet_image_proxy set_fleet_custom_metrics set_fleet_dev_sessions
+    clear_network_configuration set_fleet_ssh_access set_fleet_image_proxy set_fleet_custom_metrics set_fleet_dev_sessions set_fleet_proxy_policy
     set_fleet_security_policy set_usb_policy clear_usb_policy delete_alert_rule update_registry_credential
     delete_registry_credential delete_secret_file upload_secret_file""".split()
 )

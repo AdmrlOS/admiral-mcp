@@ -27,8 +27,10 @@ PROXY = {
     "url": "https://brisk-otter-1234-proxy.example.com/",
     "device_id": DEV,
     "service": "web",
+    "visibility": "private",
     "created_at": "2026-10-22T01:00:00Z",
     "expires": "2026-10-22T13:00:00Z",
+    "idle_timeout": 1800,
 }
 
 
@@ -93,7 +95,8 @@ def test_open_device_proxy_posts_service_and_returns_url(api):
     req = writes(api)[0]
     assert_pat(req) and json.loads(req.content) == {"service": "web"}
     assert out["proxy"]["url"] == PROXY["url"] and out["proxy"]["expires"] == PROXY["expires"]
-    assert out["next"][0] == {"tool": "close_proxy", "why": "Close it when finished.", "arguments": {"name": PROXY["name"]}}
+    assert {"tool": "close_proxy", "why": "Close it when finished.", "arguments": {"name": PROXY["name"]}} in out["next"]
+    assert out["proxy"]["visibility"] == "private" and out["proxy"]["idle_timeout"] == 1800 and "warnings" not in out
 
 
 def test_open_device_proxy_disabled_platform_says_not_enabled(api):
@@ -130,7 +133,9 @@ def test_close_proxy(api):
 def test_proxy_tool_annotations():
     tools = {t.name: t.annotations for t in __import__("asyncio").run(server.mcp.list_tools())}
     assert tools["list_proxies"].readOnlyHint is True
-    for name in ("open_device_proxy", "close_proxy"):
+    assert tools["get_fleet_proxy_policy"].readOnlyHint is True and tools["get_org_proxy_prefix"].readOnlyHint is True
+    assert tools["set_fleet_proxy_policy"].destructiveHint is True
+    for name in ("open_device_proxy", "close_proxy", "update_proxy", "set_org_proxy_prefix"):
         assert tools[name].readOnlyHint is False and tools[name].destructiveHint is False
     assert tools["set_fleet_dev_sessions"].destructiveHint is True
 
@@ -183,3 +188,169 @@ def test_set_fleet_dev_sessions_refuses_noop_empty_and_negative(api):
     assert "nothing to change" in j(server.set_fleet_dev_sessions(FLEET, confirm=True))["error"]
     assert "0 or more" in j(server.set_fleet_dev_sessions(FLEET, max_life_seconds=-1, confirm=True))["error"]
     assert not writes(api)
+
+
+# ------------------------------------------------------- proxy v2 ---
+
+ORG_SETTINGS = "/organisations/org-1/proxy-settings"
+PUBLIC = {**PROXY, "visibility": "public", "url": "https://brisk-otter-1234.example.com/"}
+NEVER = {k: v for k, v in PUBLIC.items() if k != "expires"}
+
+
+def test_open_device_proxy_sends_v2_options(api):
+    api.on("POST", f"/devices/{DEV}/proxy", ok(NEVER))
+    out = j(server.open_device_proxy("dan-qemu-3", "web", visibility="Public", expires_in=0, idle_timeout=0, name="demo"))
+    assert json.loads(writes(api)[0].content) == {"service": "web", "visibility": "public", "expires_in": 0, "idle_timeout": 0, "name": "demo"}
+    assert out["proxy"]["expires"] == "never" and out["proxy"]["visibility"] == "public"
+    assert "anyone with this link" in out["warnings"][0] and "EdgeWire usage" in out["warnings"][0]
+
+
+def test_open_device_proxy_validates_before_calling(api):
+    for kw, text in (
+        ({"visibility": "world"}, "private' or 'public"),
+        ({"expires_in": -1}, "expires_in"),
+        ({"idle_timeout": -5}, "idle_timeout"),
+        ({"name": "Bad_Name"}, "name must be"),
+        ({"name": "x" * 41}, "name must be"),
+    ):
+        assert text in j(server.open_device_proxy("dan-qemu-3", "web", **kw))["error"]
+    assert not api.seen
+
+
+def test_open_device_proxy_description_warns_about_public():
+    d = {t.name: t.description for t in __import__("asyncio").run(server.mcp.list_tools())}["open_device_proxy"]
+    assert "ANYONE WITH THE LINK" in d and "WITHOUT SIGNING IN" in d and "EdgeWire usage" in d and "fleet setting" in d
+
+
+@pytest.mark.parametrize(
+    "code, status, text",
+    [
+        ("public_not_allowed", 403, "not allowed"),
+        ("exceeds_fleet_max", 400, "fleet's public proxy limit"),
+        ("prefix_required", 400, "need an organisation proxy prefix"),
+        ("name_taken", 409, "already open"),
+    ],
+)
+def test_open_device_proxy_maps_error_codes(api, code, status, text):
+    api.on("POST", f"/devices/{DEV}/proxy", httpx.Response(status, json={"msg": "refused", "data": {"error_code": code}}))
+    out = j(server.open_device_proxy("dan-qemu-3", "web", visibility="public"))
+    assert out["error_code"] == code and text in out["error"] and out["hint"]
+    assert "permission_denied" not in out and "conflict" not in out
+
+
+def test_error_code_at_top_level_is_also_mapped(api):
+    api.on("POST", f"/devices/{DEV}/proxy", httpx.Response(409, json={"error_code": "name_taken", "msg": "taken"}))
+    assert j(server.open_device_proxy("dan-qemu-3", "web", name="x"))["error_code"] == "name_taken"
+
+
+def test_list_proxies_defaults_legacy_rows(api):
+    legacy = {k: v for k, v in PROXY.items() if k not in ("visibility", "idle_timeout")}
+    api.on("GET", "/proxy", ok([legacy, NEVER]))
+    rows = j(server.list_proxies())["proxies"]
+    assert rows[0]["visibility"] == "private" and rows[0]["idle_timeout"] is None
+    assert rows[1]["visibility"] == "public" and rows[1]["expires"] == "never"
+
+
+def test_update_proxy_patches_only_what_is_given(api):
+    api.on("PATCH", f"/proxy/{PROXY['name']}", ok(PUBLIC))
+    out = j(server.update_proxy(PROXY["name"], visibility="public", expires_in=3600))
+    req = writes(api, "PATCH")[0]
+    assert_pat(req)
+    assert json.loads(req.content) == {"visibility": "public", "expires_in": 3600}
+    assert out["proxy"]["visibility"] == "public" and out["warnings"]
+    j(server.update_proxy(PROXY["name"], idle_timeout=0))
+    assert json.loads(writes(api, "PATCH")[1].content) == {"idle_timeout": 0}
+
+
+def test_update_proxy_refusals_and_errors(api):
+    assert "nothing to change" in j(server.update_proxy(PROXY["name"]))["error"]
+    assert "expires_in" in j(server.update_proxy(PROXY["name"], expires_in=-1))["error"]
+    assert "name is required" in j(server.update_proxy(" "))["error"]
+    assert not api.seen
+    api.on("PATCH", "/proxy/gone", httpx.Response(404, json={"msg": "nf"}))
+    assert "No open proxy" in j(server.update_proxy("gone", visibility="private"))["error"]
+    api.on("PATCH", f"/proxy/{PROXY['name']}", httpx.Response(403, json={"msg": "no", "data": {"error_code": "public_not_allowed"}}))
+    assert j(server.update_proxy(PROXY["name"], visibility="public"))["error_code"] == "public_not_allowed"
+    api.on("PATCH", f"/proxy/{PROXY['name']}", httpx.Response(503, json={"msg": "off"}))
+    assert "not enabled" in j(server.update_proxy(PROXY["name"], visibility="private"))["error"]
+
+
+# --------------------------------------------------- fleet proxy policy ---
+
+
+def test_get_fleet_proxy_policy(api):
+    api.on("GET", f"/fleets/{FLEET}/proxy-policy", ok({"publicProxiesAllowed": True, "publicProxyMaxLife": 86400}))
+    out = j(server.get_fleet_proxy_policy(FLEET))
+    assert out["proxy_policy"] == {"public_allowed": True, "public_max_life_seconds": 86400}
+    assert "public proxies allowed, max life 86400s" in out["summary"]
+
+
+def test_set_fleet_proxy_policy_previews_then_writes_and_reads_back(api):
+    state = {"publicProxiesAllowed": False, "publicProxyMaxLife": 0}
+    api.on("GET", f"/fleets/{FLEET}/proxy-policy", lambda r: ok(dict(state)))
+
+    def put(r: httpx.Request) -> httpx.Response:
+        state.update(json.loads(r.content))
+        return ok(dict(state))
+
+    api.on("PUT", f"/fleets/{FLEET}/proxy-policy", put)
+    pre = j(server.set_fleet_proxy_policy(FLEET, public_allowed=True, public_max_life_seconds=7200))
+    assert pre["confirmation_required"] is True and not writes(api)
+    assert pre["preview"]["after"] == {"public_allowed": True, "public_max_life_seconds": 7200}
+    assert any("without signing in" in w for w in pre["warnings"])
+    done = j(server.set_fleet_proxy_policy(**pre["next"]["arguments"]))
+    assert json.loads(writes(api, "PUT")[0].content) == {"publicProxiesAllowed": True, "publicProxyMaxLife": 7200}
+    assert done["read_back"]["confirmed"] is True and done["after"]["public_allowed"] is True
+
+
+def test_set_fleet_proxy_policy_turning_off_warns_and_refuses_noop(api):
+    api.on("GET", f"/fleets/{FLEET}/proxy-policy", ok({"publicProxiesAllowed": True, "publicProxyMaxLife": 60}))
+    pre = j(server.set_fleet_proxy_policy(FLEET, public_allowed=False))
+    assert any("stop serving" in w for w in pre["warnings"])
+    assert j(server.set_fleet_proxy_policy(FLEET, public_allowed=True, public_max_life_seconds=60, confirm=True))["error"].startswith("No change")
+    assert "nothing to change" in j(server.set_fleet_proxy_policy(FLEET, confirm=True))["error"]
+    assert "0 or more" in j(server.set_fleet_proxy_policy(FLEET, public_max_life_seconds=-1, confirm=True))["error"]
+    assert not writes(api)
+
+
+# ------------------------------------------------------ org proxy prefix ---
+
+
+def test_get_org_proxy_prefix(api):
+    api.on("GET", ORG_SETTINGS, ok({"prefix": "acme"}))
+    out = j(server.get_org_proxy_prefix())
+    assert out["prefix"] == "acme" and "acme" in out["summary"]
+    api.on("GET", ORG_SETTINGS, ok({"prefix": None}))
+    assert j(server.get_org_proxy_prefix())["prefix"] is None
+
+
+def test_set_org_proxy_prefix_writes_and_reads_back(api):
+    state: dict[str, Any] = {"prefix": None}
+    api.on("GET", ORG_SETTINGS, lambda r: ok(dict(state)))
+    api.on("PUT", ORG_SETTINGS, lambda r: (state.update(json.loads(r.content)), ok(dict(state)))[1])
+    out = j(server.set_org_proxy_prefix("AcmeCorp"))
+    req = writes(api, "PUT")[0]
+    assert req.url.path.endswith(ORG_SETTINGS) and json.loads(req.content) == {"prefix": "acmecorp"}
+    assert out["read_back"]["confirmed"] is True and out["after"] == "acmecorp"
+    out = j(server.set_org_proxy_prefix(""))
+    assert json.loads(writes(api, "PUT")[1].content) == {"prefix": None} and out["after"] is None
+
+
+def test_set_org_proxy_prefix_validates_and_refuses_noop(api):
+    for bad in ("ab", "x" * 21, "-acme", "acme_corp", "a--b", "acme-corp"):
+        assert "prefix must be" in j(server.set_org_proxy_prefix(bad))["error"]
+    assert not api.seen
+    api.on("GET", ORG_SETTINGS, ok({"prefix": "acme"}))
+    assert j(server.set_org_proxy_prefix("acme"))["error"].startswith("No change")
+    assert not writes(api)
+
+
+@pytest.mark.parametrize(
+    "code, status, text",
+    [("prefix_taken", 409, "Another organisation"), ("prefix_reserved", 400, "reserved")],
+)
+def test_set_org_proxy_prefix_maps_error_codes(api, code, status, text):
+    api.on("GET", ORG_SETTINGS, ok({"prefix": None}))
+    api.on("PUT", ORG_SETTINGS, httpx.Response(status, json={"msg": "no", "data": {"error_code": code}}))
+    out = j(server.set_org_proxy_prefix("acme"))
+    assert out["error_code"] == code and text in out["error"]
