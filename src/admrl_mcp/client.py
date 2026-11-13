@@ -948,8 +948,34 @@ class AdmiralClient:
         return self.get("search", org_id=org_id, params={"q": query, "limit": limit})
 
     # Developer sessions and the HTTP proxy to device services.
-    def open_device_proxy(self, device_id: str, service: str, *, org_id: str | None = None) -> Any:
-        return self.post(f"devices/{device_id}/proxy", org_id=org_id, json={"service": service})
+    def open_device_proxy(
+        self,
+        device_id: str,
+        service: str,
+        *,
+        org_id: str | None = None,
+        visibility: str | None = None,
+        expires_in: int | None = None,
+        idle_timeout: int | None = None,
+        name: str | None = None,
+    ) -> Any:
+        body: dict[str, Any] = {"service": service}
+        for key, value in (("visibility", visibility), ("expires_in", expires_in), ("idle_timeout", idle_timeout), ("name", name)):
+            if value is not None:
+                body[key] = value
+        return self.post(f"devices/{device_id}/proxy", org_id=org_id, json=body)
+
+    def update_proxy(
+        self,
+        name: str,
+        *,
+        org_id: str | None = None,
+        visibility: str | None = None,
+        expires_in: int | None = None,
+        idle_timeout: int | None = None,
+    ) -> Any:
+        body = {k: v for k, v in (("visibility", visibility), ("expires_in", expires_in), ("idle_timeout", idle_timeout)) if v is not None}
+        return self.request("PATCH", f"proxy/{quote(name, safe='')}", org_id=org_id, json=body)
 
     def list_proxies(self, *, org_id: str | None = None) -> Any:
         return self.get("proxy", org_id=org_id)

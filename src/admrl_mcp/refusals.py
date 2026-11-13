@@ -146,3 +146,47 @@ def describe(body: Any) -> dict[str, Any] | None:
     if code == BASE_VERSION_REQUIRED:
         return _base_required()
     return _export_unsupported(data)
+
+
+PROXY_ERRORS: dict[str, tuple[str, str]] = {
+    "public_not_allowed": (
+        "Public proxies are not allowed for this device's fleet.",
+        "Turn on public proxies for the fleet first (set_fleet_proxy_policy with public_allowed=true; needs the remote access management permission), or open a private proxy.",
+    ),
+    "exceeds_fleet_max": (
+        "The requested lifetime is not allowed by the fleet's public proxy limit.",
+        "A fleet with a public proxy max life requires expires_in between 1 and that many seconds (0/never is refused). Read it with get_fleet_proxy_policy.",
+    ),
+    "prefix_required": (
+        "Custom proxy names need an organisation proxy prefix, and this organisation has none.",
+        "Set one with set_org_proxy_prefix (organisation admin), or omit name to get a random one.",
+    ),
+    "name_taken": (
+        "A proxy with that name is already open.",
+        "Pick another name, or close the existing proxy with close_proxy if it is yours (list_proxies).",
+    ),
+    "prefix_taken": (
+        "Another organisation already uses that proxy prefix.",
+        "Choose a different prefix.",
+    ),
+    "prefix_reserved": (
+        "That proxy prefix is reserved (platform, brand or common-word names cannot be used).",
+        "Choose a different prefix of 3-20 lowercase letters, digits and hyphens.",
+    ),
+}
+
+
+def proxy_error(body: Any) -> dict[str, Any] | None:
+    """Clear message for an EdgeWire proxy refusal (``error_code`` at top level, in ``data``, or ``data.error``)."""
+    if not isinstance(body, dict):
+        return None
+    data = body.get("data")
+    for source in (body, data if isinstance(data, dict) else None):
+        if not source:
+            continue
+        for key in ("error_code", "error", "code"):
+            value = source.get(key)
+            if isinstance(value, str) and value in PROXY_ERRORS:
+                message, hint = PROXY_ERRORS[value]
+                return {"error": message, "error_code": value, "hint": hint}
+    return None
