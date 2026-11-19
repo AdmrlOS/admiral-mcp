@@ -43,6 +43,7 @@ PROBE_RATE_LIMIT_S = 5
 
 _UNEXPECTED_BOOT_KINDS = {
     "watchdog_no_backend": "The device rebooted itself because it lost the Admiral backend for an hour (network problem).",
+    "boot_commit_failed": "The device reached the Admiral backend but could not commit the new boot, so it restarted itself (see the detail for the last error).",
     "deadman": "The device rebooted itself after 3 days without reaching the backend (network or outage).",
     "emergency": "The agent forced an emergency reboot.",
     "kernel_fatal": "A fatal kernel error was detected and the device rebooted.",

@@ -585,6 +585,14 @@ def test_unavailable_service_health_is_not_flagged():
     assert ts._services(ev) == []
 
 
+@pytest.mark.parametrize("kind,flagged", [("boot_commit_failed", True), ("remote_reboot", False)])
+def test_boot_commit_failed_is_an_unexpected_reboot(monkeypatch, kind, flagged):
+    monkeypatch.setattr(ts, "_now", lambda: NOW)
+    st = good_state(bootReasons=[{"kind": kind, "at": "2026-10-07T23:00:00Z", "uptimeSeconds": 3600, "detail": "mount busy"}])
+    out = ts._drift({"state_doc": st, "online": True})
+    assert ("unexpected_reboot" in [f["code"] for f in out]) is flagged
+
+
 def test_fleet_health_report_buckets_follow_injected_clock(monkeypatch):
     """Same fixtures, clock moved +30 days: offline devices fall out of '< 24 h'."""
     api = fleet_api()
