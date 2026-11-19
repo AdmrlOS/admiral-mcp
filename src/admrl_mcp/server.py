@@ -105,6 +105,10 @@ How to answer naturally:
   list_proxies shows the caller's open proxies, update_proxy changes one, close_proxy closes one. Proxies are private by default;
   visibility=public means anyone with the link can use it without signing in and bills the org's EdgeWire usage, and needs
   set_fleet_proxy_policy (get_fleet_proxy_policy reads it). Custom names need an org prefix (get/set_org_proxy_prefix).
+  list_proxies also shows owner, last request, bytes_30d and visitor_count; get_proxy_usage gives one proxy's traffic and\
+  get_proxy lists its visitors and revoke_proxy_visitor drops one visitor of a private proxy.\
+  EdgeWire: get_edgewire_status says whether it is on and whether the caller can turn it on, enable_edgewire turns it on (free\
+  allowance; confirm-gated), list_edgewire_services lists the services configured across devices.\
   There is no tool to end a developer session.
 - Alerting: list_alert_rules, get_alert_rule, list_alerts (history), preview_alert_rule (evaluates, saves nothing),
   create_alert_rule, update_alert_rule, delete_alert_rule. Needs the Telemetry add-on for writes and previews.
@@ -6852,12 +6856,23 @@ def _proxy_view(p: Any) -> dict[str, Any]:
         "name": p.get("name"),
         "url": p.get("url"),
         "device_id": p.get("device_id"),
+        "device_name": p.get("device_name"),
         "service": p.get("service"),
         "visibility": p.get("visibility") or "private",
         "created_at": p.get("created_at"),
         "expires": p.get("expires") or "never",
         "idle_timeout": p.get("idle_timeout"),
+        "owner": _proxy_owner(p.get("owner")),
+        "last_request_at": p.get("last_request_at"),
+        "bytes_30d": p.get("bytes_30d"),
+        "visitor_count": p.get("visitor_count"),
     }
+
+
+def _proxy_owner(owner: Any) -> dict[str, Any] | None:
+    if not isinstance(owner, dict):
+        return None
+    return {k: owner.get(k) for k in ("id", "name", "email") if owner.get(k) is not None} or None
 
 
 _PROXY_OFF = "The HTTP proxy is not enabled on this Admiral platform (503). Nothing was opened; ask the platform operator to enable it."
@@ -7027,7 +7042,7 @@ def update_proxy(
 
 
 @mcp.tool(
-    description="List the caller's open HTTP proxies to device services (GET /proxy): name, url, device, service, visibility (private or public), created, expiry ('never' when it does not expire) and idle timeout. Read-only.",
+    description="List the caller's open HTTP proxies to device services (GET /proxy): name, url, device, service, visibility (private or public), created, expiry ('never' when it does not expire), idle timeout, owner, last request, bytes carried in the last 30 days (bytes_30d, absent while usage is not available yet) and visitor count. Organisation admins see every proxy, others their own. Read-only. Per-proxy traffic: get_proxy_usage.",
     annotations=_READ_ONLY,
 )
 def list_proxies(organization_id: str | None = None) -> str:
@@ -7054,6 +7069,49 @@ def list_proxies(organization_id: str | None = None) -> str:
 
 @mcp.tool(
     description=(
+        "One open HTTP proxy and its signed-in visitors (GET /proxy/{name}; names come from list_proxies): everything "
+        "list_proxies shows plus each visitor's user id, name and email (organisation members only) and when they signed in. "
+        "Visitors are browser sign-ins, not live connections; public proxies have none. Revoke one with revoke_proxy_visitor. "
+        "Read-only."
+    ),
+    annotations=_READ_ONLY,
+)
+def get_proxy(name: str, organization_id: str | None = None) -> str:
+    try:
+        if not (name or "").strip():
+            return _dumps({"error": "name is required: take it from list_proxies."})
+        client, org_id = _ctx(organization_id)
+        try:
+            p = client.get_proxy(name.strip(), org_id=org_id)
+        except AdmiralAPIError as exc:
+            if exc.status == 503:
+                return _dumps({"error": _PROXY_OFF})
+            if exc.status == 404:
+                return _dumps({"error": f"No open proxy named {name!r} (it may have expired or been closed). Use list_proxies."})
+            raise
+        p = p if isinstance(p, dict) else {}
+        visitors = [
+            {k: v.get(k) for k in ("user_id", "name", "email", "since") if v.get(k) is not None}
+            for v in (p.get("visitors") or [])
+            if isinstance(v, dict) and v.get("user_id")
+        ]
+        view = _proxy_view(p)
+        out: dict[str, Any] = {
+            "summary": f"Proxy {view['name']}: {view['visibility']}, {len(visitors)} visitor{'' if len(visitors) == 1 else 's'}.",
+            "organization_id": org_id,
+            "proxy": view,
+            "visitors": visitors,
+            "next": [{"tool": "get_proxy_usage", "why": "Traffic through this proxy."}],
+        }
+        if visitors:
+            out["next"].append({"tool": "revoke_proxy_visitor", "why": "Sign one visitor out.", "arguments": {"name": view["name"], "user": "<user_id>"}})
+        return _dumps(out)
+    except Exception as exc:
+        return _err(exc)
+
+
+@mcp.tool(
+    description=(
         "Close an HTTP proxy by name (DELETE /proxy/{name}; names come from list_proxies or open_device_proxy). Ends its "
         "sessions and signs every browser out; open a new one to reach the service again. Callers can close their own "
         "proxies; closing someone else's needs a higher organisation role."
@@ -7074,6 +7132,244 @@ def close_proxy(name: str, organization_id: str | None = None) -> str:
                 return _dumps({"error": f"No open proxy named {name!r} (it may have expired or been closed). Use list_proxies."})
             raise
         return _dumps({"summary": f"Proxy {name} closed.", "closed": name, "next": [{"tool": "list_proxies", "why": "Confirm what is still open."}]})
+    except Exception as exc:
+        return _err(exc)
+
+
+def _edgewire_status_view(payload: Any) -> dict[str, Any]:
+    p = payload if isinstance(payload, dict) else {}
+    return {
+        "entitled": bool(p.get("entitled")),
+        "relay": bool(p.get("relay")),
+        "included_relay_gb": p.get("included_relay_gb"),
+        "max_sessions_per_device": p.get("max_sessions_per_device"),
+        "can_enable": bool(p.get("can_enable")),
+        "enable_blocked": p.get("enable_blocked") or "",
+    }
+
+
+_ENABLE_BLOCKED = {
+    "staff_disabled": "EdgeWire was turned off for this organisation by Admiral staff. Contact support; it cannot be turned on from here.",
+    "not_admin": "Only an organisation admin can turn EdgeWire on. Ask one to do it.",
+}
+
+
+@mcp.tool(
+    description=(
+        "Whether EdgeWire (direct, authenticated connections and browser proxies to device services) is on for the organisation "
+        "(GET /edgewire/status): entitled, relay on/off, the included relay allowance in GB, the maximum sessions per device, and "
+        "whether the caller can turn it on (can_enable; enable_blocked says why not: staff_disabled or not_admin). Read-only. "
+        "Turn it on with enable_edgewire."
+    ),
+    annotations=_READ_ONLY,
+)
+def get_edgewire_status(organization_id: str | None = None) -> str:
+    try:
+        client, org_id = _ctx(organization_id)
+        view = _edgewire_status_view(client.get_edgewire_status(org_id=org_id))
+        if view["entitled"]:
+            summary = (
+                f"EdgeWire is on: relay {'on' if view['relay'] else 'off'}, {view['included_relay_gb']} GB relayed a month included, "
+                f"{view['max_sessions_per_device']} sessions per device."
+            )
+            nxt = [{"tool": "list_edgewire_services", "why": "See which device services are exposed."}]
+        elif view["can_enable"]:
+            summary = "EdgeWire is off for this organisation; the caller can turn it on."
+            nxt = [{"tool": "enable_edgewire", "why": "Turn it on (free allowance; asks for confirmation)."}]
+        else:
+            summary = "EdgeWire is off. " + _ENABLE_BLOCKED.get(view["enable_blocked"], "It cannot be turned on by this caller.")
+            nxt = []
+        return _dumps({"summary": summary, "organization_id": org_id, "status": view, "next": nxt})
+    except Exception as exc:
+        return _err(exc)
+
+
+@mcp.tool(
+    description=(
+        "Turn EdgeWire on for the organisation (POST /edgewire/enable) on the free allowance (limited relayed data a month and "
+        "sessions per device; see get_edgewire_status). Needs an organisation admin and only works for an organisation that has "
+        "never had EdgeWire configured; if Admiral staff turned it off, contact support. Relay traffic counts towards the "
+        "allowance. Destructive: without confirm=true it only shows what would happen; confirm after the user explicitly agrees. "
+        "Read back from the API."
+    ),
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True, idempotentHint=True),
+)
+def enable_edgewire(organization_id: str | None = None, confirm: bool = False) -> str:
+    def run() -> str:
+        client, org_id = _ctx(organization_id)
+        before = _edgewire_status_view(client.get_edgewire_status(org_id=org_id))
+        if before["entitled"]:
+            raise ToolRefusal("No change: EdgeWire is already on for this organisation.", status=before)
+        if not before["can_enable"]:
+            raise ToolRefusal(
+                _ENABLE_BLOCKED.get(before["enable_blocked"], "EdgeWire cannot be turned on by this caller."),
+                status=before,
+            )
+        gate = _gate(
+            confirm,
+            "enable_edgewire",
+            "turn EdgeWire on for the organisation on the free allowance.",
+            action={"organization_id": org_id},
+            args={},
+            org_id=org_id,
+            preview={"before": before, "effect": "EdgeWire on, relay on, free allowance (get_edgewire_status shows the limits once on)"},
+            warnings=["Relay traffic counts towards the monthly allowance; use beyond it needs a plan change (contact Admiral)."],
+        )
+        if gate:
+            return gate
+        client.enable_edgewire(org_id=org_id)
+        now = _edgewire_status_view(client.get_edgewire_status(org_id=org_id))
+        return _dumps(
+            {
+                "summary": "EdgeWire is on." if now["entitled"] else "Enable was sent but EdgeWire is NOT confirmed on by read-back.",
+                "before": before,
+                "after": now,
+                "read_back": {"confirmed": now["entitled"]},
+                "next": [
+                    {"tool": "list_edgewire_services", "why": "See device services; add some in a configuration's EdgeWire section first."},
+                    {"tool": "open_device_proxy", "why": "Open a service in a browser."},
+                ],
+            }
+        )
+
+    return _toggle_call(run)
+
+
+@mcp.tool(
+    description=(
+        "EdgeWire services across the devices the caller can see (GET /edgewire/services): per device its name, fleet, online "
+        "state, last seen, configured services (name, protocol, port) and the proxies currently open to them, online devices first; "
+        "plus how many devices have no services. Optional fleet (name or UUID) limits it. A truncated list says so. Read-only. "
+        "Add services in a configuration's EdgeWire section; open one with open_device_proxy."
+    ),
+    annotations=_READ_ONLY,
+)
+def list_edgewire_services(fleet: str | None = None, organization_id: str | None = None) -> str:
+    try:
+        client, org_id = _ctx(organization_id)
+        fid = None
+        if fleet and fleet.strip():
+            fid = _find_fleet(client, org_id, fleet)["id"]
+        try:
+            payload = client.list_edgewire_services(org_id=org_id, fleet_id=fid)
+        except AdmiralAPIError as exc:
+            if exc.status == 402:
+                return _dumps({"error": "EdgeWire is not on for this organisation (402).", "next": [{"tool": "get_edgewire_status", "why": "Check whether it can be turned on."}]})
+            raise
+        payload = payload if isinstance(payload, dict) else {}
+        devices = []
+        for d in payload.get("devices") or []:
+            if not isinstance(d, dict):
+                continue
+            devices.append(
+                {
+                    "device_id": d.get("device_id"),
+                    "name": d.get("name"),
+                    "fleet_id": d.get("fleet_id"),
+                    "fleet_name": d.get("fleet_name"),
+                    "online": d.get("online"),
+                    "last_seen": d.get("last_seen"),
+                    "services": [
+                        {"name": s.get("name"), "protocol": s.get("protocol"), "port": s.get("port")}
+                        for s in (d.get("services") or [])
+                        if isinstance(s, dict)
+                    ],
+                    "open_proxies": [
+                        {"name": o.get("name"), "service": o.get("service"), "visibility": o.get("visibility") or "private"}
+                        for o in (d.get("open_proxies") or [])
+                        if isinstance(o, dict)
+                    ],
+                }
+            )
+        count = sum(len(d["services"]) for d in devices)
+        without = payload.get("without_services")
+        out: dict[str, Any] = {
+            "summary": f"{count} EdgeWire service{'' if count == 1 else 's'} on {len(devices)} device{'' if len(devices) == 1 else 's'}"
+            + (f"; {without} without any" if isinstance(without, int) else "")
+            + (" (list truncated)." if payload.get("truncated") else "."),
+            "organization_id": org_id,
+            "devices": devices,
+            "without_services": without,
+            "truncated": bool(payload.get("truncated")),
+            "next": [{"tool": "open_device_proxy", "why": "Open a service in a browser.", "arguments": {"device": "<device_id>", "service": "<name>"}}],
+        }
+        return _dumps(out)
+    except Exception as exc:
+        return _err(exc)
+
+
+@mcp.tool(
+    description=(
+        "Traffic through one HTTP proxy (GET /proxy/{name}/usage; names come from list_proxies): total bytes, bytes per path "
+        "(direct and relay) and per day, from..to (RFC 3339 or YYYY-MM-DD; default the proxy's life, at most the last 90 days). "
+        "Usage can lag; 'not available yet' is not zero. Same access as list_proxies. Read-only."
+    ),
+    annotations=_READ_ONLY,
+)
+def get_proxy_usage(name: str, start: str | None = None, end: str | None = None, organization_id: str | None = None) -> str:
+    try:
+        if not (name or "").strip():
+            return _dumps({"error": "name is required: take it from list_proxies."})
+        client, org_id = _ctx(organization_id)
+        try:
+            usage = client.get_proxy_usage(name.strip(), org_id=org_id, start=start, end=end)
+        except AdmiralAPIError as exc:
+            if exc.status == 503:
+                return _dumps({"error": _PROXY_OFF})
+            if exc.status == 404:
+                return _dumps({"error": f"No open proxy named {name!r} (it may have expired or been closed). Use list_proxies."})
+            raise
+        usage = usage if isinstance(usage, dict) else {}
+        if usage.get("unavailable"):
+            return _dumps({"summary": f"Usage for proxy {name} is not available yet (not zero); try again later.", "proxy": name, "unavailable": True})
+        total = usage.get("totalBytes", usage.get("total_bytes"))
+        return _dumps(
+            {
+                "summary": f"Proxy {name}: {total} bytes carried.",
+                "proxy": name,
+                "total_bytes": total,
+                "by_path": usage.get("byPath", usage.get("by_path")) or {},
+                "daily": usage.get("daily") or [],
+                "next": [{"tool": "list_proxies", "why": "Compare with the other proxies (bytes_30d, visitors)."}],
+            }
+        )
+    except Exception as exc:
+        return _err(exc)
+
+
+@mcp.tool(
+    description=(
+        "Revoke one visitor of a private HTTP proxy (DELETE /proxy/{name}/visitors/{userId}): drops that user's sign-ins to the "
+        "proxy so they must authenticate again (and lose access if they no longer have it); other visitors and the proxy stay. "
+        "Take the name from list_proxies and the user id from get_proxy's visitors. Public proxies have no visitors to revoke "
+        "(close_proxy ends them). The owner or an organisation admin can do it; other replicas may keep serving for a few seconds. "
+        "Only when the user asks."
+    ),
+    annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False, idempotentHint=True),
+)
+def revoke_proxy_visitor(name: str, user: str, organization_id: str | None = None) -> str:
+    try:
+        if not (name or "").strip():
+            return _dumps({"error": "name is required: take it from list_proxies."})
+        if not (user or "").strip():
+            return _dumps({"error": "user is required: the id of the visitor to revoke."})
+        client, org_id = _ctx(organization_id)
+        try:
+            client.revoke_proxy_visitor(name.strip(), user.strip(), org_id=org_id)
+        except AdmiralAPIError as exc:
+            if exc.status == 503:
+                return _dumps({"error": _PROXY_OFF})
+            if exc.status == 404:
+                return _dumps({"error": f"No open proxy named {name!r} (it may have expired or been closed). Use list_proxies."})
+            raise
+        return _dumps(
+            {
+                "summary": f"Visitor {user} revoked from proxy {name}.",
+                "proxy": name,
+                "revoked": user,
+                "next": [{"tool": "list_proxies", "why": "Check the visitor count."}],
+            }
+        )
     except Exception as exc:
         return _err(exc)
 

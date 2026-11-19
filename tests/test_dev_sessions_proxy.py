@@ -135,7 +135,10 @@ def test_proxy_tool_annotations():
     assert tools["list_proxies"].readOnlyHint is True
     assert tools["get_fleet_proxy_policy"].readOnlyHint is True and tools["get_org_proxy_prefix"].readOnlyHint is True
     assert tools["set_fleet_proxy_policy"].destructiveHint is True
-    for name in ("open_device_proxy", "close_proxy", "update_proxy", "set_org_proxy_prefix"):
+    for name in ("get_edgewire_status", "list_edgewire_services", "get_proxy_usage"):
+        assert tools[name].readOnlyHint is True
+    assert tools["enable_edgewire"].destructiveHint is True
+    for name in ("open_device_proxy", "close_proxy", "update_proxy", "set_org_proxy_prefix", "revoke_proxy_visitor"):
         assert tools[name].readOnlyHint is False and tools[name].destructiveHint is False
     assert tools["set_fleet_dev_sessions"].destructiveHint is True
 
@@ -354,3 +357,130 @@ def test_set_org_proxy_prefix_maps_error_codes(api, code, status, text):
     api.on("PUT", ORG_SETTINGS, httpx.Response(status, json={"msg": "no", "data": {"error_code": code}}))
     out = j(server.set_org_proxy_prefix("acme"))
     assert out["error_code"] == code and text in out["error"]
+
+
+# ------------------------------------------------------ EdgeWire console v3 ---
+
+EW_OFF = {"entitled": False, "relay": False, "included_relay_gb": 0, "max_sessions_per_device": 0, "can_enable": True, "enable_blocked": ""}
+EW_ON = {"entitled": True, "relay": True, "included_relay_gb": 1, "max_sessions_per_device": 2, "can_enable": False, "enable_blocked": ""}
+
+
+def test_list_proxies_shows_owner_traffic_and_visitors(api):
+    row = {**PROXY, "owner": {"id": "u1", "name": "Dev", "email": "dev@example.com", "extra": "x"}, "last_request_at": "2026-11-19T01:00:00Z", "bytes_30d": "123456", "visitor_count": 3}
+    api.on("GET", "/proxy", ok([row, PROXY]))
+    rows = j(server.list_proxies())["proxies"]
+    assert rows[0]["owner"] == {"id": "u1", "name": "Dev", "email": "dev@example.com"}
+    assert rows[0]["last_request_at"] == row["last_request_at"] and rows[0]["bytes_30d"] == "123456" and rows[0]["visitor_count"] == 3
+    assert rows[1]["owner"] is None and rows[1]["bytes_30d"] is None
+
+
+def test_get_edgewire_status_variants(api):
+    api.on("GET", "/edgewire/status", ok(EW_OFF))
+    out = j(server.get_edgewire_status())
+    assert out["status"]["can_enable"] is True and out["next"][0]["tool"] == "enable_edgewire"
+    api.on("GET", "/edgewire/status", ok({**EW_OFF, "can_enable": False, "enable_blocked": "staff_disabled"}))
+    out = j(server.get_edgewire_status())
+    assert "Contact support" in out["summary"] and out["next"] == []
+    api.on("GET", "/edgewire/status", ok({**EW_OFF, "can_enable": False, "enable_blocked": "not_admin"}))
+    assert "organisation admin" in j(server.get_edgewire_status())["summary"]
+    api.on("GET", "/edgewire/status", ok(EW_ON))
+    out = j(server.get_edgewire_status())
+    assert "EdgeWire is on" in out["summary"] and "2 sessions" in out["summary"]
+    assert not writes(api)
+
+
+def test_enable_edgewire_previews_then_posts_and_reads_back(api):
+    state = {"v": EW_OFF}
+    api.on("GET", "/edgewire/status", lambda r: ok(dict(state["v"])))
+    api.on("POST", "/edgewire/enable", lambda r: (state.update(v=EW_ON), ok(EW_ON))[1])
+    pre = j(server.enable_edgewire())
+    assert pre["confirmation_required"] is True and not writes(api)
+    assert pre["next"]["tool"] == "enable_edgewire" and pre["next"]["arguments"]["confirm"] is True
+    assert any("allowance" in w for w in pre["warnings"])
+    done = j(server.enable_edgewire(**pre["next"]["arguments"]))
+    req = writes(api, "POST")[0]
+    assert_pat(req)
+    assert req.url.path.endswith("/edgewire/enable")
+    assert done["read_back"]["confirmed"] is True and done["after"]["entitled"] is True
+
+
+def test_enable_edgewire_refusals(api):
+    api.on("GET", "/edgewire/status", ok(EW_ON))
+    assert "already on" in j(server.enable_edgewire(confirm=True))["error"]
+    api.on("GET", "/edgewire/status", ok({**EW_OFF, "can_enable": False, "enable_blocked": "staff_disabled"}))
+    assert "support" in j(server.enable_edgewire(confirm=True))["error"]
+    api.on("GET", "/edgewire/status", ok({**EW_OFF, "can_enable": False, "enable_blocked": "not_admin"}))
+    assert "organisation admin" in j(server.enable_edgewire(confirm=True))["error"]
+    assert not writes(api)
+
+
+def test_enable_edgewire_maps_staff_disabled_conflict(api):
+    api.on("GET", "/edgewire/status", ok(EW_OFF))
+    api.on("POST", "/edgewire/enable", httpx.Response(409, json={"msg": "no", "error_code": "staff_disabled"}))
+    out = j(server.enable_edgewire(confirm=True))
+    assert out["error_code"] == "staff_disabled" and "support" in out["hint"]
+
+
+def test_list_edgewire_services(api):
+    body = {
+        "devices": [
+            {
+                "device_id": DEV, "name": "dan-qemu-3", "fleet_id": FLEET, "fleet_name": "shop", "online": True, "last_seen": "2026-11-19T01:00:00Z",
+                "services": [{"name": "web", "protocol": "tcp", "port": 8080}], "open_proxies": [{"name": "brisk-otter-1234", "service": "web"}],
+            }
+        ],
+        "without_services": 4,
+    }
+    api.on("GET", "/edgewire/services", ok(body))
+    out = j(server.list_edgewire_services(fleet=FLEET))
+    assert api.seen[-1].url.params["fleetId"] == FLEET
+    assert out["devices"][0]["services"] == [{"name": "web", "protocol": "tcp", "port": 8080}]
+    assert out["devices"][0]["open_proxies"][0]["visibility"] == "private"
+    assert out["summary"] == "1 EdgeWire service on 1 device; 4 without any." and out["truncated"] is False
+    api.on("GET", "/edgewire/services", httpx.Response(402, json={"msg": "not entitled"}))
+    assert "not on" in j(server.list_edgewire_services())["error"]
+
+
+def test_get_proxy_usage(api):
+    name = PROXY["name"]
+    api.on("GET", f"/proxy/{name}/usage", ok({"totalBytes": 2048, "byPath": {"direct": 1024, "relay": 1024}, "daily": [{"day": "2026-11-18", "bytes": 2048}]}))
+    out = j(server.get_proxy_usage(name, start="2026-11-01", end="2026-11-19"))
+    params = api.seen[-1].url.params
+    assert params["from"] == "2026-11-01" and params["to"] == "2026-11-19"
+    assert out["total_bytes"] == 2048 and out["by_path"]["relay"] == 1024 and out["daily"][0]["bytes"] == 2048
+    api.on("GET", f"/proxy/{name}/usage", ok({"unavailable": True}))
+    out = j(server.get_proxy_usage(name))
+    assert out["unavailable"] is True and "not available yet" in out["summary"] and "total_bytes" not in out
+    api.on("GET", "/proxy/gone/usage", httpx.Response(404, json={"msg": "nf"}))
+    assert "No open proxy" in j(server.get_proxy_usage("gone"))["error"]
+    assert "name is required" in j(server.get_proxy_usage(" "))["error"]
+
+
+def test_get_proxy_lists_visitors(api):
+    name = PROXY["name"]
+    api.on(
+        "GET",
+        f"/proxy/{name}",
+        ok({**PROXY, "device_name": "lobby", "visitors": [{"user_id": "u2", "name": "Ann", "email": "a@x", "since": "2026-11-18T00:00:00Z"}, {"user_id": "staff", "since": "2026-11-18T01:00:00Z"}, {"since": "x"}]}),
+    )
+    out = j(server.get_proxy(name))
+    assert out["proxy"]["device_name"] == "lobby"
+    assert out["visitors"] == [{"user_id": "u2", "name": "Ann", "email": "a@x", "since": "2026-11-18T00:00:00Z"}, {"user_id": "staff", "since": "2026-11-18T01:00:00Z"}]
+    assert any(n["tool"] == "revoke_proxy_visitor" for n in out["next"])
+    api.on("GET", "/proxy/gone", httpx.Response(404, json={"msg": "nf"}))
+    assert "No open proxy" in j(server.get_proxy("gone"))["error"]
+    assert "name is required" in j(server.get_proxy(" "))["error"]
+
+
+def test_revoke_proxy_visitor(api):
+    name = PROXY["name"]
+    api.on("DELETE", f"/proxy/{name}/visitors/user-1", ok(None))
+    out = j(server.revoke_proxy_visitor(name, "user-1"))
+    req = writes(api, "DELETE")[0]
+    assert_pat(req)
+    assert out["revoked"] == "user-1" and out["proxy"] == name
+    api.on("DELETE", f"/proxy/{name}/visitors/user-2", httpx.Response(400, json={"msg": "public", "data": {"error_code": "public_proxy"}}))
+    out = j(server.revoke_proxy_visitor(name, "user-2"))
+    assert out["error_code"] == "public_proxy" and "close_proxy" in out["hint"]
+    assert "user is required" in j(server.revoke_proxy_visitor(name, " "))["error"]
+    assert "name is required" in j(server.revoke_proxy_visitor(" ", "u"))["error"]

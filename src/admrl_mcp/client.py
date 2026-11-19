@@ -980,8 +980,26 @@ class AdmiralClient:
     def list_proxies(self, *, org_id: str | None = None) -> Any:
         return self.get("proxy", org_id=org_id)
 
+    def get_proxy(self, name: str, *, org_id: str | None = None) -> Any:
+        return self.get(f"proxy/{quote(name, safe='')}", org_id=org_id)
+
     def close_proxy(self, name: str, *, org_id: str | None = None) -> Any:
         return self.delete(f"proxy/{quote(name, safe='')}", org_id=org_id)
+
+    def get_proxy_usage(self, name: str, *, org_id: str | None = None, start: str | None = None, end: str | None = None) -> Any:
+        return self.get(f"proxy/{quote(name, safe='')}/usage", org_id=org_id, params={"from": start, "to": end})
+
+    def revoke_proxy_visitor(self, name: str, user_id: str, *, org_id: str | None = None) -> Any:
+        return self.delete(f"proxy/{quote(name, safe='')}/visitors/{quote(user_id, safe='')}", org_id=org_id)
+
+    def get_edgewire_status(self, *, org_id: str | None = None) -> Any:
+        return self.get("edgewire/status", org_id=org_id)
+
+    def enable_edgewire(self, *, org_id: str | None = None) -> Any:
+        return self.post("edgewire/enable", org_id=org_id, json={})
+
+    def list_edgewire_services(self, *, org_id: str | None = None, fleet_id: str | None = None) -> Any:
+        return self.get("edgewire/services", org_id=org_id, params={"fleetId": fleet_id})
 
     def reboot_device(self, device_id: str, *, org_id: str | None = None) -> Any:
         return self.post(f"devices/{device_id}/reboot", org_id=org_id, json={})

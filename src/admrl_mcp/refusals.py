@@ -173,6 +173,14 @@ PROXY_ERRORS: dict[str, tuple[str, str]] = {
         "That proxy prefix is reserved (platform, brand or common-word names cannot be used).",
         "Choose a different prefix of 3-20 lowercase letters, digits and hyphens.",
     ),
+    "staff_disabled": (
+        "EdgeWire was turned off for this organisation.",
+        "It cannot be turned on from here; contact Admiral support.",
+    ),
+    "public_proxy": (
+        "That proxy is public, so it has no visitors to revoke.",
+        "Close it with close_proxy to end access for everyone.",
+    ),
 }
 
 
